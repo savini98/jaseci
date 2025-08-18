@@ -1,0 +1,12 @@
+>>>>> Found parent Ability: with_breaks <jaclang.compiler.unitree.Ability object at 0x7a363219ecc0>:
+    a: Symbol(a, variable, public, [Token(NAME, a, 117:17 - 117:18)])
+    b: Symbol(b, variable, public, [Token(NAME, b, 117:25 - 117:26), Token(NAME, b, 119:5 - 119:6)])
+    x: Symbol(x, variable, public, [Token(NAME, x, 118:5 - 118:6)])
+
+names: [Token(NAME, b, 120:9 - 120:10), Token(NAME, sum, 120:11 - 120:14)]
+{Symbol(b, variable, public, [Token(NAME, b, 121:9 - 121:10)])}
+Found function call: <jaclang.compiler.unitree.FuncCall object at 0x7a3631f5c380>
+FunctionCall nodes: [<jaclang.compiler.unitree.FuncCall object at 0x7a3631f5c380>]
+Target: Token(NAME, sum, 120:11 - 120:14)
+Graph breaks: 1
+Graph count: 2

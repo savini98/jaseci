@@ -25,6 +25,7 @@ from jaclang.compiler.passes.main import (
     SymTabBuildPass,
     SymTabLinkPass,
     Transform,
+    PreDynamoPass,
 )
 from jaclang.compiler.passes.tool import (
     DocIRGenPass,
@@ -43,6 +44,7 @@ ir_gen_sched = [
     SemDefMatchPass,
     CFGBuildPass,
     InheritancePass,
+    PreDynamoPass,  # TODO: Implement PreDynamoPass
 ]
 py_code_gen = [
     PyastGenPass,
