@@ -162,6 +162,7 @@ def run(
     session: str = "",
     main: bool = True,
     cache: bool = True,
+    graphmend: bool = False,
 ) -> None:
     """Run the specified .jac, .jir, or .py file.
 
@@ -173,18 +174,21 @@ def run(
         session: Optional session identifier for persistent state
         main: Treat the module as __main__ (default: True)
         cache: Use cached compilation if available (default: True)
+        graphmend: Enable graphmend for pytorch (default: False)
 
     Examples:
         jac run myprogram.jac
         jac run myscript.py
         jac run myprogram.jac --session mysession
         jac run myprogram.jac --no-main
+        jac run myprogram.jac --graphmend
     """
     # if no session specified, check if it was defined via global CLI args
     # otherwise default to jaclang.session
     base, mod, mach = proc_file_sess(filename, session)
     lng = filename.split(".")[-1]
     Jac.set_base_path(base)
+    settings.graphmend = graphmend
 
     if filename.endswith((".jac", ".py")):
         try:

@@ -27,6 +27,7 @@ from jaclang.compiler.passes.main import (
     SymTabBuildPass,
     Transform,
     TypeCheckPass,
+    CatchBreaksPass,
 )
 from jaclang.compiler.passes.tool import (
     CommentInjectionPass,
@@ -153,8 +154,10 @@ class JacProgram:
             )
         # If the module has syntax errors, we skip code generation.
         if (not mod_targ.has_syntax_errors) and (not no_cgen):
-            if settings.predynamo_pass and PreDynamoPass not in py_code_gen:
+            if settings.graphmend and PreDynamoPass not in py_code_gen:
                 py_code_gen.insert(0, PreDynamoPass)
+            if settings.graphmend and CatchBreaksPass not in py_code_gen:
+                py_code_gen.insert(0, CatchBreaksPass)
             self.run_schedule(
                 mod=mod_targ, passes=py_code_gen, cancel_token=cancel_token
             )

@@ -14,6 +14,7 @@ from .sem_def_match_pass import SemDefMatchPass  # noqa: I100
 from .semantic_analysis_pass import SemanticAnalysisPass  # noqa: I100
 from .sym_tab_build_pass import SymTabBuildPass, UniPass  # noqa: I100
 from .type_checker_pass import TypeCheckPass  # noqa: I100
+from .catch_breaks_pass import CatchBreaksPass  # noqa: I100
 
 __all__ = [
     "Alert",
@@ -33,4 +34,5 @@ __all__ = [
     "PyBytecodeGenPass",
     "CFGBuildPass",
     "PyJacAstLinkPass",
+    "CatchBreaksPass",
 ]
