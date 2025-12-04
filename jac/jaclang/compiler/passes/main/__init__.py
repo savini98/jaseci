@@ -2,6 +2,7 @@
 
 from ..transform import Alert, BaseTransform, Transform  # noqa: I100
 from .annex_pass import JacAnnexPass  # noqa: I100
+from .catch_breaks_pass import CatchBreaksPass  # noqa: I100
 from .cfg_build_pass import CFGBuildPass  # noqa: I100
 from .def_impl_match_pass import DeclImplMatchPass  # noqa: I100
 from .import_pass import JacImportDepsPass  # noqa: I100
@@ -14,7 +15,6 @@ from .sem_def_match_pass import SemDefMatchPass  # noqa: I100
 from .semantic_analysis_pass import SemanticAnalysisPass  # noqa: I100
 from .sym_tab_build_pass import SymTabBuildPass, UniPass  # noqa: I100
 from .type_checker_pass import TypeCheckPass  # noqa: I100
-from .catch_breaks_pass import CatchBreaksPass  # noqa: I100
 
 __all__ = [
     "Alert",

@@ -1,7 +1,6 @@
 """Pytorch Fix Pass."""
 
 import jaclang.compiler.unitree as uni
-from jaclang.compiler.constant import Tokens as Tok
 from jaclang.compiler.passes import UniPass
 
 
@@ -19,11 +18,14 @@ class CatchBreaksPass(UniPass):
         # print(f"Visiting ability")
         if node.decorators:
             for dec in node.decorators:
-
                 dec_txt = dec.unparse().strip() if hasattr(dec, "unparse") else ""
-                if dec_txt == "torch . compile" or dec_txt.startswith("torch . compile ( "):
+                if dec_txt == "torch . compile" or dec_txt.startswith(
+                    "torch . compile ( "
+                ):
                     self._torch_compiled_abilities.append(node)
                     tracer = BreakFinder(node)
+
+
 class CFGTracer:
     """CFG Tracer to trace control flow graphs."""
 
@@ -50,6 +52,7 @@ class CFGTracer:
         """Perform analysis."""
         pass
 
+
 class BreakFinder(CFGTracer):
     """Break Finder to find break statements."""
 
@@ -58,7 +61,7 @@ class BreakFinder(CFGTracer):
         super().__init__(ability)
         self.breaks: list[uni.BreakStmt] = []
 
-    def gather_external_symbols(self, node:uni.IfStmt | uni.ElseIf) -> set[uni.Symbol]:
+    def gather_external_symbols(self, node: uni.IfStmt | uni.ElseIf) -> set[uni.Symbol]:
         """Gather external symbols used in this expression statement."""
         name_atoms = node.condition.get_all_sub_nodes(uni.Name)
         symbols = set()
@@ -74,4 +77,4 @@ class BreakFinder(CFGTracer):
             symbols = self.gather_external_symbols(stmt)
             # print(f"External symbols in IfStmt: {symbols}")
             # for sym in symbols:
-                # print(f"Symbol: {sym.sym_name}, Type: {sym.sym_type}")
+            # print(f"Symbol: {sym.sym_name}, Type: {sym.sym_type}")

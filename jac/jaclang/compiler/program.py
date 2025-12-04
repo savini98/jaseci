@@ -13,6 +13,7 @@ from jaclang.compiler.parser import JacParser
 from jaclang.compiler.passes.ecmascript import EsastGenPass
 from jaclang.compiler.passes.main import (
     Alert,
+    CatchBreaksPass,
     CFGBuildPass,
     DeclImplMatchPass,
     JacAnnexPass,
@@ -27,7 +28,6 @@ from jaclang.compiler.passes.main import (
     SymTabBuildPass,
     Transform,
     TypeCheckPass,
-    CatchBreaksPass,
 )
 from jaclang.compiler.passes.tool import (
     CommentInjectionPass,
