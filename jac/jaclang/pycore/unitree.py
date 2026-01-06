@@ -745,6 +745,19 @@ class UniCFGNode(UniNode):
             node = node.bb_out[0]
         return node
 
+    def get_current_bb(self) -> list[UniCFGNode]:
+        """Get current basic block."""
+        start_node = self.get_head()
+        cur_node = start_node
+        end_node = self.get_tail()
+        bb_nodes = []
+        while cur_node != end_node:
+            bb_nodes.append(cur_node)
+            if not cur_node.bb_out:
+                break
+            cur_node = cur_node.bb_out[0]
+        bb_nodes.append(end_node)
+        return bb_nodes
 
 class Expr(UniNode):
     """Expression is a combination of values, variables operators and fuctions that are evaluated to produce a value.

@@ -422,6 +422,7 @@ MICRO_JAC_FILES: list[str] = [
     "tests/compiler/passes/main/fixtures/mtest.impl.jac",
     "tests/compiler/passes/main/fixtures/mtest.jac",
     "tests/compiler/passes/main/fixtures/nested_impls.jac",
+    "tests/compiler/passes/main/fixtures/predynamo_where_return.jac",
     "tests/compiler/passes/main/fixtures/py_imp_test.jac",
     "tests/compiler/passes/main/fixtures/sem_def_match.impl.jac",
     "tests/compiler/passes/main/fixtures/sem_def_match.jac",

@@ -18,6 +18,7 @@ from jaclang.pycore.helpers import read_file_with_encoding
 from jaclang.pycore.jac_parser import JacParser
 from jaclang.pycore.passes import (
     Alert,
+    CatchBreaksPass,
     DeclImplMatchPass,
     JacAnnexPass,
     PyastGenPass,
@@ -294,8 +295,13 @@ class JacProgram:
                 mod=mod_targ, passes=get_type_check_sched(), cancel_token=cancel_token
             )
         # If the module has syntax errors, we skip code generation.
+        # print(f"Codegen schedule after CatchBreaksPass insertion:")
         if (not mod_targ.has_syntax_errors) and (not no_cgen):
             codegen_sched = get_minimal_py_code_gen() if minimal else get_py_code_gen()
+            print(f"Codegen schedule before CatchBreaksPass insertion: {codegen_sched}")
+            if True:
+                codegen_sched.insert(0, CatchBreaksPass)
+                print(f"Codegen schedule after CatchBreaksPass insertion: {codegen_sched}")
             self.run_schedule(
                 mod=mod_targ, passes=codegen_sched, cancel_token=cancel_token
             )
