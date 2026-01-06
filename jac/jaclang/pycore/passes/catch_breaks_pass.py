@@ -18,9 +18,10 @@ class CatchBreaksPass(UniPass):
         # print(f"Visiting ability")
         if node.decorators:
             for dec in node.decorators:
+                # print(dec.unparse())
                 dec_txt = dec.unparse().strip() if hasattr(dec, "unparse") else ""
-                if dec_txt == "torch . compile" or dec_txt.startswith(
-                    "torch . compile ( "
+                if dec_txt == "torch.compile" or dec_txt.startswith(
+                    "torch.compile ("
                 ):
                     self._torch_compiled_abilities.append(node)
                     tracer = BreakFinder(node)
@@ -75,6 +76,6 @@ class BreakFinder(CFGTracer):
         """Perform analysis."""
         if isinstance(stmt, uni.IfStmt):
             symbols = self.gather_external_symbols(stmt)
-            # print(f"External symbols in IfStmt: {symbols}")
-            # for sym in symbols:
-            # print(f"Symbol: {sym.sym_name}, Type: {sym.sym_type}")
+            print(f"External symbols in IfStmt: {symbols}")
+            for sym in symbols:
+                print(f"Symbol: {sym.sym_name}, Type: {sym.sym_type}")
