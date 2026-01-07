@@ -9,7 +9,6 @@ class CatchBreaksPass(UniPass):
 
     def before_pass(self):
         """Before pass setup."""
-        # print("Running CatchBreaksPass...")
         self._torch_compiled_abilities: list[uni.Ability] = []
         self._torch_compiled_archetypes: list[uni.Archetype] = []
         self._current_archetype: uni.Archetype | None = None
@@ -24,7 +23,7 @@ class CatchBreaksPass(UniPass):
                 dec_txt = dec.unparse().strip() if hasattr(dec, "unparse") else ""
                 if dec_txt == "torch.compile" or dec_txt.startswith("torch.compile ("):
                     self._torch_compiled_archetypes.append(node)
-                    print(f"Found @torch.compile on class: {node.name.value}")
+                    # print(f"Found @torch.compile on class: {node.name.value}")
                     break
 
     def exit_archetype(self, node: uni.Archetype) -> None:
@@ -35,7 +34,7 @@ class CatchBreaksPass(UniPass):
     def enter_ability(self, node: uni.Ability) -> None:
         """Enter ability (function/method)."""
         should_analyze = False
-        
+
         # Check if the ability itself is decorated with torch.compile
         if node.decorators:
             for dec in node.decorators:
@@ -43,7 +42,7 @@ class CatchBreaksPass(UniPass):
                 if dec_txt == "torch.compile" or dec_txt.startswith("torch.compile ("):
                     self._torch_compiled_abilities.append(node)
                     should_analyze = True
-                    print(f"Found @torch.compile on function: {node.name_spec.value if hasattr(node, 'name_spec') else 'unknown'}")
+                    # print(f"Found @torch.compile on function: {node.name_spec.value if hasattr(node, 'name_spec') else 'unknown'}")
                     break
         
         # Check if the ability is inside a torch.compile decorated class
@@ -89,6 +88,7 @@ class BreakFinder(CFGTracer):
         """Initialize BreakFinder."""
         self.breaks: list = []
         self.graph_break_stmts: list[uni.IfStmt] = []  # Track statements with graph breaks
+        self.analyzed_stmts: set[int] = set()  # Track analyzed statements by id to avoid duplicates
         super().__init__(ability)
         # Report summary after analysis
         self.report_graph_breaks()
@@ -116,7 +116,7 @@ class BreakFinder(CFGTracer):
         """Check if a symbol is used with a specific method call in an expression (e.g., b.sum())."""
         # Find all AtomTrailer nodes in the expression
         atom_trailers = expr.get_all_sub_nodes(uni.AtomTrailer)
-        
+
         for trailer in atom_trailers:
             # Check if this is an attribute access (method call)
             if trailer.is_attr:
@@ -144,7 +144,6 @@ class BreakFinder(CFGTracer):
                             for method_name_node in right_names:
                                 if method_name_node.value == method_name:
                                     return True
-        
         return False
 
     def check_symbol_has_method_call(self, symbol: uni.Symbol, method_name: str) -> bool:
@@ -152,17 +151,16 @@ class BreakFinder(CFGTracer):
         # Get the definition node (NameAtom)
         if not symbol.defn:
             return False
-        
         defn_node = symbol.defn[-1]  # Get the most recent definition
-        
+
         # Navigate up to find the Assignment statement
         current = defn_node.parent
         while current and not isinstance(current, uni.Assignment):
             current = current.parent
-        
+
         if not isinstance(current, uni.Assignment):
             return False
-        
+
         # Check the assignment value for AtomTrailer nodes with the method call
         if current.value:
             atom_trailers = current.value.get_all_sub_nodes(uni.AtomTrailer)
@@ -173,7 +171,7 @@ class BreakFinder(CFGTracer):
                     for name in names:
                         if name.value == method_name:
                             return True
-        
+
         return False
 
     def is_symbol_function_parameter(self, symbol: uni.Symbol) -> bool:
@@ -181,9 +179,9 @@ class BreakFinder(CFGTracer):
         # Check if the symbol is defined in a function's parameter list
         if not symbol.defn:
             return False
-        
+
         defn_node = symbol.defn[0]  # Get the original definition
-        
+
         # Navigate up to find if it's in a ParamVar context
         current = defn_node.parent
         while current:
@@ -194,7 +192,7 @@ class BreakFinder(CFGTracer):
                 # Reached function level without finding ParamVar
                 break
             current = current.parent
-        
+
         return False
 
     def trace_symbol_dependencies(self, symbol: uni.Symbol, visited: set[str] | None = None, depth: int = 0) -> tuple[bool, str]:
@@ -204,21 +202,21 @@ class BreakFinder(CFGTracer):
         """
         if visited is None:
             visited = set()
-        
+
         # Prevent infinite recursion
         if symbol.sym_name in visited or depth > 10:
             return False, ""
-        
+
         visited.add(symbol.sym_name)
         indent = "  " * depth
-        
+
         print(f"{indent}Tracing symbol: {symbol.sym_name}")
-        
+
         # Check if symbol is a function parameter (dynamic value)
         if self.is_symbol_function_parameter(symbol):
             print(f"{indent}  -> Is function parameter (dynamic)")
             return True, f"depends on function parameter '{symbol.sym_name}'"
-        
+
         # Check if symbol's definition contains graph-breaking operations
         if not symbol.defn:
             return False, ""
@@ -272,6 +270,12 @@ class BreakFinder(CFGTracer):
     def analysis_on_stmt(self, stmt: uni.UniCFGNode) -> None:
         """Perform analysis."""
         if isinstance(stmt, uni.IfStmt):
+            # Check if we've already analyzed this statement (avoid duplicates in CFG traversal)
+            stmt_id = id(stmt)
+            if stmt_id in self.analyzed_stmts:
+                return
+            self.analyzed_stmts.add(stmt_id)
+            
             symbols = self.gather_external_symbols(stmt)
             print(f"\nExternal symbols in IfStmt at line {stmt.loc.first_line}: {symbols}")
             
