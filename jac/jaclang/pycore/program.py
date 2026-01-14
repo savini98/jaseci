@@ -20,6 +20,7 @@ from jaclang.pycore.passes import (
     Alert,
     CatchBreaksPass,
     DeclImplMatchPass,
+    FixBreaksPass,
     JacAnnexPass,
     PyastGenPass,
     PyBytecodeGenPass,
@@ -299,8 +300,11 @@ class JacProgram:
         if (not mod_targ.has_syntax_errors) and (not no_cgen):
             codegen_sched = get_minimal_py_code_gen() if minimal else get_py_code_gen()
             if True:
+                # Insert CatchBreaksPass first to detect graph breaks
                 codegen_sched.insert(0, CatchBreaksPass)
-                # print(f"Codegen schedule after CatchBreaksPass insertion: {codegen_sched}")
+                # Insert FixBreaksPass after CatchBreaksPass to transform flagged if statements
+                codegen_sched.insert(1, FixBreaksPass)
+                # print(f"Codegen schedule after passes insertion: {codegen_sched}")
             self.run_schedule(
                 mod=mod_targ, passes=codegen_sched, cancel_token=cancel_token
             )
