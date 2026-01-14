@@ -108,6 +108,60 @@ class FixBreaksPass(UniPass):
         
         return (call.target.target, method_name, args, kwargs)
 
+    def extract_expressions(
+        self, 
+        node: uni.IfStmt, 
+        condition: uni.Expr,
+        true_expr: uni.Expr, 
+        false_expr: uni.Expr
+    ) -> tuple[list[uni.Assignment], uni.Name, uni.Name, uni.Name]:
+        """
+        Always extract expressions into temporary variables for clarity.
+        Returns (assignments_list, cond_name, true_name, false_name).
+        """
+        assignments = []
+        
+        # Extract condition
+        cond_tmp = self.gen_name(node, Tok.NAME, "__cond")
+        cond_tmp.py_ctx_func = ast3.Store
+        cond_assign = uni.Assignment(
+            target=[cond_tmp],
+            value=condition,
+            type_tag=None,
+            kid=[cond_tmp, condition],
+        )
+        assignments.append(cond_assign)
+        # Create reference to use in torch.where
+        cond_ref = self.gen_name(node, Tok.NAME, "__cond")
+        
+        # Extract true branch expression
+        true_tmp = self.gen_name(node, Tok.NAME, "__true_val")
+        true_tmp.py_ctx_func = ast3.Store
+        true_assign = uni.Assignment(
+            target=[true_tmp],
+            value=true_expr,
+            type_tag=None,
+            kid=[true_tmp, true_expr],
+        )
+        assignments.append(true_assign)
+        # Create reference to use in torch.where
+        true_ref = self.gen_name(node, Tok.NAME, "__true_val")
+        
+        # Extract false branch expression
+        false_tmp = self.gen_name(node, Tok.NAME, "__false_val")
+        false_tmp.py_ctx_func = ast3.Store
+        false_assign = uni.Assignment(
+            target=[false_tmp],
+            value=false_expr,
+            type_tag=None,
+            kid=[false_tmp, false_expr],
+        )
+        assignments.append(false_assign)
+        # Create reference to use in torch.where
+        false_ref = self.gen_name(node, Tok.NAME, "__false_val")
+        
+        return assignments, cond_ref, true_ref, false_ref
+
     def exit_if_stmt(self, node: uni.IfStmt) -> None:
         """Exit if statement and transform if it has graph breaks."""
         # Only transform if this IfStmt was flagged by CatchBreaksPass with dynamic control flow break
@@ -143,6 +197,13 @@ class FixBreaksPass(UniPass):
             lhs = self.check_same_lhs(a0, b0)
             if lhs is not None:
                 print(f"  -> Transforming assignment: {lhs.value} = torch.where(...)")
+                
+                # Extract expressions into temporary variables
+                temp_assigns, cond_ref, true_ref, false_ref = self.extract_expressions(
+                    node, node.condition, cast(uni.Expr, a0.value), cast(uni.Expr, b0.value)
+                )
+                
+                # Create torch.where call
                 func_name = self.gen_name(node, Tok.NAME, "torch")
                 attr_name = self.gen_name(node, Tok.NAME, "where")
                 target = uni.AtomTrailer(
@@ -154,19 +215,19 @@ class FixBreaksPass(UniPass):
                 )
                 call = uni.FuncCall(
                     target=target,
-                    params=[
-                        node.condition,
-                        cast(uni.Expr, a0.value),
-                        cast(uni.Expr, b0.value),
-                    ],
+                    params=[cond_ref, true_ref, false_ref],
                     genai_call=None,
-                    kid=[target, node.condition, a0.value, b0.value],
+                    kid=[target, cond_ref, true_ref, false_ref],
                 )
-                new_node = uni.Assignment(
+                result_assign = uni.Assignment(
                     target=[lhs], value=call, type_tag=None, kid=[lhs, call]
                 )
-                self.replace_node(new_node, node, "body")
+                
+                # Combine all statements: temp assignments + final assignment
+                all_stmts = temp_assigns + [result_assign]
+                self.replace_node(all_stmts, node, "body")
                 print("  -> Successfully transformed to torch.where assignment")
+                return
 
         # Case 2: Both branches are return statements
         elif isinstance(a0, uni.ReturnStmt) and isinstance(b0, uni.ReturnStmt):
@@ -175,6 +236,13 @@ class FixBreaksPass(UniPass):
                 print("  -> Skipping: return statement has no expression")
                 return
             print("  -> Transforming return: return torch.where(...)")
+            
+            # Extract expressions into temporary variables
+            temp_assigns, cond_ref, true_ref, false_ref = self.extract_expressions(
+                node, node.condition, cast(uni.Expr, aexpr), cast(uni.Expr, bexpr)
+            )
+            
+            # Create torch.where call
             func_name = self.gen_name(node, Tok.NAME, "torch")
             attr_name = self.gen_name(node, Tok.NAME, "where")
             target = uni.AtomTrailer(
@@ -186,13 +254,17 @@ class FixBreaksPass(UniPass):
             )
             call = uni.FuncCall(
                 target=target,
-                params=[node.condition, cast(uni.Expr, aexpr), cast(uni.Expr, bexpr)],
+                params=[cond_ref, true_ref, false_ref],
                 genai_call=None,
-                kid=[target, node.condition, aexpr, bexpr],
+                kid=[target, cond_ref, true_ref, false_ref],
             )
-            new_node = uni.ReturnStmt(expr=call, kid=[call])
-            self.replace_node(new_node, node, "body")
+            return_stmt = uni.ReturnStmt(expr=call, kid=[call])
+            
+            # Combine all statements: temp assignments + return
+            all_stmts = temp_assigns + [return_stmt]
+            self.replace_node(all_stmts, node, "body")
             print("  -> Successfully transformed to torch.where return")
+            return
 
         # Case 3: Both branches are method calls with same method name
         elif isinstance(a0, uni.ExprStmt) and isinstance(b0, uni.ExprStmt):
@@ -217,6 +289,11 @@ class FixBreaksPass(UniPass):
                             first_arg_same = (a_str == b_str)
                         
                         if first_arg_same:
+                            # Extract expressions into temporary variables
+                            temp_assigns, cond_ref, true_ref, false_ref = self.extract_expressions(
+                                node, node.condition, a_args[1], b_args[1]
+                            )
+                            
                             # Create temporary variable for torch.where result
                             tmp_name_value = f"__{a_args[0].value if isinstance(a_args[0], uni.String) else 'temp'}"
                             tmp_name = self.gen_name(node, Tok.NAME, tmp_name_value)
@@ -234,13 +311,13 @@ class FixBreaksPass(UniPass):
                             )
                             where_call = uni.FuncCall(
                                 target=where_target,
-                                params=[node.condition, a_args[1], b_args[1]],
+                                params=[cond_ref, true_ref, false_ref],
                                 genai_call=None,
-                                kid=[where_target, node.condition, a_args[1], b_args[1]],
+                                kid=[where_target, cond_ref, true_ref, false_ref],
                             )
                             
                             # Create assignment: tmp = torch.where(...)
-                            assign_node = uni.Assignment(
+                            result_assign = uni.Assignment(
                                 target=[tmp_name],
                                 value=where_call,
                                 type_tag=None,
@@ -269,8 +346,9 @@ class FixBreaksPass(UniPass):
                                     expr=method_call, in_fstring=False, kid=[method_call]
                                 )
                                 
-                                # Replace with both statements
-                                self.replace_node([assign_node, method_node], node, "body")
+                                # Replace with all statements: temp extractions + where assignment + method call
+                                all_stmts = temp_assigns + [result_assign, method_node]
+                                self.replace_node(all_stmts, node, "body")
                                 print(f"  -> Successfully transformed to torch.where + {a_method} call")
                                 return
             
