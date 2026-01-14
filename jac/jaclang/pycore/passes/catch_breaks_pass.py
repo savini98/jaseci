@@ -87,7 +87,8 @@ class BreakFinder(CFGTracer):
     def __init__(self, ability: uni.Ability):
         """Initialize BreakFinder."""
         self.breaks: list = []
-        self.graph_break_stmts: list[uni.IfStmt] = []  # Track statements with graph breaks
+        self.graph_break_stmts: list[uni.IfStmt] = []  # Track statements with dynamic control flow breaks
+        self.side_effect_stmts: list[uni.UniNode] = []  # Track statements with side effects
         self.analyzed_stmts: set[int] = set()  # Track analyzed statements by id to avoid duplicates
         super().__init__(ability)
         # Report summary after analysis
@@ -95,10 +96,18 @@ class BreakFinder(CFGTracer):
 
     def report_graph_breaks(self) -> None:
         """Report all detected graph breaks."""
-        if self.graph_break_stmts:
-            print(f"\n=== SUMMARY: Found {len(self.graph_break_stmts)} statement(s) with dynamo graph breaks ===")
-            for idx, stmt in enumerate(self.graph_break_stmts, 1):
-                print(f"  {idx}. IfStmt at line {stmt.loc.first_line}: has_dynamo_graph_break={getattr(stmt, 'has_dynamo_graph_break', False)}")
+        total_breaks = len(self.graph_break_stmts) + len(self.side_effect_stmts)
+        if total_breaks > 0:
+            print(f"\n=== SUMMARY: Found {total_breaks} statement(s) with dynamo graph breaks ===")
+            if self.graph_break_stmts:
+                print(f"\n  Dynamic Control Flow Breaks ({len(self.graph_break_stmts)}):")
+                for idx, stmt in enumerate(self.graph_break_stmts, 1):
+                    print(f"    {idx}. IfStmt at line {stmt.loc.first_line}: has_break_dyn_cf={getattr(stmt, 'has_break_dyn_cf', False)}")
+            if self.side_effect_stmts:
+                print(f"\n  Side Effect Breaks ({len(self.side_effect_stmts)}):")
+                for idx, stmt in enumerate(self.side_effect_stmts, 1):
+                    stmt_type = type(stmt).__name__
+                    print(f"    {idx}. {stmt_type} at line {stmt.loc.first_line}: has_break_se={getattr(stmt, 'has_break_se', False)}")
         else:
             print("\n=== SUMMARY: No dynamo graph breaks detected ===")
 
@@ -195,6 +204,68 @@ class BreakFinder(CFGTracer):
 
         return False
 
+    def check_side_effect_call(self, node: uni.UniNode) -> tuple[bool, str]:
+        """
+        Check if a node contains side-effect causing function calls.
+        Returns (has_side_effect, reason).
+        """
+        # List of built-in functions and modules that cause graph breaks
+        side_effect_funcs = {
+            "print": "I/O operation",
+            "input": "I/O operation",
+            "open": "file I/O",
+            "write": "I/O operation",
+            "read": "I/O operation",
+        }
+        
+        # Logging-related patterns
+        logging_patterns = ["log", "logger", "logging", "warn", "error", "info", "debug"]
+        
+        # Get all function calls in the node
+        func_calls = node.get_all_sub_nodes(uni.FuncCall)
+        
+        for call in func_calls:
+            # Check direct function name
+            if isinstance(call.target, uni.Name):
+                func_name = call.target.value
+                
+                # Check if it's a built-in function name
+                if func_name in side_effect_funcs:
+                    # Verify it's actually the built-in, not a redefined variable
+                    # Look up the symbol in the symbol table
+                    if hasattr(node, 'sym_tab') and node.sym_tab:
+                        symbol = node.sym_tab.lookup(name=func_name, deep=True)
+                        # If symbol is found and it has a definition, it's user-defined
+                        if symbol and symbol.defn:
+                            # User has redefined this name, skip it
+                            continue
+                    # It's the built-in function
+                    return True, f"calls {func_name}() ({side_effect_funcs[func_name]})"
+                
+                # Check for logging patterns
+                for pattern in logging_patterns:
+                    if pattern in func_name.lower():
+                        # For logging, we're less strict since it's less likely to be redefined
+                        return True, f"calls {func_name}() (logging operation)"
+            
+            # Check for method calls like logger.info(), logging.debug(), etc.
+            elif isinstance(call.target, uni.AtomTrailer) and call.target.is_attr:
+                if isinstance(call.target.right, uni.Name):
+                    method_name = call.target.right.value
+                    # Check if it's a logging method
+                    for pattern in logging_patterns:
+                        if pattern in method_name.lower():
+                            return True, f"calls .{method_name}() (logging operation)"
+                    
+                    # Check target for logging modules
+                    if isinstance(call.target.target, uni.Name):
+                        target_name = call.target.target.value
+                        for pattern in logging_patterns:
+                            if pattern in target_name.lower():
+                                return True, f"calls {target_name}.{method_name}() (logging operation)"
+        
+        return False, ""
+
     def trace_symbol_dependencies(self, symbol: uni.Symbol, visited: set[str] | None = None, depth: int = 0) -> tuple[bool, str]:
         """
         Recursively trace a symbol's dependencies to find graph-breaking operations.
@@ -269,6 +340,23 @@ class BreakFinder(CFGTracer):
 
     def analysis_on_stmt(self, stmt: uni.UniCFGNode) -> None:
         """Perform analysis."""
+        # Skip checking entire Ability nodes - we want to check individual statements inside
+        if isinstance(stmt, uni.Ability):
+            return
+        
+        # Check for side-effect causing calls in statements
+        has_side_effect, se_reason = self.check_side_effect_call(stmt)
+        if has_side_effect:
+            stmt_id = id(stmt)
+            if stmt_id not in self.analyzed_stmts:
+                self.analyzed_stmts.add(stmt_id)
+                self.side_effect_stmts.append(stmt)
+                stmt.has_break_se = True  # type: ignore
+                stmt.side_effect_reason = se_reason  # type: ignore
+                print(f"\n  *** SIDE EFFECT BREAK DETECTED - Marked {type(stmt).__name__} at line {stmt.loc.first_line} ***")
+                print(f"  Reason: {se_reason}")
+        
+        # Check for dynamic control flow breaks in if statements
         if isinstance(stmt, uni.IfStmt):
             # Check if we've already analyzed this statement (avoid duplicates in CFG traversal)
             stmt_id = id(stmt)
@@ -315,8 +403,11 @@ class BreakFinder(CFGTracer):
             # Mark the statement with a graph break label if detected
             if has_graph_break:
                 self.graph_break_stmts.append(stmt)
-                # Add a custom attribute to mark this statement
+                # Add custom attributes to mark this statement
+                stmt.has_break_dyn_cf = True  # type: ignore
+                stmt.dyn_cf_reasons = graph_break_reasons  # type: ignore
+                # Keep old name for backward compatibility with FixBreaksPass
                 stmt.has_dynamo_graph_break = True  # type: ignore
                 stmt.graph_break_reasons = graph_break_reasons  # type: ignore
-                print(f"\n  *** GRAPH BREAK DETECTED - Marked IfStmt at line {stmt.loc.first_line} ***")
+                print(f"\n  *** DYNAMIC CONTROL FLOW BREAK DETECTED - Marked IfStmt at line {stmt.loc.first_line} ***")
                 print(f"  Reasons: {'; '.join(graph_break_reasons)}")

@@ -110,21 +110,28 @@ class FixBreaksPass(UniPass):
 
     def exit_if_stmt(self, node: uni.IfStmt) -> None:
         """Exit if statement and transform if it has graph breaks."""
-        # Only transform if this IfStmt was flagged by CatchBreaksPass
-        if not getattr(node, "has_dynamo_graph_break", False):
+        # Only transform if this IfStmt was flagged by CatchBreaksPass with dynamic control flow break
+        # Check new flag name first, fall back to old name for backward compatibility
+        has_dyn_cf_break = getattr(node, "has_break_dyn_cf", False) or getattr(node, "has_dynamo_graph_break", False)
+        
+        if not has_dyn_cf_break:
             return
 
-        print(f"\n=== Transforming IfStmt at line {node.loc.first_line} with graph break ===")
-        if hasattr(node, "graph_break_reasons"):
+        print(f"\n=== Transforming IfStmt at line {node.loc.first_line} with dynamic control flow break ===")
+        
+        # Get reasons from new or old attribute
+        if hasattr(node, "dyn_cf_reasons"):
+            print(f"Reasons: {'; '.join(node.dyn_cf_reasons)}")  # type: ignore
+        elif hasattr(node, "graph_break_reasons"):
             print(f"Reasons: {'; '.join(node.graph_break_reasons)}")  # type: ignore
 
         # Check if we have exactly one statement in if and else branches
         if not node.body or len(node.body) != 1:
-            print(f"  -> Skipping: if body doesn't have exactly 1 statement")
+            print("  -> Skipping: if body doesn't have exactly 1 statement")
             return
         
         if not node.else_body or not node.else_body.body or len(node.else_body.body) != 1:
-            print(f"  -> Skipping: else body doesn't have exactly 1 statement")
+            print("  -> Skipping: else body doesn't have exactly 1 statement")
             return
 
         a0 = node.body[0]
@@ -159,15 +166,15 @@ class FixBreaksPass(UniPass):
                     target=[lhs], value=call, type_tag=None, kid=[lhs, call]
                 )
                 self.replace_node(new_node, node, "body")
-                print(f"  -> Successfully transformed to torch.where assignment")
+                print("  -> Successfully transformed to torch.where assignment")
 
         # Case 2: Both branches are return statements
         elif isinstance(a0, uni.ReturnStmt) and isinstance(b0, uni.ReturnStmt):
             aexpr, bexpr = a0.expr, b0.expr
             if aexpr is None or bexpr is None:
-                print(f"  -> Skipping: return statement has no expression")
+                print("  -> Skipping: return statement has no expression")
                 return
-            print(f"  -> Transforming return: return torch.where(...)")
+            print("  -> Transforming return: return torch.where(...)")
             func_name = self.gen_name(node, Tok.NAME, "torch")
             attr_name = self.gen_name(node, Tok.NAME, "where")
             target = uni.AtomTrailer(
@@ -185,7 +192,7 @@ class FixBreaksPass(UniPass):
             )
             new_node = uni.ReturnStmt(expr=call, kid=[call])
             self.replace_node(new_node, node, "body")
-            print(f"  -> Successfully transformed to torch.where return")
+            print("  -> Successfully transformed to torch.where return")
 
         # Case 3: Both branches are method calls with same method name
         elif isinstance(a0, uni.ExprStmt) and isinstance(b0, uni.ExprStmt):
@@ -267,5 +274,5 @@ class FixBreaksPass(UniPass):
                                 print(f"  -> Successfully transformed to torch.where + {a_method} call")
                                 return
             
-            print(f"  -> Skipping: method call pattern not supported")
+            print("  -> Skipping: method call pattern not supported")
 
