@@ -44,12 +44,17 @@ class CatchBreaksPass(UniPass):
                     should_analyze = True
                     # print(f"Found @torch.compile on function: {node.name_spec.value if hasattr(node, 'name_spec') else 'unknown'}")
                     break
-        
+
         # Check if the ability is inside a torch.compile decorated class
-        if not should_analyze and self._current_archetype in self._torch_compiled_archetypes:
+        if (
+            not should_analyze
+            and self._current_archetype in self._torch_compiled_archetypes
+        ):
             should_analyze = True
-            print(f"Found function inside @torch.compile class: {node.name_spec.value if hasattr(node, 'name_spec') else 'unknown'}")
-        
+            print(
+                f"Found function inside @torch.compile class: {node.name_spec.value if hasattr(node, 'name_spec') else 'unknown'}"
+            )
+
         if should_analyze:
             _ = BreakFinder(node)  # Analysis happens in __init__
 
@@ -87,9 +92,15 @@ class BreakFinder(CFGTracer):
     def __init__(self, ability: uni.Ability):
         """Initialize BreakFinder."""
         self.breaks: list = []
-        self.graph_break_stmts: list[uni.IfStmt] = []  # Track statements with dynamic control flow breaks
-        self.side_effect_stmts: list[uni.UniNode] = []  # Track statements with side effects
-        self.analyzed_stmts: set[int] = set()  # Track analyzed statements by id to avoid duplicates
+        self.graph_break_stmts: list[
+            uni.IfStmt
+        ] = []  # Track statements with dynamic control flow breaks
+        self.side_effect_stmts: list[
+            uni.UniNode
+        ] = []  # Track statements with side effects
+        self.analyzed_stmts: set[int] = (
+            set()
+        )  # Track analyzed statements by id to avoid duplicates
         super().__init__(ability)
         # Report summary after analysis
         self.report_graph_breaks()
@@ -98,16 +109,24 @@ class BreakFinder(CFGTracer):
         """Report all detected graph breaks."""
         total_breaks = len(self.graph_break_stmts) + len(self.side_effect_stmts)
         if total_breaks > 0:
-            print(f"\n=== SUMMARY: Found {total_breaks} statement(s) with dynamo graph breaks ===")
+            print(
+                f"\n=== SUMMARY: Found {total_breaks} statement(s) with dynamo graph breaks ==="
+            )
             if self.graph_break_stmts:
-                print(f"\n  Dynamic Control Flow Breaks ({len(self.graph_break_stmts)}):")
+                print(
+                    f"\n  Dynamic Control Flow Breaks ({len(self.graph_break_stmts)}):"
+                )
                 for idx, stmt in enumerate(self.graph_break_stmts, 1):
-                    print(f"    {idx}. IfStmt at line {stmt.loc.first_line}: has_break_dyn_cf={getattr(stmt, 'has_break_dyn_cf', False)}")
+                    print(
+                        f"    {idx}. IfStmt at line {stmt.loc.first_line}: has_break_dyn_cf={getattr(stmt, 'has_break_dyn_cf', False)}"
+                    )
             if self.side_effect_stmts:
                 print(f"\n  Side Effect Breaks ({len(self.side_effect_stmts)}):")
                 for idx, stmt in enumerate(self.side_effect_stmts, 1):
                     stmt_type = type(stmt).__name__
-                    print(f"    {idx}. {stmt_type} at line {stmt.loc.first_line}: has_break_se={getattr(stmt, 'has_break_se', False)}")
+                    print(
+                        f"    {idx}. {stmt_type} at line {stmt.loc.first_line}: has_break_se={getattr(stmt, 'has_break_se', False)}"
+                    )
         else:
             print("\n=== SUMMARY: No dynamo graph breaks detected ===")
 
@@ -121,7 +140,9 @@ class BreakFinder(CFGTracer):
                 symbols.add(new_symbol)
         return symbols
 
-    def check_symbol_has_method_call_in_expr(self, expr: uni.Expr, symbol: uni.Symbol, method_name: str) -> bool:
+    def check_symbol_has_method_call_in_expr(
+        self, expr: uni.Expr, symbol: uni.Symbol, method_name: str
+    ) -> bool:
         """Check if a symbol is used with a specific method call in an expression (e.g., b.sum())."""
         # Find all AtomTrailer nodes in the expression
         atom_trailers = expr.get_all_sub_nodes(uni.AtomTrailer)
@@ -133,10 +154,17 @@ class BreakFinder(CFGTracer):
                 if isinstance(trailer.target, uni.Name):
                     if trailer.target.value == symbol.sym_name:
                         # Check if the right side (method name) matches
-                        if isinstance(trailer.right, uni.Name) and trailer.right.value == method_name:
+                        if (
+                            isinstance(trailer.right, uni.Name)
+                            and trailer.right.value == method_name
+                        ):
                             return True
                         # Also check subnodes
-                        right_names = trailer.right.get_all_sub_nodes(uni.Name) if hasattr(trailer.right, 'get_all_sub_nodes') else []
+                        right_names = (
+                            trailer.right.get_all_sub_nodes(uni.Name)
+                            if hasattr(trailer.right, "get_all_sub_nodes")
+                            else []
+                        )
                         for method_name_node in right_names:
                             if method_name_node.value == method_name:
                                 return True
@@ -147,15 +175,24 @@ class BreakFinder(CFGTracer):
                     for target_name in target_names:
                         if target_name.value == symbol.sym_name:
                             # Check if the right side (method name) matches
-                            if isinstance(trailer.right, uni.Name) and trailer.right.value == method_name:
+                            if (
+                                isinstance(trailer.right, uni.Name)
+                                and trailer.right.value == method_name
+                            ):
                                 return True
-                            right_names = trailer.right.get_all_sub_nodes(uni.Name) if hasattr(trailer.right, 'get_all_sub_nodes') else []
+                            right_names = (
+                                trailer.right.get_all_sub_nodes(uni.Name)
+                                if hasattr(trailer.right, "get_all_sub_nodes")
+                                else []
+                            )
                             for method_name_node in right_names:
                                 if method_name_node.value == method_name:
                                     return True
         return False
 
-    def check_symbol_has_method_call(self, symbol: uni.Symbol, method_name: str) -> bool:
+    def check_symbol_has_method_call(
+        self, symbol: uni.Symbol, method_name: str
+    ) -> bool:
         """Check if symbol's definition expression contains a specific method call (e.g., .sum())."""
         # Get the definition node (NameAtom)
         if not symbol.defn:
@@ -217,23 +254,31 @@ class BreakFinder(CFGTracer):
             "write": "I/O operation",
             "read": "I/O operation",
         }
-        
+
         # Logging-related patterns
-        logging_patterns = ["log", "logger", "logging", "warn", "error", "info", "debug"]
-        
+        logging_patterns = [
+            "log",
+            "logger",
+            "logging",
+            "warn",
+            "error",
+            "info",
+            "debug",
+        ]
+
         # Get all function calls in the node
         func_calls = node.get_all_sub_nodes(uni.FuncCall)
-        
+
         for call in func_calls:
             # Check direct function name
             if isinstance(call.target, uni.Name):
                 func_name = call.target.value
-                
+
                 # Check if it's a built-in function name
                 if func_name in side_effect_funcs:
                     # Verify it's actually the built-in, not a redefined variable
                     # Look up the symbol in the symbol table
-                    if hasattr(node, 'sym_tab') and node.sym_tab:
+                    if hasattr(node, "sym_tab") and node.sym_tab:
                         symbol = node.sym_tab.lookup(name=func_name, deep=True)
                         # If symbol is found and it has a definition, it's user-defined
                         if symbol and symbol.defn:
@@ -241,13 +286,13 @@ class BreakFinder(CFGTracer):
                             continue
                     # It's the built-in function
                     return True, f"calls {func_name}() ({side_effect_funcs[func_name]})"
-                
+
                 # Check for logging patterns
                 for pattern in logging_patterns:
                     if pattern in func_name.lower():
                         # For logging, we're less strict since it's less likely to be redefined
                         return True, f"calls {func_name}() (logging operation)"
-            
+
             # Check for method calls like logger.info(), logging.debug(), etc.
             elif isinstance(call.target, uni.AtomTrailer) and call.target.is_attr:
                 if isinstance(call.target.right, uni.Name):
@@ -256,17 +301,22 @@ class BreakFinder(CFGTracer):
                     for pattern in logging_patterns:
                         if pattern in method_name.lower():
                             return True, f"calls .{method_name}() (logging operation)"
-                    
+
                     # Check target for logging modules
                     if isinstance(call.target.target, uni.Name):
                         target_name = call.target.target.value
                         for pattern in logging_patterns:
                             if pattern in target_name.lower():
-                                return True, f"calls {target_name}.{method_name}() (logging operation)"
-        
+                                return (
+                                    True,
+                                    f"calls {target_name}.{method_name}() (logging operation)",
+                                )
+
         return False, ""
 
-    def trace_symbol_dependencies(self, symbol: uni.Symbol, visited: set[str] | None = None, depth: int = 0) -> tuple[bool, str]:
+    def trace_symbol_dependencies(
+        self, symbol: uni.Symbol, visited: set[str] | None = None, depth: int = 0
+    ) -> tuple[bool, str]:
         """
         Recursively trace a symbol's dependencies to find graph-breaking operations.
         Returns (has_graph_break, reason).
@@ -291,17 +341,17 @@ class BreakFinder(CFGTracer):
         # Check if symbol's definition contains graph-breaking operations
         if not symbol.defn:
             return False, ""
-        
+
         defn_node = symbol.defn[-1]
-        
+
         # Navigate up to find the Assignment statement
         current = defn_node.parent
         while current and not isinstance(current, uni.Assignment):
             current = current.parent
-        
+
         if not isinstance(current, uni.Assignment) or not current.value:
             return False, ""
-        
+
         # Check for torch operations that cause graph breaks
         atom_trailers = current.value.get_all_sub_nodes(uni.AtomTrailer)
         for trailer in atom_trailers:
@@ -312,19 +362,21 @@ class BreakFinder(CFGTracer):
                     target_names = [trailer.target]
                 else:
                     target_names = trailer.target.get_all_sub_nodes(uni.Name)
-                
+
                 for target_name in target_names:
                     if target_name.value == "torch":
                         method_name = ""
                         if isinstance(trailer.right, uni.Name):
                             method_name = trailer.right.value
-                        
+
                         # List of torch operations that cause graph breaks
                         graph_breaking_ops = ["max", "min", "sum"]
                         if method_name in graph_breaking_ops:
-                            print(f"{indent}  -> Contains torch.{method_name}() (graph-breaking op)")
+                            print(
+                                f"{indent}  -> Contains torch.{method_name}() (graph-breaking op)"
+                            )
                             return True, f"uses torch.{method_name}()"
-        
+
         # Recursively check all symbols used in the definition
         name_nodes = current.value.get_all_sub_nodes(uni.Name)
         for name_node in name_nodes:
@@ -332,10 +384,12 @@ class BreakFinder(CFGTracer):
             dep_symbol = current.sym_tab.lookup(name=name_node.value, deep=True)
             if dep_symbol and dep_symbol.sym_name not in visited:
                 print(f"{indent}  -> Depends on: {dep_symbol.sym_name}")
-                has_break, reason = self.trace_symbol_dependencies(dep_symbol, visited, depth + 1)
+                has_break, reason = self.trace_symbol_dependencies(
+                    dep_symbol, visited, depth + 1
+                )
                 if has_break:
                     return True, f"depends on '{dep_symbol.sym_name}' which {reason}"
-        
+
         return False, ""
 
     def analysis_on_stmt(self, stmt: uni.UniCFGNode) -> None:
@@ -343,7 +397,7 @@ class BreakFinder(CFGTracer):
         # Skip checking entire Ability nodes - we want to check individual statements inside
         if isinstance(stmt, uni.Ability):
             return
-        
+
         # Check for side-effect causing calls in statements
         has_side_effect, se_reason = self.check_side_effect_call(stmt)
         if has_side_effect:
@@ -353,9 +407,11 @@ class BreakFinder(CFGTracer):
                 self.side_effect_stmts.append(stmt)
                 stmt.has_break_se = True  # type: ignore
                 stmt.side_effect_reason = se_reason  # type: ignore
-                print(f"\n  *** SIDE EFFECT BREAK DETECTED - Marked {type(stmt).__name__} at line {stmt.loc.first_line} ***")
+                print(
+                    f"\n  *** SIDE EFFECT BREAK DETECTED - Marked {type(stmt).__name__} at line {stmt.loc.first_line} ***"
+                )
                 print(f"  Reason: {se_reason}")
-        
+
         # Check for dynamic control flow breaks in if statements
         if isinstance(stmt, uni.IfStmt):
             # Check if we've already analyzed this statement (avoid duplicates in CFG traversal)
@@ -363,34 +419,42 @@ class BreakFinder(CFGTracer):
             if stmt_id in self.analyzed_stmts:
                 return
             self.analyzed_stmts.add(stmt_id)
-            
+
             symbols = self.gather_external_symbols(stmt)
-            print(f"\nExternal symbols in IfStmt at line {stmt.loc.first_line}: {symbols}")
-            
+            print(
+                f"\nExternal symbols in IfStmt at line {stmt.loc.first_line}: {symbols}"
+            )
+
             has_graph_break = False
             graph_break_reasons = []
-            
+
             for sym in symbols:
                 print(f"\nAnalyzing symbol: {sym.sym_name}, Type: {sym.sym_type}")
-                
+
                 # Check if symbol is used with .sum() in the condition
-                has_sum_in_condition = self.check_symbol_has_method_call_in_expr(stmt.condition, sym, "sum")
+                has_sum_in_condition = self.check_symbol_has_method_call_in_expr(
+                    stmt.condition, sym, "sum"
+                )
                 if has_sum_in_condition:
-                    reason = f"Symbol '{sym.sym_name}' is used with .sum() in the condition"
+                    reason = (
+                        f"Symbol '{sym.sym_name}' is used with .sum() in the condition"
+                    )
                     print(f"  -> {reason}")
                     has_graph_break = True
                     graph_break_reasons.append(reason)
                     continue  # No need to trace further
-                
+
                 # Check if symbol's definition contains .sum()
                 has_sum_in_defn = self.check_symbol_has_method_call(sym, "sum")
                 if has_sum_in_defn:
-                    reason = f"Symbol '{sym.sym_name}' contains .sum() in its definition"
+                    reason = (
+                        f"Symbol '{sym.sym_name}' contains .sum() in its definition"
+                    )
                     print(f"  -> {reason}")
                     has_graph_break = True
                     graph_break_reasons.append(reason)
                     continue
-                
+
                 # Trace symbol dependencies recursively
                 print(f"  -> Tracing dependencies for '{sym.sym_name}':")
                 has_break, trace_reason = self.trace_symbol_dependencies(sym)
@@ -399,7 +463,7 @@ class BreakFinder(CFGTracer):
                     print(f"  -> GRAPH BREAK: {reason}")
                     has_graph_break = True
                     graph_break_reasons.append(reason)
-            
+
             # Mark the statement with a graph break label if detected
             if has_graph_break:
                 self.graph_break_stmts.append(stmt)
@@ -409,5 +473,7 @@ class BreakFinder(CFGTracer):
                 # Keep old names for backward compatibility
                 stmt.has_dynamo_graph_break = True  # type: ignore
                 stmt.graph_break_reasons = graph_break_reasons  # type: ignore
-                print(f"\n  *** DYNAMIC CONTROL FLOW BREAK DETECTED - Marked IfStmt at line {stmt.loc.first_line} ***")
+                print(
+                    f"\n  *** DYNAMIC CONTROL FLOW BREAK DETECTED - Marked IfStmt at line {stmt.loc.first_line} ***"
+                )
                 print(f"  Reasons: {'; '.join(graph_break_reasons)}")

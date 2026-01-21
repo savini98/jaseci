@@ -785,6 +785,7 @@ class UniCFGNode(UniNode):
         bb_nodes.append(end_node)
         return bb_nodes
 
+
 class Expr(UniNode):
     """Expression is a combination of values, variables operators and fuctions that are evaluated to produce a value.
 
