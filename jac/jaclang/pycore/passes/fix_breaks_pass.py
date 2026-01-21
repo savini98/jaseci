@@ -11,8 +11,8 @@ from jaclang.pycore.passes.catch_breaks_pass import CatchBreaksPass
 T = TypeVar("T", bound=ast3.AST)
 
 
-class FixBreaksPass(UniPass):
-    """Fix Breaks Pass to transform if statements with graph breaks into torch.where."""
+class FixDynBreaksPass(UniPass):
+    """Fix Dynamic Control Flow Breaks Pass - transforms if statements with dynamic control flow breaks into torch.where."""
 
     def gen_name(self, node: uni.UniNode, name: Tok, value: str) -> uni.Name:
         """Generate Name."""

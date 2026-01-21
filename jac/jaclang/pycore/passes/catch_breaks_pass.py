@@ -406,7 +406,7 @@ class BreakFinder(CFGTracer):
                 # Add custom attributes to mark this statement
                 stmt.has_break_dyn_cf = True  # type: ignore
                 stmt.dyn_cf_reasons = graph_break_reasons  # type: ignore
-                # Keep old name for backward compatibility with FixBreaksPass
+                # Keep old names for backward compatibility
                 stmt.has_dynamo_graph_break = True  # type: ignore
                 stmt.graph_break_reasons = graph_break_reasons  # type: ignore
                 print(f"\n  *** DYNAMIC CONTROL FLOW BREAK DETECTED - Marked IfStmt at line {stmt.loc.first_line} ***")
