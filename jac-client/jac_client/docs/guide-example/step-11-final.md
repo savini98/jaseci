@@ -689,18 +689,18 @@ cl {
 
 ### Running the App
 
-1. **Save the code** to `app.jac`
+1. **Save the code** to `main.jac`
 
 2. **Start the server:**
 
    ```bash
-   jac serve src/app.jac
+   jac start main.jac
    ```
 
 3. **Open in browser:**
 
    ```
-   http://localhost:8000/page/app
+   http://localhost:8000/cl/app
    ```
 
 4. **Test it out:**
@@ -861,23 +861,10 @@ You've completed the tutorial! Here are some ideas to continue learning:
 
 **Deployment options:**
 
-- Jac Cloud (easiest)
 - Vercel
 - Netlify
 - Digital Ocean
 - AWS
-
-**Steps:**
-
-```bash
-# Install Jac Cloud
-pip install jac-cloud
-
-# Deploy
-jac cloud deploy app.jac
-
-# Your app is now live!
-```
 
 ### 4. Learn Advanced Jac Features
 

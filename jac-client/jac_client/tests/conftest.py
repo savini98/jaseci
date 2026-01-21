@@ -15,13 +15,31 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from jaclang.pycore.program import JacProgram
 from jaclang.pycore.runtime import JacRuntime as Jac
-from jaclang.pycore.runtime import JacRuntimeImpl, plugin_manager
+from jaclang.pycore.runtime import JacRuntimeImpl, JacRuntimeInterface, plugin_manager
+
+# =============================================================================
+# Console Output Normalization - Disable Rich styling during tests
+# =============================================================================
+
+
+@pytest.fixture(autouse=True)
+def disable_rich_console_formatting(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable Rich console formatting for consistent test output.
+
+    Sets NO_COLOR and NO_EMOJI environment variables to ensure tests
+    get plain text output without ANSI codes or emoji prefixes.
+    """
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("NO_EMOJI", "1")
+
 
 # Store unregistered plugins globally for session-level management
 _external_plugins: list = []
@@ -79,11 +97,34 @@ def _get_env_with_npm() -> dict[str, str]:
 
 
 @pytest.fixture(autouse=True)
-def reset_jac_machine() -> Generator[None, None, None]:
+def reset_jac_machine(tmp_path: Path) -> Generator[None, None, None]:
     """Reset Jac machine before and after each test."""
-    Jac.reset_machine()
+    # Close existing context if any
+    if Jac.exec_ctx is not None:
+        Jac.exec_ctx.mem.close()
+
+    # Remove user .jac modules from sys.modules so they get re-imported fresh
+    # Keep jaclang.* and __main__ to avoid breaking dataclass references
+    for mod in list(Jac.loaded_modules.values()):
+        if not mod.__name__.startswith("jaclang.") and mod.__name__ != "__main__":
+            sys.modules.pop(mod.__name__, None)
+    Jac.loaded_modules.clear()
+
+    # Set up fresh state
+    Jac.base_path_dir = str(tmp_path)
+    Jac.program = JacProgram()
+    Jac.pool = ThreadPoolExecutor()
+    Jac.exec_ctx = JacRuntimeInterface.create_j_context(user_root=None)
+
     yield
-    Jac.reset_machine()
+
+    # Cleanup after test
+    if Jac.exec_ctx is not None:
+        Jac.exec_ctx.mem.close()
+    for mod in list(Jac.loaded_modules.values()):
+        if not mod.__name__.startswith("jaclang.") and mod.__name__ != "__main__":
+            sys.modules.pop(mod.__name__, None)
+    Jac.loaded_modules.clear()
 
 
 # Session-scoped cache for npm installation
@@ -123,11 +164,11 @@ def npm_cache_dir() -> Generator[Path, None, None]:
     jac_toml = cache_dir / "jac.toml"
     jac_toml.write_text(_get_minimal_jac_toml())
 
-    # Run jac add --cl to install packages
+    # Run jac add --npm to install packages
     jac_cmd = _get_jac_command()
     env = _get_env_with_npm()
     result = subprocess.run(
-        [*jac_cmd, "add", "--cl"],
+        [*jac_cmd, "add", "--npm"],
         cwd=cache_dir,
         capture_output=True,
         text=True,
@@ -213,7 +254,7 @@ antd = "^6.0.0"
     jac_cmd = _get_jac_command()
     env = _get_env_with_npm()
     result = subprocess.run(
-        [*jac_cmd, "add", "--cl"],
+        [*jac_cmd, "add", "--npm"],
         cwd=tmp_path,
         capture_output=True,
         text=True,

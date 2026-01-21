@@ -69,7 +69,7 @@ Jac Client uses `jac.toml` (the standard Jac project configuration file) for all
 name = "my-app"
 version = "1.0.0"
 description = "My Jac application"
-entry-point = "src/app.jac"
+entry-point = "main.jac"
 
 # Vite configuration
 [plugins.client.vite]
@@ -104,10 +104,44 @@ sass = "^1.77.8"
 | Section | Purpose | Documentation |
 |---------|---------|--------------|
 | `[project]` | Project metadata | Core Jac config |
+| `[serve]` | Server and routing configuration | See below |
 | `[plugins.client.vite]` | Vite build configuration | [Custom Configuration](./custom-config.md) |
 | `[plugins.client.ts]` | tsconfig.json customization | [Custom Configuration](./custom-config.md) |
 | `[dependencies.npm]` | npm runtime dependencies | [Package Management](./package-management.md) |
 | `[dependencies.npm.dev]` | npm dev dependencies | [Package Management](./package-management.md) |
+
+### Server Configuration (`[serve]`)
+
+The `[serve]` section configures how `jac start` handles routing for client-side applications:
+
+```toml
+[serve]
+cl_route_prefix = "cl"      # URL prefix for client apps (default: "cl")
+base_route_app = "app"      # Client app to serve at root "/" (default: none)
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `cl_route_prefix` | string | `"cl"` | The URL path prefix for client-side apps. Apps are served at `/<prefix>/<app_name>`. |
+| `base_route_app` | string | `""` | Name of a client app to serve at the root `/` path. When set, visiting `/` renders this app instead of the API info page. |
+
+**Example: Custom route prefix**
+
+```toml
+[serve]
+cl_route_prefix = "pages"
+```
+
+With this config, client apps are accessed at `/pages/MyApp` instead of `/cl/MyApp`.
+
+**Example: Serve app at root**
+
+```toml
+[serve]
+base_route_app = "app"
+```
+
+With this config, visiting `/` renders the `app` client function directly, making it the default landing page.
 
 ## Configuration Loading
 
@@ -158,17 +192,17 @@ sass = "^1.77.8"
 
 ### Package Lifecycle
 
-1. **Add Package**: `jac add --cl <package>`
+1. **Add Package**: `jac add --npm <package>`
    - Updates `jac.toml`
    - Regenerates `package.json`
    - Runs `npm install`
 
-2. **Install All Packages**: `jac add --cl` (no package name)
+2. **Install All Packages**: `jac add --npm` (no package name)
    - Reads all packages from `jac.toml`
    - Regenerates `package.json`
    - Runs `npm install`
 
-3. **Remove Package**: `jac remove --cl <package>`
+3. **Remove Package**: `jac remove --npm <package>`
    - Removes from `jac.toml`
    - Regenerates `package.json`
    - Runs `npm install`
@@ -236,28 +270,28 @@ export default {
 
 | Command | Purpose |
 |---------|---------|
-| `jac create --cl <name>` | Create new client project with `jac.toml` |
-| `jac add --cl <package>` | Add npm package |
-| `jac remove --cl <package>` | Remove npm package |
-| `jac add --cl` | Install all packages from jac.toml |
+| `jac create --use client <name>` | Create new client project with `jac.toml` |
+| `jac add --npm <package>` | Add npm package |
+| `jac remove --npm <package>` | Remove npm package |
+| `jac add --npm` | Install all packages from jac.toml |
 
 ### Command Workflow
 
 ```bash
 # 1. Create project
-jac create --cl my-app
+jac create --use client my-app
 cd my-app
 
 # 2. jac.toml is automatically created with organized folder structure
 
 # 3. Add custom packages
-jac add --cl lodash
-jac add --cl --dev sass
+jac add --npm lodash
+jac add --npm --dev sass
 
 # 4. Customize build (edit jac.toml)
 
 # 5. Build/serve
-jac serve src/app.jac
+jac start main.jac
 ```
 
 ## File Organization
@@ -267,9 +301,8 @@ jac serve src/app.jac
 ```
 project-root/
 ├── jac.toml                   # ← Source of truth (committed)
-├── src/
-│   ├── app.jac                # Your Jac application
-│   └── components/            # TypeScript components (optional)
+├── main.jac                   # Your Jac application
+├── components/                # TypeScript components (optional)
 ├── assets/                    # Static assets
 ├── compiled/                  # Compiled output
 │   ├── client_runtime.js
@@ -290,8 +323,8 @@ project-root/
 **Commit**:
 
 - `jac.toml` - Your configuration
-- `src/app.jac` - Your application code
-- `src/components/` - Your components
+- `main.jac` - Your application code
+- `components/` - Your components
 - `assets/` - Your assets
 
 **Don't Commit** (automatically gitignored):
@@ -306,10 +339,10 @@ project-root/
 
 ```bash
 # Good: Use CLI
-jac add --cl lodash
+jac add --npm lodash
 
 # Less ideal: Manual edit
-# (requires running jac add --cl after)
+# (requires running jac add --npm after)
 ```
 
 ### 2. Minimal Configuration
@@ -376,7 +409,7 @@ axios = "^1.6.0"        # Caret for minor updates
 
 **Solutions**:
 
-- Run `jac add --cl` to regenerate
+- Run `jac add --npm` to regenerate
 - Delete `.jac/client/` and rebuild
 - Check jac.toml syntax
 

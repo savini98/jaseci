@@ -19,7 +19,7 @@ type checking, and semantic analysis throughout the compilation process.
 """
 
 import jaclang.pycore.unitree as uni
-from jaclang.pycore.constant import SymbolAccess
+from jaclang.pycore.constant import SymbolAccess, Tokens
 from jaclang.pycore.passes.uni_pass import UniPass
 from jaclang.pycore.unitree import UniScopeNode
 
@@ -347,13 +347,20 @@ class SymTabBuildPass(UniPass):
     def exit_iter_for_stmt(self, node: uni.IterForStmt) -> None:
         self.pop_scope()
 
+    def _def_insert_unpacking(self, node: uni.Expr, sym_tab: UniScopeNode) -> None:
+        """Recursively define symbols in unpacking expressions."""
+        if isinstance(node, uni.Name):
+            sym_tab.def_insert(node, single_decl="iterator")
+        elif isinstance(node, (uni.TupleVal, uni.ListVal)):
+            for target_var in node.values:
+                if isinstance(target_var, uni.Expr):
+                    self._def_insert_unpacking(target_var, sym_tab)
+        elif isinstance(node, uni.UnaryExpr) and node.op.name == Tokens.STAR_MUL:
+            self._def_insert_unpacking(node.operand, sym_tab)
+
     def enter_in_for_stmt(self, node: uni.InForStmt) -> None:
         self.push_scope_and_link(node)
-        # 1. for <name> in collection
-        if isinstance(node.target, uni.Name):
-            node.sym_tab.def_insert(node.target, single_decl="iterator")
-        # 2. for (<name> (, <name> ...)*) in collection
-        # TODO:
+        self._def_insert_unpacking(node.target, node.sym_tab)
 
     def exit_in_for_stmt(self, node: uni.InForStmt) -> None:
         self.pop_scope()
@@ -370,6 +377,10 @@ class SymTabBuildPass(UniPass):
     def exit_with_stmt(self, node: uni.WithStmt) -> None:
         self.pop_scope()
 
+    def exit_expr_as_item(self, node: uni.ExprAsItem) -> None:
+        if node.alias and isinstance(node.alias, uni.Name):
+            node.alias.sym_tab.def_insert(node.alias, single_decl="context var")
+
     def enter_lambda_expr(self, node: uni.LambdaExpr) -> None:
         self.push_scope_and_link(node)
 
@@ -378,6 +389,8 @@ class SymTabBuildPass(UniPass):
 
     def enter_inner_compr(self, node: uni.InnerCompr) -> None:
         self.push_scope_and_link(node)
+        if isinstance(node.target, uni.Name):
+            node.sym_tab.def_insert(node.target, single_decl="iterator")
 
     def exit_inner_compr(self, node: uni.InnerCompr) -> None:
         self.pop_scope()

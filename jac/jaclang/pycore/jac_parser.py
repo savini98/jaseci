@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import keyword
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from typing import TYPE_CHECKING, TypeAlias, TypeVar, cast
 
 import jaclang.pycore.lark_jac_parser as jl
 import jaclang.pycore.unitree as uni
-from jaclang.pycore.constant import EdgeDir
+from jaclang.pycore.constant import CodeContext, EdgeDir
 from jaclang.pycore.constant import Tokens as Tok
 from jaclang.pycore.passes import BaseTransform, Transform
 
@@ -39,6 +40,33 @@ TOKEN_MAP.update({
     "BW_XOR_EQ": "^=", "BW_NOT_EQ": "~=", "LSHIFT_EQ": "<<=",
 })
 # fmt: on
+
+
+def _extract_jac_keywords() -> set[str]:
+    """Extract Jac keywords from TOKEN_MAP."""
+    keywords = set()
+
+    # Iterate through all KW_* tokens
+    for tok_name in dir(Tok):
+        if (
+            not (
+                tok_name.startswith("KW_")
+                or (tok_name.endswith("_OP"))
+                or tok_name in ("NULL", "NOT")
+            )
+            or tok_name not in TOKEN_MAP
+        ):
+            continue
+        else:
+            keywords.add(TOKEN_MAP[tok_name])
+    keywords.update(["or", "and", "False", "True"])
+
+    return keywords
+
+
+JAC_KEYWORDS = _extract_jac_keywords()
+# Python keywords that should NOT be used as names in Jac
+PYTHON_ONLY_KEYWORDS = set(keyword.kwlist) - JAC_KEYWORDS
 
 
 @dataclass
@@ -91,32 +119,89 @@ class JacParser(Transform[uni.Source, uni.Module]):
             child.parent = node
             JacParser._recalculate_parents(child)
 
+    def _log_python_only_keyword_error(
+        self, keyword: str, node: uni.Token | None = None
+    ) -> None:
+        """Log error for Python-only keywords that are not valid in Jac."""
+        self.log_error(
+            f"'{keyword}' keyword is not allowed in Jac",
+            node_override=node,
+        )
+        self.log_error(
+            "Jac does not allow this keyword in any syntactic position",
+            node_override=node,
+        )
+
     @classmethod
     def _coerce_client_module(cls, module: uni.Module) -> None:
-        """Treat a `.cl.jac` file as client code without wrapping in ClientBlock.
+        """Treat a `.cl.jac` file as client code, except for explicit sv blocks.
 
         This allows authoring client-only modules without sprinkling `cl` in front
-        of every statement. We mark nodes with is_client_decl=True so client
-        codegen logic can reliably detect them.
+        of every statement. Explicit sv{} blocks can override to include server code.
         """
         elements: list[uni.ElementStmt] = []
         for stmt in module.body:
             if isinstance(stmt, uni.ClientBlock):
                 elements.extend(stmt.body)
+            elif isinstance(stmt, uni.ServerBlock):
+                # Skip ServerBlocks - they remain server-side even in .cl.jac
+                elements.append(stmt)
             elif isinstance(stmt, uni.ElementStmt):
                 elements.append(stmt)
 
-        # Mark all top-level statements as client declarations,
-        # and propagate one level into `with entry` blocks.
+        # Mark all top-level statements as CLIENT context,
+        # except for ServerBlocks and explicit sv statements which keep their SERVER context.
+        # Propagate one level into `with entry` blocks.
         for elem in elements:
-            if isinstance(elem, uni.ClientFacingNode):
-                elem.is_client_decl = True
+            if isinstance(elem, uni.ServerBlock):
+                continue  # Keep as SERVER
+            if isinstance(elem, uni.ContextAwareNode):
+                # Skip elements that have explicit sv token (not just default SERVER context)
+                context_token = elem._source_context_token()
+                if context_token is not None and context_token.name == Tok.KW_SERVER:
+                    continue  # Keep explicit sv as SERVER
+                elem.code_context = CodeContext.CLIENT
                 if isinstance(elem, uni.ModuleCode) and elem.body:
                     for inner in elem.body:
-                        if isinstance(inner, uni.ClientFacingNode):
-                            inner.is_client_decl = True
+                        if isinstance(inner, uni.ContextAwareNode):
+                            inner.code_context = CodeContext.CLIENT
 
         # Keep elements as direct module children (no ClientBlock wrapper)
+        module.body = elements
+        module.normalize(deep=False)
+        cls._recalculate_parents(module)
+
+    @classmethod
+    def _coerce_server_module(cls, module: uni.Module) -> None:
+        """Treat a `.sv.jac` file as server code (explicit marking).
+
+        This is mostly for symmetry with .cl.jac. Since .jac files default to
+        server context, .sv.jac provides explicit documentation of intent.
+        Explicit cl{} blocks can override to include client code.
+        """
+        elements: list[uni.ElementStmt] = []
+        for stmt in module.body:
+            if isinstance(stmt, uni.ServerBlock):
+                elements.extend(stmt.body)
+            elif isinstance(stmt, uni.ClientBlock):
+                # Keep ClientBlocks - they remain client-side even in .sv.jac
+                elements.append(stmt)
+            elif isinstance(stmt, uni.ElementStmt):
+                elements.append(stmt)
+
+        # Mark all top-level statements as SERVER context,
+        # except for ClientBlocks which keep their CLIENT context.
+        for elem in elements:
+            if isinstance(elem, uni.ClientBlock):
+                continue  # Keep as CLIENT
+            if isinstance(elem, uni.ContextAwareNode):
+                elem.code_context = CodeContext.SERVER
+                if isinstance(elem, uni.ModuleCode) and elem.body:
+                    for inner in elem.body:
+                        if isinstance(inner, uni.ContextAwareNode):
+                            inner.code_context = CodeContext.SERVER
+
+        # Keep elements as direct module children (no ServerBlock wrapper)
         module.body = elements
         module.normalize(deep=False)
         cls._recalculate_parents(module)
@@ -153,6 +238,8 @@ class JacParser(Transform[uni.Source, uni.Module]):
                 mod.has_syntax_errors = True
             if ir_in.file_path.endswith(".cl.jac"):
                 self._coerce_client_module(mod)
+            elif ir_in.file_path.endswith(".sv.jac"):
+                self._coerce_server_module(mod)
             self.ir_out = mod
             return mod
         except jl.UnexpectedInput as e:
@@ -231,6 +318,18 @@ class JacParser(Transform[uni.Source, uni.Module]):
                 if e.token_history and len(e.token_history) >= 1
                 else None
             )
+
+            # Check for unsupported python keywords in code blocks
+            if (
+                e.token
+                and e.token.value in PYTHON_ONLY_KEYWORDS
+                and (Tok.RBRACE.name in e.accepts or Tok.SEMI.name in e.accepts)
+            ):
+                self._log_python_only_keyword_error(
+                    e.token.value, self.error_to_token(e)
+                )
+                return True
+
             # If last token is DOT and we expect a NAME, insert a NAME token
             if (
                 last_tok
@@ -505,40 +604,68 @@ class JacParser(Transform[uni.Source, uni.Module]):
         def toplevel_stmt(self, _: None) -> uni.ElementStmt | list[uni.ElementStmt]:
             """Grammar rule.
 
-            toplevel_stmt: KW_CLIENT? onelang_stmt
-                | KW_CLIENT LBRACE onelang_stmt* RBRACE
+            toplevel_stmt: (KW_CLIENT | KW_SERVER)? onelang_stmt
+                | (KW_CLIENT | KW_SERVER) LBRACE onelang_stmt* RBRACE
                 | py_code_block
             """
+            # Check for context keywords (mutually exclusive)
             client_tok = self.match_token(Tok.KW_CLIENT)
-            if client_tok:
+            server_tok = self.match_token(Tok.KW_SERVER) if not client_tok else None
+
+            if client_tok or server_tok:
+                # Determine context
+                context = CodeContext.CLIENT if client_tok else CodeContext.SERVER
+                context_tok = client_tok if client_tok else server_tok
+                assert context_tok is not None  # One must be set due to if condition
+
                 lbrace = self.match_token(Tok.LBRACE)
                 if lbrace:
-                    # Create a ClientBlock to wrap the statements
+                    # Create a ClientBlock or ServerBlock to wrap the statements
                     elements: list[uni.ElementStmt] = []
                     while elem := self.match(uni.ElementStmt):
-                        if isinstance(elem, uni.ClientFacingNode):
-                            elem.is_client_decl = True
+                        # VALIDATION: Prevent nested context blocks
+                        if isinstance(elem, (uni.ClientBlock, uni.ServerBlock)):
+                            opposite = (
+                                "sv" if isinstance(elem, uni.ClientBlock) else "cl"
+                            )
+                            current = "cl" if client_tok else "sv"
+                            self.error(
+                                elem,
+                                f"Cannot nest {opposite} blocks inside {current} blocks. "
+                                f"Code context keywords are mutually exclusive.",
+                            )
+
+                        if isinstance(elem, uni.ContextAwareNode):
+                            elem.code_context = context
                             # Propagate to ModuleCode children (with entry blocks)
                             if isinstance(elem, uni.ModuleCode) and elem.body:
                                 for stmt in elem.body:
-                                    if isinstance(stmt, uni.ClientFacingNode):
-                                        stmt.is_client_decl = True
+                                    if isinstance(stmt, uni.ContextAwareNode):
+                                        stmt.code_context = context
                         elements.append(elem)
                     self.consume(uni.Token)  # RBRACE
-                    return uni.ClientBlock(
-                        body=elements,
-                        kid=self.flat_cur_nodes,
-                    )
+
+                    if client_tok:
+                        return uni.ClientBlock(
+                            body=elements,
+                            kid=self.flat_cur_nodes,
+                        )
+                    else:  # server_tok
+                        return uni.ServerBlock(
+                            body=elements,
+                            kid=self.flat_cur_nodes,
+                        )
                 else:
+                    # Single statement: cl/sv import foo;
                     element = self.consume(uni.ElementStmt)
-                    if isinstance(element, uni.ClientFacingNode):
-                        element.is_client_decl = True
+                    if isinstance(element, uni.ContextAwareNode):
+                        element.code_context = context
                         # Propagate to ModuleCode children (with entry blocks)
                         if isinstance(element, uni.ModuleCode) and element.body:
                             for stmt in element.body:
-                                if isinstance(stmt, uni.ClientFacingNode):
-                                    stmt.is_client_decl = True
-                        element.add_kids_left([client_tok])
+                                if isinstance(stmt, uni.ContextAwareNode):
+                                    stmt.code_context = context
+                        element.add_kids_left([context_tok])
                     return element
             else:
                 return self.consume(uni.ElementStmt)
@@ -1256,6 +1383,7 @@ class JacParser(Transform[uni.Source, uni.Module]):
             name = self.consume(uni.Name)
             type_tag = self.consume(uni.SubTag)
             value = self.consume(uni.Expr) if self.match_token(Tok.EQ) else None
+
             return uni.ParamVar(
                 name=name,
                 type_tag=type_tag,
@@ -1724,6 +1852,7 @@ class JacParser(Transform[uni.Source, uni.Module]):
             """
             self.consume_token(Tok.KW_RETURN)
             expr = self.match(uni.Expr)
+
             return uni.ReturnStmt(
                 expr=expr,
                 kid=self.cur_nodes,
@@ -1824,6 +1953,7 @@ class JacParser(Transform[uni.Source, uni.Module]):
                 value = self.consume(uni.Expr) if self.match_token(Tok.EQ) else None
 
             valid_assignees = [i for i in assignees if isinstance(i, (uni.Expr))]
+
             if is_aug:
                 return uni.Assignment(
                     target=valid_assignees,
@@ -3786,8 +3916,13 @@ class JacParser(Transform[uni.Source, uni.Module]):
                 pos_start=token.start_pos if token.start_pos is not None else 0,
                 pos_end=token.end_pos if token.end_pos is not None else 0,
             )
-            if isinstance(ret, uni.Name) and token.type == Tok.KWESC_NAME:
-                ret.is_kwesc = True
+            if isinstance(ret, uni.Name):
+                if token.type == Tok.KWESC_NAME:
+                    ret.is_kwesc = True
+                # Check if Python-only keywords are used as names
+                elif ret.sym_name in PYTHON_ONLY_KEYWORDS:
+                    self.parse_ref._log_python_only_keyword_error(ret.sym_name, ret)
+
             self.terminals.append(ret)
             return ret
 

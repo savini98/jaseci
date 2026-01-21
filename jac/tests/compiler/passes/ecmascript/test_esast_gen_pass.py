@@ -261,3 +261,155 @@ def test_export_semantics_for_pub_declarations(
     assert "export const PrivateStatus" not in js_code, (
         "Private enum should NOT have export keyword"
     )
+
+
+def test_reactive_state_generates_use_state(
+    fixture_path: Callable[[str], str],
+) -> None:
+    """Test that has variables in client context generate useState calls."""
+    es_ast = compile_to_esast(fixture_path("reactive_state.jac"))
+    js_code = es_to_js(es_ast)
+
+    # Check that useState is imported from @jac-client/utils (auto-injected)
+    assert 'import { useState } from "@jac-client/utils"' in js_code, (
+        "useState should be auto-imported from @jac-client/utils"
+    )
+
+    # Check that has declarations generate useState destructuring
+    # has count: int = 0; -> const [count, setCount] = useState(0);
+    assert "const [count, setCount] = useState(0)" in js_code, (
+        "has count should generate useState destructuring"
+    )
+    assert 'const [name, setName] = useState("test")' in js_code, (
+        "has name should generate useState destructuring"
+    )
+
+    # Check that assignments to reactive vars generate setter calls
+    # count = count + 1; -> setCount(count + 1);
+    assert "setCount((count + 1))" in js_code, (
+        "Assignment to reactive var should use setter"
+    )
+    assert "setCount(42)" in js_code, "Direct assignment should use setter"
+    assert "setName(" in js_code, "Assignment to name should use setName"
+
+
+def test_reactive_state_in_cl_jac_file(
+    fixture_path: Callable[[str], str],
+) -> None:
+    """Test that has variables work in .cl.jac files without explicit cl {} wrapper.
+
+    Regression test for bug where has variables only worked inside cl {} blocks
+    in .jac files, but failed when defined directly in .cl.jac files.
+    """
+    es_ast = compile_to_esast(fixture_path("reactive_state.cl.jac"))
+    js_code = es_to_js(es_ast)
+
+    # Check that useState is imported from @jac-client/utils (auto-injected)
+    assert 'import { useState } from "@jac-client/utils"' in js_code, (
+        "useState should be auto-imported from @jac-client/utils in .cl.jac files"
+    )
+
+    # Check that has declarations generate useState destructuring
+    # has count: int = 0; -> const [count, setCount] = useState(0);
+    assert "const [count, setCount] = useState(0)" in js_code, (
+        "has count should generate useState destructuring in .cl.jac files"
+    )
+    assert 'const [name, setName] = useState("test")' in js_code, (
+        "has name should generate useState destructuring in .cl.jac files"
+    )
+
+    # Check that assignments to reactive vars generate setter calls
+    # count = count + 1; -> setCount(count + 1);
+    assert "setCount((count + 1))" in js_code, (
+        "Assignment to reactive var should use setter in .cl.jac files"
+    )
+    assert "setCount(42)" in js_code, "Direct assignment should use setter"
+    assert "setName(" in js_code, "Assignment to name should use setName"
+
+
+def test_equivalent_context_patterns(fixture_path: Callable[[str], str]) -> None:
+    """Three files with same code but different cl/sv patterns should produce identical output.
+
+    Tests that:
+    1. Standard .jac with explicit cl/sv blocks
+    2. .cl.jac with default client + explicit sv block
+    3. .sv.jac with default server + explicit cl block
+
+    All three should produce identical JavaScript and Python output.
+    """
+    files = [
+        fixture_path("mixed_explicit.jac"),
+        fixture_path("mixed_cl_default.cl.jac"),
+        fixture_path("mixed_sv_default.sv.jac"),
+    ]
+
+    js_outputs = []
+    py_outputs = []
+
+    for filepath in files:
+        prog = JacProgram()
+        # Don't use no_cgen=True since we need Python output
+        ir = prog.compile(file_path=filepath)
+        assert not prog.errors_had, f"Errors in {filepath}: {prog.errors_had}"
+
+        # Get JavaScript output - use existing es_ast if already generated,
+        # otherwise run EsastGenPass
+        if ir.gen.es_ast:
+            js_code = es_to_js(ir.gen.es_ast)
+        else:
+            es_pass = EsastGenPass(ir, prog)
+            js_code = es_to_js(es_pass.ir_out.gen.es_ast)
+        js_outputs.append(js_code)
+
+        # Get Python output
+        py_code = ir.gen.py
+        py_outputs.append(py_code)
+
+    # All JavaScript outputs should be identical
+    assert js_outputs[0] == js_outputs[1], (
+        f"JS output mismatch between mixed_explicit.jac and mixed_cl_default.cl.jac:\n"
+        f"--- mixed_explicit.jac ---\n{js_outputs[0]}\n"
+        f"--- mixed_cl_default.cl.jac ---\n{js_outputs[1]}"
+    )
+    assert js_outputs[1] == js_outputs[2], (
+        f"JS output mismatch between mixed_cl_default.cl.jac and mixed_sv_default.sv.jac:\n"
+        f"--- mixed_cl_default.cl.jac ---\n{js_outputs[1]}\n"
+        f"--- mixed_sv_default.sv.jac ---\n{js_outputs[2]}"
+    )
+
+    # All Python outputs should be identical
+    assert py_outputs[0] == py_outputs[1], (
+        f"Python output mismatch between mixed_explicit.jac and mixed_cl_default.cl.jac:\n"
+        f"--- mixed_explicit.jac ---\n{py_outputs[0]}\n"
+        f"--- mixed_cl_default.cl.jac ---\n{py_outputs[1]}"
+    )
+    assert py_outputs[1] == py_outputs[2], (
+        f"Python output mismatch between mixed_cl_default.cl.jac and mixed_sv_default.sv.jac:\n"
+        f"--- mixed_cl_default.cl.jac ---\n{py_outputs[1]}\n"
+        f"--- mixed_sv_default.sv.jac ---\n{py_outputs[2]}"
+    )
+
+    # Sanity checks - verify both client and server code are present
+    assert "client_var" in js_outputs[0], "Client code should be in JavaScript output"
+    assert "client_func" in js_outputs[0], (
+        "Client function should be in JavaScript output"
+    )
+    assert "server_var" not in js_outputs[0], (
+        "Server code should NOT be in JavaScript output"
+    )
+
+    assert "server_var" in py_outputs[0], "Server code should be in Python output"
+    assert "server_func" in py_outputs[0], "Server function should be in Python output"
+    assert "MyWalker" in py_outputs[0], "Walker should be in Python output"
+
+    # Verify imports are routed to correct outputs
+    assert "lodash" in js_outputs[0], "Client import should be in JavaScript output"
+    assert "debounce" in js_outputs[0], (
+        "Client import symbol should be in JavaScript output"
+    )
+    assert "lodash" not in py_outputs[0], "Client import should NOT be in Python output"
+
+    assert "from os import path" in py_outputs[0], (
+        "Server import should be in Python output"
+    )
+    assert "os" not in js_outputs[0], "Server import should NOT be in JavaScript output"

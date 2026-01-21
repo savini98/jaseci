@@ -1,6 +1,7 @@
 """Client-side runtime for Jac JSX and walker interactions."""
 
 import from 'react' { * as React }
+import from 'react' { useState as reactUseState }
 import from 'react-dom/client' { * as ReactDOM }
 import from 'react-router-dom' {
     HashRouter as ReactRouterHashRouter,
@@ -12,27 +13,34 @@ import from 'react-router-dom' {
     useLocation as reactRouterUseLocation,
     useParams as reactRouterUseParams
 }
+import from 'react-error-boundary' { ErrorBoundary }
 
-def : pub __jacJsx(tag: any, props: dict = {}, children: any = []) -> any;
+def:pub __jacJsx(tag: any, props: dict = {}, children: any = []) -> any;
 
-glob : pub Router = ReactRouterHashRouter,
+# React hooks re-exported for auto-injection by `has` variables
+glob:pub useState = reactUseState,
+     Router = ReactRouterHashRouter,
      Routes = ReactRouterRoutes,
      Route = ReactRouterRoute,
      Link = ReactRouterLink,
      Navigate = ReactRouterNavigate,
      useNavigate = reactRouterUseNavigate,
      useLocation = reactRouterUseLocation,
-     useParams = reactRouterUseParams;
+     useParams = reactRouterUseParams,
+     JacClientErrorBoundary = ErrorBoundary;
 
-def : pub useRouter -> dict;
-def : pub navigate(path: str) -> None;
-async def : pub __jacSpawn(left: str, right: str = "", fields: dict = {}) -> any;
-def : pub jacSpawn(left: str, right: str = "", fields: dict = {}) -> any;
-async def : pub __jacCallFunction(function_name: str, args: dict = {}) -> any;
-async def : pub jacSignup(username: str, password: str) -> dict;
-async def : pub jacLogin(username: str, password: str) -> bool;
-def : pub jacLogout -> None;
-def : pub jacIsLoggedIn -> bool;
-def : pub __getLocalStorage(key: str) -> str;
-def : pub __setLocalStorage(key: str, value: str) -> None;
-def : pub __removeLocalStorage(key: str) -> None;
+def:pub useRouter -> dict;
+def:pub navigate(path: str) -> None;
+async def:pub __jacSpawn(left: str, right: str = "", fields: dict = {}) -> any;
+def:pub jacSpawn(left: str, right: str = "", fields: dict = {}) -> any;
+async def:pub __jacCallFunction(function_name: str, args: dict = {}) -> any;
+async def:pub jacSignup(username: str, password: str) -> dict;
+async def:pub jacLogin(username: str, password: str) -> bool;
+def:pub jacLogout -> None;
+def:pub jacIsLoggedIn -> bool;
+def:pub __getLocalStorage(key: str) -> str;
+def:pub __setLocalStorage(key: str, value: str) -> None;
+def:pub __removeLocalStorage(key: str) -> None;
+def:pub ErrorFallback(error: str, resetErrorBoundary: any) -> any;
+def:pub errorOverlay(filePath: str, errors: str) -> any;
+# React Router components

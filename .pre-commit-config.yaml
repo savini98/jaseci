@@ -28,7 +28,7 @@ repos:
     - id: markdownlint-cli2
       args: [--fix]
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.14.10
+    rev: v0.14.11
     hooks:
       - id: ruff
         args: [--fix]
@@ -119,8 +119,6 @@ repos:
               ^jac-client/jac_client/examples/asset-serving/css-with-image/assets/burger\.png$|
               ^jac-client/jac_client/examples/asset-serving/image-asset/assets/burger\.png$|
               ^jac-client/jac_client/examples/asset-serving/import-alias/assets/burger\.png$|
-              ^jac-streamlit/assets/interactive\ view\.png$|
-              ^jac-streamlit/assets/static\ view\.png$|
               ^jac/examples/rpg_game/jac_impl/fonts/8bitoperator_jve\.ttf$|
               ^jac/examples/rpg_game/lib_mode/8bitoperator_jve\.ttf$|
               ^jac/examples/rpg_game/python_impl/8bitoperator_jve\.ttf$
@@ -130,28 +128,4 @@ repos:
         name: Ban em-dashes (—)
         language: pygrep
         entry: '—'
-        types: [markdown]
-
-      - id: fix-emojis
-        name: Remove emojis (auto-fix)
-        language: python
-        entry: python3
-        args:
-          - -c
-          - |
-            import sys, re
-
-            EMOJI_RE = re.compile(
-                r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF'
-                r'\U0001F1E0-\U0001F1FF\U0001F90D-\U0001F9FF\U0001FA70-\U0001FAFF'
-                r'\u2600-\u26FF\u2700-\u27BF]'
-            )
-
-            for f in sys.argv[1:]:
-                with open(f, 'r', encoding='utf-8') as fh:
-                    content = fh.read()
-                fixed = EMOJI_RE.sub('', content)
-                if fixed != content:
-                    with open(f, 'w', encoding='utf-8') as fh:
-                        fh.write(fixed)
         types: [markdown]

@@ -50,7 +50,9 @@ obj TestConfig {
 obj ServeConfig {
     has port: int = 8000,
         session: str = "",
-        main: bool = True;
+        main: bool = True,
+        cl_route_prefix: str = "cl",
+        base_route_app: str = "";
 }
 
 """Format command defaults from [format] section."""
@@ -85,7 +87,7 @@ obj CacheConfig {
 obj PluginsConfig {
     has discovery: str = "auto",
         enabled: list[str] = [],
-        disabled: list[str] = [];
+        disabled: list[str] = [];  # Plugins temporarily bypassed by user
 }
 
 """Environment configuration from [environment] section."""
@@ -154,7 +156,6 @@ obj JacConfig {
     def get_data_dir -> Path;
     def get_client_dir -> Path;
     def is_valid -> bool;
-    static def create_default_toml(project_name: str) -> str;
     def save -> None;
     def add_dependency(
         name: str, version: str, dev: bool = False, dep_type: str = "python"

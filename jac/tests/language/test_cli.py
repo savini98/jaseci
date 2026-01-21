@@ -5,17 +5,26 @@ import inspect
 import io
 import os
 import re
-import subprocess
 import sys
 import tempfile
 import traceback
+import typing
 from collections.abc import Callable
 from contextlib import AbstractContextManager
+from pathlib import Path
 
 import pytest
 
-from jaclang.cli import cli
-from jaclang.cli.cmdreg import cmd_registry, extract_param_descriptions
+from jaclang.cli.commands import (  # type: ignore[attr-defined]
+    analysis,
+    execution,
+    project,
+    tools,
+    transform,
+)
+from jaclang.cli.commands import (  # type: ignore[attr-defined]
+    config as config_cmd,
+)
 from jaclang.runtimelib.builtin import printgraph
 
 
@@ -25,7 +34,7 @@ def test_jac_cli_run(
 ) -> None:
     """Basic test for pass."""
     with capture_stdout() as output:
-        cli.run(fixture_path("hello.jac"))
+        execution.run(fixture_path("hello.jac"))
 
     stdout_value = output.getvalue()
     assert "Hello World!" in stdout_value
@@ -37,7 +46,7 @@ def test_jac_cli_run_python_file(
 ) -> None:
     """Test running Python files with jac run command."""
     with capture_stdout() as output:
-        cli.run(fixture_path("python_run_test.py"))
+        execution.run(fixture_path("python_run_test.py"))
 
     stdout_value = output.getvalue()
     assert "Hello from Python!" in stdout_value
@@ -53,7 +62,7 @@ def test_jac_run_py_fstr(
 ) -> None:
     """Test running Python files with jac run command."""
     with capture_stdout() as output:
-        cli.run(fixture_path("pyfunc_fstr.py"))
+        execution.run(fixture_path("pyfunc_fstr.py"))
 
     stdout_value = output.getvalue()
     assert "Hello Peter" in stdout_value
@@ -71,7 +80,7 @@ def test_jac_run_py_fmt(
 ) -> None:
     """Test running Python files with jac run command."""
     with capture_stdout() as output:
-        cli.run(fixture_path("pyfunc_fmt.py"))
+        execution.run(fixture_path("pyfunc_fmt.py"))
 
     stdout_value = output.getvalue()
     assert "One" in stdout_value
@@ -89,7 +98,7 @@ def test_jac_run_pyfunc_kwesc(
 ) -> None:
     """Test running Python files with jac run command."""
     with capture_stdout() as output:
-        cli.run(fixture_path("pyfunc_kwesc.py"))
+        execution.run(fixture_path("pyfunc_kwesc.py"))
 
     stdout_value = output.getvalue()
     out = stdout_value.split("\n")
@@ -106,7 +115,7 @@ def test_jac_cli_alert_based_err(fixture_path: Callable[[str], str]) -> None:
     sys.stderr = captured_output
 
     try:
-        cli.enter(fixture_path("err2.jac"), entrypoint="speak", args=[])
+        execution.enter(fixture_path("err2.jac"), entrypoint="speak", args=[])
     except Exception as e:
         print(f"Error: {e}")
 
@@ -122,13 +131,13 @@ def test_jac_cli_alert_based_runtime_err(fixture_path: Callable[[str], str]) -> 
     sys.stdout = captured_output
     sys.stderr = captured_output
 
-    with pytest.raises(SystemExit) as excinfo:
-        cli.run(fixture_path("err_runtime.jac"))
+    try:
+        result = execution.run(fixture_path("err_runtime.jac"))
+    finally:
+        sys.stdout = sys.__stdout__
+        sys.stderr = sys.__stderr__
 
-    sys.stdout = sys.__stdout__
-    sys.stderr = sys.__stderr__
-
-    assert excinfo.value.code == 1
+    assert result == 1
 
     output = captured_output.getvalue()
 
@@ -165,7 +174,7 @@ def test_jac_impl_err(fixture_path: Callable[[str], str]) -> None:
     sys.stderr = captured_output
 
     try:
-        cli.enter(fixture_path("err.jac"), entrypoint="speak", args=[])
+        execution.enter(fixture_path("err.jac"), entrypoint="speak", args=[])
     except Exception:
         traceback.print_exc()
 
@@ -182,7 +191,7 @@ def test_param_name_diff(fixture_path: Callable[[str], str]) -> None:
     sys.stdout = captured_output
     sys.stderr = captured_output
     with contextlib.suppress(Exception):
-        cli.run(fixture_path("decl_defn_param_name.jac"))
+        execution.run(fixture_path("decl_defn_param_name.jac"))
     sys.stdout = sys.__stdout__
     sys.stderr = sys.__stderr__
 
@@ -200,7 +209,7 @@ def test_jac_test_err(fixture_path: Callable[[str], str]) -> None:
     captured_output = io.StringIO()
     sys.stdout = captured_output
     sys.stderr = captured_output
-    cli.test(fixture_path("baddy.jac"))
+    analysis.test(fixture_path("baddy.jac"))
     sys.stdout = sys.__stdout__
     sys.stderr = sys.__stderr__
     stdout_value = captured_output.getvalue()
@@ -213,7 +222,7 @@ def test_jac_ast_tool_pass_template(
 ) -> None:
     """Basic test for pass."""
     with capture_stdout() as output:
-        cli.tool("pass_template")
+        tools.tool("pass_template")
 
     stdout_value = output.getvalue()
     assert "Sub objects." in stdout_value
@@ -226,7 +235,7 @@ def test_ast_print(
 ) -> None:
     """Testing for print AstTool."""
     with capture_stdout() as output:
-        cli.tool("ir", ["ast", f"{fixture_path('hello.jac')}"])
+        tools.tool("ir", ["ast", f"{fixture_path('hello.jac')}"])
 
     stdout_value = output.getvalue()
     assert "+-- Token" in stdout_value
@@ -238,7 +247,7 @@ def test_ast_printgraph(
 ) -> None:
     """Testing for print AstTool."""
     with capture_stdout() as output:
-        cli.tool("ir", ["ast.", f"{fixture_path('hello.jac')}"])
+        tools.tool("ir", ["ast.", f"{fixture_path('hello.jac')}"])
 
     stdout_value = output.getvalue()
     assert '[label="MultiString"]' in stdout_value
@@ -250,7 +259,7 @@ def test_cfg_printgraph(
 ) -> None:
     """Testing for print CFG."""
     with capture_stdout() as output:
-        cli.tool("ir", ["cfg.", f"{fixture_path('hello.jac')}"])
+        tools.tool("ir", ["cfg.", f"{fixture_path('hello.jac')}"])
 
     stdout_value = output.getvalue()
     correct_graph = (
@@ -268,51 +277,44 @@ def test_del_clean(
 ) -> None:
     """Testing for print AstTool."""
     with capture_stdout() as output:
-        cli.check(f"{fixture_path('del_clean.jac')}")
+        analysis.check(f"{fixture_path('del_clean.jac')}")
 
     stdout_value = output.getvalue()
     assert "0 errors, 0 warnings" in stdout_value
 
 
-def test_build_and_run(
+def test_run_test(
     fixture_path: Callable[[str], str],
     capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
 ) -> None:
-    """Testing for print AstTool."""
-    if os.path.exists(f"{fixture_path('needs_import.jir')}"):
-        os.remove(f"{fixture_path('needs_import.jir')}")
-    with capture_stdout() as output:
-        cli.build(f"{fixture_path('needs_import.jac')}")
-        cli.run(f"{fixture_path('needs_import.jir')}")
+    """Basic test for jac test command with filepath."""
+    captured_stderr = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = captured_stderr
 
-    stdout_value = output.getvalue()
-    assert "Errors: 0, Warnings: 0" in stdout_value
-    assert "<module 'pyfunc' from" in stdout_value
+    try:
+        with capture_stdout():
+            analysis.test(fixture_path("run_test.jac"), maxfail=2)
+        stderr = captured_stderr.getvalue()
+    finally:
+        sys.stderr = old_stderr
 
-
-def test_run_test(fixture_path: Callable[[str], str]) -> None:
-    """Basic test for pass."""
-    process = subprocess.Popen(
-        ["jac", "test", f"{fixture_path('run_test.jac')}", "-m 2"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
     assert "Ran 3 tests" in stderr
     assert "FAILED (failures=2)" in stderr
     assert "F.F" in stderr
 
+
+def test_run_test_with_directory_filter(examples_path: Callable[[str], str]) -> None:
+    """Test jac test with directory and filter options.
+
+    Note: This test uses subprocess because the test runner has internal state
+    that can interfere between multiple invocations in the same process.
+    """
+    import subprocess
+
+    examples_dir = examples_path("")
     process = subprocess.Popen(
-        [
-            "jac",
-            "test",
-            "-d" + f"{fixture_path('../../../')}",
-            "-f" + "circle*",
-            "-x",
-        ],
-        stdin=subprocess.PIPE,
+        ["jac", "test", "-d", examples_dir, "-f", "circle*", "-x"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -322,9 +324,18 @@ def test_run_test(fixture_path: Callable[[str], str]) -> None:
     assert "circle_purfe.test" not in stdout
     assert "circle_pure.impl" not in stdout
 
+
+def test_run_test_with_filter_maxfail(fixture_path: Callable[[str], str]) -> None:
+    """Test jac test with filter and maxfail options.
+
+    Note: This test uses subprocess because the test runner has internal state
+    that can interfere between multiple invocations in the same process.
+    """
+    import subprocess
+
     process = subprocess.Popen(
-        ["jac", "test", "-f" + "*run_test.jac", "-m 3"],
-        stdin=subprocess.PIPE,
+        ["jac", "test", "-f", "*run_test.jac", "-m", "3"],
+        cwd=fixture_path(""),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -334,22 +345,23 @@ def test_run_test(fixture_path: Callable[[str], str]) -> None:
     assert "F.F" in stderr
 
 
-def test_run_specific_test_only(fixture_path: Callable[[str], str]) -> None:
+def test_run_specific_test_only(
+    fixture_path: Callable[[str], str],
+    capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
+) -> None:
     """Test a specific test case."""
-    process = subprocess.Popen(
-        [
-            "jac",
-            "test",
-            "-t",
-            "from_2_to_10",
-            fixture_path("jactest_main.jac"),
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
+    captured_stderr = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = captured_stderr
+
+    try:
+        with capture_stdout() as output:
+            analysis.test(fixture_path("jactest_main.jac"), test_name="from_2_to_10")
+        stdout = output.getvalue()
+        stderr = captured_stderr.getvalue()
+    finally:
+        sys.stderr = old_stderr
+
     assert "Ran 1 test" in stderr
     assert "Testing fibonacci numbers from 2 to 10." in stdout
     assert "Testing first 2 fibonacci numbers." not in stdout
@@ -358,7 +370,7 @@ def test_run_specific_test_only(fixture_path: Callable[[str], str]) -> None:
 
 def test_graph_coverage() -> None:
     """Test for coverage of graph cmd."""
-    graph_params = set(inspect.signature(cli.dot).parameters.keys())
+    graph_params = set(inspect.signature(tools.dot).parameters.keys())
     printgraph_params = set(inspect.signature(printgraph).parameters.keys())
     printgraph_params = printgraph_params - {
         "node",
@@ -376,13 +388,13 @@ def test_graph(
 ) -> None:
     """Test for graph CLI cmd."""
     with capture_stdout() as output:
-        cli.dot(f"{examples_path('reference/connect_expressions_(osp).jac')}")
+        tools.dot(f"{examples_path('micro/simple_walk.jac')}")
 
     stdout_value = output.getvalue()
-    if os.path.exists("connect_expressions_(osp).dot"):
-        os.remove("connect_expressions_(osp).dot")
+    if os.path.exists("simple_walk.dot"):
+        os.remove("simple_walk.dot")
     assert ">>> Graph content saved to" in stdout_value
-    assert "connect_expressions_(osp).dot\n" in stdout_value
+    assert "simple_walk.dot\n" in stdout_value
 
 
 def test_py_to_jac(
@@ -391,7 +403,7 @@ def test_py_to_jac(
 ) -> None:
     """Test for graph CLI cmd."""
     with capture_stdout() as output:
-        cli.py2jac(f"{fixture_path('pyfunc.py')}")
+        transform.py2jac(f"{fixture_path('pyfunc.py')}")
 
     stdout_value = output.getvalue()
     assert "def my_print(x: object) -> None" in stdout_value
@@ -405,7 +417,7 @@ def test_lambda_arg_annotation(
 ) -> None:
     """Test for lambda argument annotation."""
     with capture_stdout() as output:
-        cli.jac2py(f"{fixture_path('lambda_arg_annotation.jac')}")
+        transform.jac2py(f"{fixture_path('lambda_arg_annotation.jac')}")
 
     stdout_value = output.getvalue()
     assert "x = lambda a, b: b + a" in stdout_value
@@ -419,7 +431,7 @@ def test_lambda_self(
 ) -> None:
     """Test for lambda argument annotation."""
     with capture_stdout() as output:
-        cli.jac2py(f"{fixture_path('lambda_self.jac')}")
+        transform.jac2py(f"{fixture_path('lambda_self.jac')}")
 
     stdout_value = output.getvalue()
     assert "def travel(self, here: City) -> None:" in stdout_value
@@ -438,7 +450,7 @@ def test_param_arg(
 
     filename = fixture_path("params/test_complex_params.jac")
     with capture_stdout() as output:
-        cli.jac2py(f"{fixture_path('params/test_complex_params.jac')}")
+        transform.jac2py(f"{fixture_path('params/test_complex_params.jac')}")
         py_code = JacProgram().compile(file_path=filename).gen.py
 
         with tempfile.NamedTemporaryFile(
@@ -456,7 +468,7 @@ def test_param_arg(
             ) as temp_file:
                 temp_file.write(jac_code)
                 jac_file_path = temp_file.name
-            cli.run(jac_file_path)
+            execution.run(jac_file_path)
         finally:
             os.remove(py_file_path)
             os.remove(jac_file_path)
@@ -471,7 +483,14 @@ def test_param_arg(
 
 
 def test_caching_issue(fixture_path: Callable[[str], str]) -> None:
-    """Test for Caching Issue."""
+    """Test for Caching Issue.
+
+    Note: This test uses subprocess because it tests the caching behavior
+    across multiple compilations, which requires process isolation to avoid
+    in-memory state interference.
+    """
+    import subprocess
+
     test_file = fixture_path("test_caching_issue.jac")
     test_cases = [(10, True), (11, False)]
     for x, is_passed in test_cases:
@@ -499,166 +518,73 @@ def test_caching_issue(fixture_path: Callable[[str], str]) -> None:
     os.remove(test_file)
 
 
-def test_cli_docstring_parameters() -> None:
-    """Test that all CLI command parameters are documented in their docstrings."""
-    commands = {}
-    for name, _ in cmd_registry.registry.items():
-        if hasattr(cli, name):
-            commands[name] = getattr(cli, name)
-
-    missing_params = {}
-
-    for cmd_name, cmd_func in commands.items():
-        signature_params = set(inspect.signature(cmd_func).parameters.keys())
-        docstring = cmd_func.__doc__ or ""
-
-        args_match = re.search(r"Args:(.*?)(?:\n\n|\Z)", docstring, re.DOTALL)
-        if not args_match:
-            missing_params[cmd_name] = list(signature_params)
-            continue
-
-        args_section = args_match.group(1)
-        doc_params = set()
-        for line in args_section.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            param_match = re.match(r"\s*([a-zA-Z0-9_]+)(?:\s*\([^)]*\))?:\s*", line)
-            if param_match:
-                doc_params.add(param_match.group(1))
-
-        undocumented_params = signature_params - doc_params
-        if undocumented_params:
-            missing_params[cmd_name] = list(undocumented_params)
-
-    assert missing_params == {}, (
-        f"The following CLI commands have undocumented parameters: {missing_params}"
-    )
-
-
-def test_cli_help_uses_docstring_descriptions() -> None:
-    """Test that CLI help text uses parameter descriptions from docstrings."""
-    test_commands = ["run", "dot", "test"]
-
-    for cmd_name in test_commands:
-        if not hasattr(cli, cmd_name):
-            continue
-
-        cmd_func = getattr(cli, cmd_name)
-        docstring = cmd_func.__doc__ or ""
-        docstring_param_descriptions = extract_param_descriptions(docstring)
-
-        if not docstring_param_descriptions:
-            continue
-
-        process = subprocess.Popen(
-            ["jac", cmd_name, "--help"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        help_text, _ = process.communicate()
-
-        for param_name, description in docstring_param_descriptions.items():
-            description_start = description.split()[:3]
-            description_pattern = r"\s+".join(
-                re.escape(word) for word in description_start
-            )
-            assert re.search(description_pattern, help_text), (
-                f"Parameter description for '{param_name}' not found in help text for '{cmd_name}'"
-            )
-
-
-def test_run_jac_name_py(fixture_path: Callable[[str], str]) -> None:
+def test_run_jac_name_py(
+    fixture_path: Callable[[str], str],
+    capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
+) -> None:
     """Test a specific test case."""
-    process = subprocess.Popen(
-        [
-            "jac",
-            "run",
-            fixture_path("py_run.py"),
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
+    with capture_stdout() as output:
+        execution.run(fixture_path("py_run.py"))
+    stdout = output.getvalue()
     assert "Hello, World!" in stdout
     assert "Sum: 8" in stdout
 
 
-def test_jac_run_py_bugs(fixture_path: Callable[[str], str]) -> None:
+def test_jac_run_py_bugs(
+    fixture_path: Callable[[str], str],
+    capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
+) -> None:
     """Test jac run python files."""
-    process = subprocess.Popen(
-        [
-            "jac",
-            "run",
-            fixture_path("jac_run_py_bugs.py"),
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
+    with capture_stdout() as output:
+        execution.run(fixture_path("jac_run_py_bugs.py"))
+    stdout = output.getvalue()
     assert "Hello, my name is Alice and I am 30 years old." in stdout
     assert "MyModule initialized!" in stdout
 
 
-def test_cli_defaults_to_run_with_file(fixture_path: Callable[[str], str]) -> None:
+def test_cli_defaults_to_run_with_file(
+    fixture_path: Callable[[str], str],
+    capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
+) -> None:
     """jac myfile.jac should behave like jac run myfile.jac."""
-    process = subprocess.Popen(
-        [
-            "jac",
-            fixture_path("hello.jac"),
-        ],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
+    # The default behavior (jac <file>) routes to execution.run
+    with capture_stdout() as output:
+        execution.run(fixture_path("hello.jac"))
+    stdout = output.getvalue()
     assert "Hello World!" in stdout
 
 
-def test_cli_error_exit_codes(fixture_path: Callable[[str], str]) -> None:
+def test_cli_error_exit_codes(
+    fixture_path: Callable[[str], str],
+    capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
+) -> None:
     """Test that CLI commands return non-zero exit codes on errors."""
     # Test run command with syntax error
-    process = subprocess.Popen(
-        ["jac", "run", fixture_path("err2.jac")],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
-    assert process.returncode == 1, (
-        "run command should exit with code 1 on syntax error"
-    )
+    captured_stderr = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = captured_stderr
+
+    try:
+        with capture_stdout() as output:
+            result = execution.run(fixture_path("err2.jac"))
+        stderr = captured_stderr.getvalue()
+    finally:
+        sys.stderr = old_stderr
+
+    assert result == 1, "run command should exit with code 1 on syntax error"
     assert "Error" in stderr
 
-    # Test build command with syntax error
-    process = subprocess.Popen(
-        ["jac", "build", fixture_path("err2.jac")],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
-    assert process.returncode == 1, (
-        "build command should exit with code 1 on compilation error"
-    )
-
     # Test check command with syntax error
-    process = subprocess.Popen(
-        ["jac", "check", fixture_path("err2.jac")],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
-    assert process.returncode == 1, (
-        "check command should exit with code 1 on type check error"
-    )
+    captured_stderr = io.StringIO()
+    sys.stderr = captured_stderr
+
+    try:
+        with capture_stdout() as output:
+            result = analysis.check([fixture_path("err2.jac")])
+    finally:
+        sys.stderr = old_stderr
+
+    assert result == 1, "check command should exit with code 1 on type check error"
 
     # Test format command with file that needs changes (exits 1 for pre-commit usage)
     with tempfile.NamedTemporaryFile(
@@ -667,58 +593,77 @@ def test_cli_error_exit_codes(fixture_path: Callable[[str], str]) -> None:
         temp_file.write('with entry{print("hello");}')  # Needs formatting
         temp_path = temp_file.name
     try:
-        process = subprocess.Popen(
-            ["jac", "format", temp_path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        stdout, stderr = process.communicate()
-        assert process.returncode == 1, (
+        with capture_stdout() as output:
+            result = analysis.format([temp_path])
+        assert result == 1, (
             "format command should exit with code 1 when file is changed"
         )
     finally:
         os.remove(temp_path)
 
     # Test check command with invalid file type
-    process = subprocess.Popen(
-        ["jac", "check", "/nonexistent.txt"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
-    assert process.returncode == 1, (
-        "check command should exit with code 1 on invalid file type"
-    )
+    captured_stderr = io.StringIO()
+    sys.stderr = captured_stderr
+
+    try:
+        with capture_stdout() as output:
+            result = analysis.check(["/nonexistent.txt"])
+        stderr = captured_stderr.getvalue()
+    finally:
+        sys.stderr = old_stderr
+
+    assert result == 1, "check command should exit with code 1 on invalid file type"
     assert "is not a .jac file" in stderr
 
     # Test tool command with non-existent tool
-    process = subprocess.Popen(
-        ["jac", "tool", "nonexistent_tool"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
-    assert process.returncode == 1, (
-        "tool command should exit with code 1 on non-existent tool"
-    )
+    captured_stderr = io.StringIO()
+    sys.stderr = captured_stderr
+
+    try:
+        with capture_stdout() as output:
+            result = tools.tool("nonexistent_tool")
+        stderr = captured_stderr.getvalue()
+    finally:
+        sys.stderr = old_stderr
+
+    assert result == 1, "tool command should exit with code 1 on non-existent tool"
     assert "not found" in stderr
 
     # Test successful run returns exit code 0
-    process = subprocess.Popen(
-        ["jac", "run", fixture_path("hello.jac")],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    stdout, stderr = process.communicate()
-    assert process.returncode == 0, "run command should exit with code 0 on success"
+    with capture_stdout() as output:
+        result = execution.run(fixture_path("hello.jac"))
+    stdout = output.getvalue()
+    assert result == 0, "run command should exit with code 0 on success"
     assert "Hello World!" in stdout
 
 
-def test_format_tracks_changed_files() -> None:
+def test_positional_args_with_defaults(
+    capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
+) -> None:
+    """Test that positional arguments with defaults are optional."""
+    # Test that 'jac plugins' works without providing the 'action' argument
+    # The action parameter has a default of 'list', so it should be optional
+    with capture_stdout() as output:
+        result = config_cmd.plugins()
+    stdout = output.getvalue()
+    assert result == 0, "'jac plugins' should work without action argument"
+    # Check for plugins list output (case-insensitive, handles Rich formatting)
+    assert "installed jac plugin" in stdout.lower(), (
+        "Output should show installed plugins list"
+    )
+
+    # Verify explicit 'list' action produces the same result
+    with capture_stdout() as output_explicit:
+        config_cmd.plugins(action="list")
+    stdout_explicit = output_explicit.getvalue()
+    assert stdout == stdout_explicit, (
+        "'jac plugins' and 'jac plugins list' should produce identical output"
+    )
+
+
+def test_format_tracks_changed_files(
+    capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
+) -> None:
     """Test that format command correctly tracks and reports changed files."""
     with tempfile.TemporaryDirectory() as tmpdir:
         # Create a file that needs formatting (bad indentation/spacing)
@@ -732,15 +677,548 @@ def test_format_tracks_changed_files() -> None:
             f.write('with entry {\n    print("hello");\n}\n')
 
         # Run format on the directory
-        process = subprocess.Popen(
-            ["jac", "format", tmpdir],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        stdout, stderr = process.communicate()
+        captured_stderr = io.StringIO()
+        old_stderr = sys.stderr
+        sys.stderr = captured_stderr
+
+        try:
+            with capture_stdout() as output:
+                result = analysis.format([tmpdir])
+            stdout = output.getvalue()
+            stderr = captured_stderr.getvalue()
+        finally:
+            sys.stderr = old_stderr
 
         # Exit code 1 indicates files were changed (useful for pre-commit hooks)
-        assert process.returncode == 1
-        assert "2/2" in stderr
-        assert "(1 changed)" in stderr
+        assert result == 1
+        # Output may go to stdout or stderr depending on console implementation
+        combined_output = stdout + stderr
+        assert "2/2" in combined_output
+        assert "(1 changed)" in combined_output
+
+
+def test_jac_create_and_run_no_root_files(
+    cli_test_dir: Path,
+    capture_stdout: Callable[[], AbstractContextManager[io.StringIO]],
+) -> None:
+    """Test that jac create + jac run doesn't create files outside .jac/ directory."""
+    project_name = "test-no-root-files"
+    project_path = cli_test_dir / project_name
+
+    # Run jac create to create the project
+    with capture_stdout() as output:
+        result = project.create(project_name)
+    assert result == 0, "jac create failed"
+
+    # Record files after create (before run)
+    def get_root_files(path: Path) -> set[str]:
+        """Get files/dirs in project root, excluding .jac directory."""
+        items = set()
+        for item in path.iterdir():
+            if item.name != ".jac":
+                items.add(item.name)
+        return items
+
+    files_before_run = get_root_files(project_path)
+
+    # Run jac run main.jac (change to project directory first)
+    original_cwd = os.getcwd()
+    os.chdir(project_path)
+    try:
+        with capture_stdout() as output:
+            result = execution.run("main.jac")
+        stdout = output.getvalue()
+    finally:
+        os.chdir(original_cwd)
+
+    assert result == 0, "jac run failed"
+    assert f"Hello from {project_name}!" in stdout
+
+    # Record files after run
+    files_after_run = get_root_files(project_path)
+
+    # Check no new files were created in project root
+    new_files = files_after_run - files_before_run
+    assert not new_files, (
+        f"jac run created unexpected files in project root: {new_files}. "
+        "All runtime files should be in .jac/ directory."
+    )
+
+
+def test_jac_create_default_name_jactastic(cli_test_dir: Path) -> None:
+    """Test that jac create without a name defaults to 'jactastic' with incrementing numbers."""
+    # First create should use 'jactastic'
+    assert project.create() == 0
+    assert (cli_test_dir / "jactastic").is_dir()
+
+    # Second create should use 'jactastic1'
+    assert project.create() == 0
+    assert (cli_test_dir / "jactastic1").is_dir()
+
+    # Third create should use 'jactastic2'
+    assert project.create() == 0
+    assert (cli_test_dir / "jactastic2").is_dir()
+
+
+class TestConfigCommand:
+    """Tests for the jac config CLI command."""
+
+    @pytest.fixture
+    def project_dir(self, tmp_path: Path):
+        """Create a temporary project directory with jac.toml."""
+        toml_content = """[project]
+name = "test-project"
+version = "1.0.0"
+description = "A test project"
+
+[run]
+cache = false
+
+[build]
+typecheck = true
+
+[test]
+verbose = true
+"""
+        toml_path = tmp_path / "jac.toml"
+        toml_path.write_text(toml_content)
+        original_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            yield str(tmp_path)
+        finally:
+            os.chdir(original_cwd)
+
+    @pytest.fixture
+    def capture(self) -> Callable[[], AbstractContextManager[io.StringIO]]:
+        """Fixture to capture stdout."""
+
+        @contextlib.contextmanager
+        def _capture() -> typing.Generator[io.StringIO, None, None]:
+            captured = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = captured
+            try:
+                yield captured
+            finally:
+                sys.stdout = old_stdout
+
+        return _capture
+
+    def test_config_groups(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config groups lists available configuration groups."""
+        with capture() as output:
+            result = config_cmd.config(action="groups")
+        stdout = output.getvalue()
+        assert result == 0
+        assert "project" in stdout
+        assert "run" in stdout
+        assert "build" in stdout
+        assert "test" in stdout
+        assert "serve" in stdout
+
+    def test_config_path(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config path shows path to config file."""
+        with capture() as output:
+            result = config_cmd.config(action="path")
+        stdout = output.getvalue()
+        assert result == 0
+        assert "jac.toml" in stdout
+
+    def test_config_show(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config show displays only explicitly set values."""
+        with capture() as output:
+            result = config_cmd.config(action="show")
+        stdout = output.getvalue()
+        assert result == 0
+        # Should show explicitly set values
+        assert "test-project" in stdout
+        assert "1.0.0" in stdout
+
+    def test_config_show_group(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config show with group filter."""
+        with capture() as output:
+            result = config_cmd.config(action="show", group="project")
+        stdout = output.getvalue()
+        assert result == 0
+        assert "test-project" in stdout
+
+    def test_config_list(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config list displays all settings including defaults."""
+        with capture() as output:
+            result = config_cmd.config(action="list")
+        stdout = output.getvalue()
+        assert result == 0
+        # Should show all settings including defaults
+        assert "project" in stdout or "name" in stdout
+
+    def test_config_get(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config get retrieves a specific setting."""
+        with capture() as output:
+            result = config_cmd.config(action="get", key="project.name")
+        stdout = output.getvalue()
+        assert result == 0
+        assert "test-project" in stdout
+
+    def test_config_set_and_unset(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config set and unset modify settings."""
+        # Set a new value
+        with capture() as output:
+            result = config_cmd.config(
+                action="set", key="project.description", value="Updated desc"
+            )
+        assert result == 0
+
+        # Verify the value was set
+        with capture() as output:
+            result = config_cmd.config(action="get", key="project.description")
+        stdout = output.getvalue()
+        assert "Updated desc" in stdout
+
+        # Unset the value
+        with capture() as output:
+            result = config_cmd.config(action="unset", key="project.description")
+        assert result == 0
+
+    def test_config_output_json(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config with JSON output format."""
+        with capture() as output:
+            result = config_cmd.config(action="show", output="json")
+        stdout = output.getvalue()
+        assert result == 0
+        # JSON output should be parseable
+        import json
+
+        data = json.loads(stdout)
+        assert isinstance(data, dict)
+
+    def test_config_output_toml(self, project_dir: str, capture: Callable) -> None:
+        """Test jac config with TOML output format."""
+        with capture() as output:
+            result = config_cmd.config(action="show", output="toml")
+        stdout = output.getvalue()
+        assert result == 0
+        # TOML output should contain section markers
+        assert "[" in stdout
+
+    def test_config_no_project(self, tmp_path: Path, capture: Callable) -> None:
+        """Test jac config behavior when no jac.toml exists."""
+        original_cwd = os.getcwd()
+        os.chdir(tmp_path)
+        try:
+            with capture() as output:
+                config_cmd.config(action="path")
+            stdout = output.getvalue()
+            # The config path command shows the expected path even if file doesn't exist
+            # Just verify it shows a path ending in jac.toml
+            assert "jac.toml" in stdout
+        finally:
+            os.chdir(original_cwd)
+
+
+def _run_jac_check(test_dir: str, ignore_pattern: str = "") -> int:
+    """Run jac check and return file count."""
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = captured_stdout
+    sys.stderr = captured_stderr
+
+    try:
+        analysis.check([test_dir], ignore=ignore_pattern)
+        stdout = captured_stdout.getvalue()
+        stderr = captured_stderr.getvalue()
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    match = re.search(r"Checked (\d+)", stdout + stderr)
+    return int(match.group(1)) if match else 0
+
+
+def test_jac_cli_check_ignore_patterns(fixture_path: Callable[[str], str]) -> None:
+    """Test --ignore flag with exact pattern matching (combined patterns)."""
+    test_dir = fixture_path("deep")
+    result_count = _run_jac_check(test_dir, "deeper,one_lev_dup.jac,one_lev.jac,mycode")
+    # Only mycode.jac is checked; all other files are ignored
+    assert result_count == 1
+
+
+class TestCleanCommand:
+    """Tests for the jac clean CLI command."""
+
+    @staticmethod
+    def _create_project(tmpdir: str) -> str:
+        """Create a minimal jac project structure for testing."""
+        project_path = os.path.join(tmpdir, "testproj")
+        os.makedirs(project_path, exist_ok=True)
+
+        # Create minimal jac.toml
+        toml_content = """\
+[project]
+name = "testproj"
+version = "0.1.0"
+"""
+        with open(os.path.join(project_path, "jac.toml"), "w") as f:
+            f.write(toml_content)
+
+        # Create .jac directory structure
+        os.makedirs(os.path.join(project_path, ".jac"), exist_ok=True)
+
+        return project_path
+
+    @staticmethod
+    def _capture_output() -> tuple[
+        io.StringIO, io.StringIO, "typing.TextIO", "typing.TextIO"
+    ]:
+        """Set up output capture and return (stdout_capture, stderr_capture, old_stdout, old_stderr)."""
+        captured_stdout = io.StringIO()
+        captured_stderr = io.StringIO()
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        sys.stdout = captured_stdout
+        sys.stderr = captured_stderr
+        return captured_stdout, captured_stderr, old_stdout, old_stderr
+
+    @staticmethod
+    def _restore_output(
+        old_stdout: "typing.TextIO", old_stderr: "typing.TextIO"
+    ) -> None:
+        """Restore original stdout/stderr."""
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    @staticmethod
+    def _reset_config() -> None:
+        """Reset the global config cache to force rediscovery."""
+        from jaclang.project import config as config_module
+
+        config_module._config = None
+
+    def test_clean_no_project(self) -> None:
+        """Test jac clean fails when no jac.toml exists."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            self._reset_config()
+            captured_stdout, captured_stderr, old_stdout, old_stderr = (
+                self._capture_output()
+            )
+            try:
+                result = project.clean(force=True)
+                stderr = captured_stderr.getvalue()
+            finally:
+                self._restore_output(old_stdout, old_stderr)
+                os.chdir(original_cwd)
+                self._reset_config()
+            assert result == 1
+            assert "No jac.toml found" in stderr
+
+    def test_clean_nothing_to_clean(self) -> None:
+        """Test jac clean when no build artifacts exist."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_path = self._create_project(tmpdir)
+
+            # Remove the .jac/data directory if it exists (keep only cache from build)
+            data_dir = os.path.join(project_path, ".jac", "data")
+            if os.path.exists(data_dir):
+                import shutil
+
+                shutil.rmtree(data_dir)
+
+            original_cwd = os.getcwd()
+            os.chdir(project_path)
+            self._reset_config()
+            captured_stdout, captured_stderr, old_stdout, old_stderr = (
+                self._capture_output()
+            )
+            try:
+                result = project.clean(force=True)
+                stdout = captured_stdout.getvalue()
+            finally:
+                self._restore_output(old_stdout, old_stderr)
+                os.chdir(original_cwd)
+                self._reset_config()
+            assert result == 0
+            assert "Nothing to clean" in stdout
+
+    def test_clean_data_directory(self) -> None:
+        """Test jac clean removes the data directory by default."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_path = self._create_project(tmpdir)
+
+            # Create .jac/data directory with some files
+            data_dir = os.path.join(project_path, ".jac", "data")
+            os.makedirs(data_dir, exist_ok=True)
+            test_file = os.path.join(data_dir, "test.db")
+            with open(test_file, "w") as f:
+                f.write("test data")
+
+            assert os.path.exists(data_dir)
+
+            original_cwd = os.getcwd()
+            os.chdir(project_path)
+            self._reset_config()
+            captured_stdout, captured_stderr, old_stdout, old_stderr = (
+                self._capture_output()
+            )
+            try:
+                result = project.clean(force=True)
+                stdout = captured_stdout.getvalue()
+            finally:
+                self._restore_output(old_stdout, old_stderr)
+                os.chdir(original_cwd)
+                self._reset_config()
+            assert result == 0
+            assert "Removed data:" in stdout
+            assert not os.path.exists(data_dir)
+
+    def test_clean_cache_directory(self) -> None:
+        """Test jac clean --cache removes the cache directory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_path = self._create_project(tmpdir)
+
+            # jac create already creates .jac/cache, but let's ensure it has content
+            cache_dir = os.path.join(project_path, ".jac", "cache")
+            os.makedirs(cache_dir, exist_ok=True)
+            test_file = os.path.join(cache_dir, "cached.pyc")
+            with open(test_file, "w") as f:
+                f.write("cached bytecode")
+
+            assert os.path.exists(cache_dir)
+
+            original_cwd = os.getcwd()
+            os.chdir(project_path)
+            self._reset_config()
+            captured_stdout, captured_stderr, old_stdout, old_stderr = (
+                self._capture_output()
+            )
+            try:
+                result = project.clean(cache=True, force=True)
+                stdout = captured_stdout.getvalue()
+            finally:
+                self._restore_output(old_stdout, old_stderr)
+                os.chdir(original_cwd)
+                self._reset_config()
+            assert result == 0
+            assert "Removed cache:" in stdout
+            assert not os.path.exists(cache_dir)
+
+    def test_clean_all_directories(self) -> None:
+        """Test jac clean --all removes all build artifact directories."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_path = self._create_project(tmpdir)
+
+            # Create all .jac subdirectories with content
+            jac_dir = os.path.join(project_path, ".jac")
+            dirs_to_create = ["data", "cache", "packages", "client"]
+            for dir_name in dirs_to_create:
+                dir_path = os.path.join(jac_dir, dir_name)
+                os.makedirs(dir_path, exist_ok=True)
+                # Add a file to each directory
+                with open(os.path.join(dir_path, "test.txt"), "w") as f:
+                    f.write("test")
+
+            for dir_name in dirs_to_create:
+                assert os.path.exists(os.path.join(jac_dir, dir_name))
+
+            original_cwd = os.getcwd()
+            os.chdir(project_path)
+            self._reset_config()
+            captured_stdout, captured_stderr, old_stdout, old_stderr = (
+                self._capture_output()
+            )
+            try:
+                # Note: 'all' is a Python keyword, so we use **kwargs
+                result = project.clean(**{"all": True, "force": True})
+                stdout = captured_stdout.getvalue()
+            finally:
+                self._restore_output(old_stdout, old_stderr)
+                os.chdir(original_cwd)
+                self._reset_config()
+            assert result == 0
+            assert "Clean completed successfully" in stdout
+
+            # Verify all directories are removed
+            for dir_name in dirs_to_create:
+                assert not os.path.exists(os.path.join(jac_dir, dir_name))
+
+    def test_clean_multiple_specific_directories(self) -> None:
+        """Test jac clean with multiple specific flags."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_path = self._create_project(tmpdir)
+
+            # Create .jac subdirectories with content
+            jac_dir = os.path.join(project_path, ".jac")
+            data_dir = os.path.join(jac_dir, "data")
+            cache_dir = os.path.join(jac_dir, "cache")
+            packages_dir = os.path.join(jac_dir, "packages")
+
+            for dir_path in [data_dir, cache_dir, packages_dir]:
+                os.makedirs(dir_path, exist_ok=True)
+                with open(os.path.join(dir_path, "test.txt"), "w") as f:
+                    f.write("test")
+
+            original_cwd = os.getcwd()
+            os.chdir(project_path)
+            self._reset_config()
+            captured_stdout, captured_stderr, old_stdout, old_stderr = (
+                self._capture_output()
+            )
+            try:
+                result = project.clean(data=True, cache=True, force=True)
+                stdout = captured_stdout.getvalue()
+            finally:
+                self._restore_output(old_stdout, old_stderr)
+                os.chdir(original_cwd)
+                self._reset_config()
+            assert result == 0
+            assert "Removed data:" in stdout
+            assert "Removed cache:" in stdout
+            # Packages should NOT be removed
+            assert os.path.exists(packages_dir)
+            assert not os.path.exists(data_dir)
+            assert not os.path.exists(cache_dir)
+
+
+def test_error_traceback_shows_source_code(fixture_path: Callable[[str], str]) -> None:
+    """Test that runtime errors show source code context and line numbers."""
+    # Test that import errors show the problematic line with context
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sys.stdout = captured_stdout
+    sys.stderr = captured_stderr
+
+    try:
+        result = execution.run(fixture_path("import_error_traceback.jac"))
+        stderr = captured_stderr.getvalue()
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+    # Should exit with error
+    assert result == 1, "run command should exit with code 1 on import error"
+
+    # Should show the error message
+    assert "Error" in stderr, "stderr should contain 'Error'"
+    assert (
+        "attempted relative import" in stderr
+        or "ImportError" in stderr
+        or "__package__" in stderr
+    ), "stderr should contain import error message"
+
+    # Should show the source code line that caused the error
+    assert "import from .nonexistent_module" in stderr, (
+        "stderr should show the problematic import statement"
+    )
+
+    # Should show the file path and line number
+    assert "import_error_traceback.jac" in stderr, (
+        "stderr should contain the source file name"
+    )
+    assert ":7" in stderr or "line 7" in stderr, (
+        "stderr should indicate line number 7 where the error occurred"
+    )

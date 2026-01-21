@@ -18,14 +18,29 @@ glob JsonValue: TypeAlias = None | str | int | float | bool | list['JsonValue'] 
      ],
      StatusCode: TypeAlias = Literal[(200, 201, 400, 401, 404, 503)];
 
-"""Jac Client Module Introspector."""
-class JacClientModuleIntrospector(ModuleIntrospector) {
-    def render_page(
-        self: JacClientModuleIntrospector,
+"""Builds HTML head content from meta data."""
+obj HeaderBuilder {
+    has meta_data: dict,
         function_name: str,
-        args: dict[(str, Any)],
-        username: str
-    ) -> dict[str, Any];
+        DEFAULTS: dict = {
+            "charset": "UTF-8",
+            "viewport": "width=device-width,initial-scale=1"
+        },
+        standard_tags: list = [
+            "description",
+            "keywords",
+            "author",
+            "robots",
+            "theme_color"
+        ];
+
+    def build_head -> str;
+    def _get_value(key: str) -> str;
+    def _build_special_tags -> list[str];
+    def _build_meta_tags -> list[str];
+    def _build_og_tags -> list[str];
+    def _build_link_tags -> list[str];
+    def _build_generic_meta_tags -> list[str];
 }
 
 """Jac Client."""
@@ -39,14 +54,17 @@ class JacClient {
     ) -> ClientBundle;
 
     @hookimpl
-    static def get_module_introspector(
-        module_name: str, base_path: (str | None)
-    ) -> ModuleIntrospector;
-
-    @hookimpl
     static def send_static_file(
         handler: BaseHTTPRequestHandler,
         file_path: Path,
         content_type: (str | None) = None
     ) -> None;
+
+    @hookimpl
+    static def render_page(
+        introspector: ModuleIntrospector,
+        function_name: str,
+        args: dict[(str, Any)],
+        username: str
+    ) -> dict[str, Any];
 }

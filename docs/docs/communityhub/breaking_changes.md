@@ -6,9 +6,243 @@ This page documents significant breaking changes in Jac and Jaseci that may affe
 
 MTLLM library is now deprecated and replaced by the byLLM package. In all place where `mtllm` was used before can be replaced with `byllm`.
 
+### `--cl` Flag Replaced with `--npm` and `--use client`
+
+The `--cl` flag has been removed from jac-client CLI commands and replaced with more descriptive alternatives.
+
+**Before:**
+
+```bash
+# Create a client project
+jac create myapp --cl
+
+# Add npm dependencies
+jac add tailwind --cl
+jac add typescript --cl --dev
+
+# Remove npm dependencies
+jac remove lodash --cl
+```
+
+**After:**
+
+```bash
+# Create a client project (use --use client instead of --cl)
+jac create myapp --use client
+
+# Add npm dependencies (use --npm instead of --cl)
+jac add tailwind --npm
+jac add typescript --npm --dev
+
+# Remove npm dependencies (use --npm instead of --cl)
+jac remove lodash --npm
+```
+
+**Key Changes:**
+
+- `jac create --cl` → `jac create --use client`
+- `jac add --cl` → `jac add --npm`
+- `jac remove --cl` → `jac remove --npm`
+- The `--skip` flag remains available for `jac create --use client --skip` to skip npm package installation
+
+### `.cl.jac` Files No Longer Auto-Imported as Annexes
+
+Client module files (`.cl.jac`) are now treated as **standalone modules only**. Previously, `.cl.jac` files were automatically annexed to their corresponding `.jac` files (similar to `.impl.jac` files). This dual behavior has been removed to simplify the module system.
+
+**Before:**
+
+```jac
+# main.jac - automatically included main.cl.jac content
+node Todo { has title: str; }
+
+walker AddTodo { has title: str; }
+```
+
+```jac
+# main.cl.jac - auto-annexed to main.jac (no explicit import needed)
+cl {
+    def:pub app -> any {
+        return <div>Hello World</div>;
+    }
+}
+```
+
+**After:**
+
+```jac
+# main.jac - must explicitly import client code
+node Todo { has title: str; }
+
+walker AddTodo { has title: str; }
+
+# Explicit client block with import
+cl {
+    import from .frontend { app as ClientApp }
+
+    def:pub app -> any {
+        return <ClientApp />;
+    }
+}
+```
+
+```jac
+# frontend.cl.jac - standalone client module (renamed from main.cl.jac)
+def:pub app -> any {
+    return <div>Hello World</div>;
+}
+```
+
+**Key Changes:**
+
+- `.cl.jac` files are no longer automatically annexed to matching `.jac` files
+- Client code must be explicitly imported using `cl import` or imported inside a `cl {}` block
+- The main entry point must re-export the client app through a `cl {}` block to trigger client compilation
+- Use uppercase aliases when importing components (e.g., `app as ClientApp`) so JSX compiles to component references instead of strings
+
+**Migration Steps:**
+
+1. Rename your `main.cl.jac` to a descriptive name like `frontend.cl.jac` or `app.cl.jac`
+2. Add a `cl {}` block in your `main.jac` that imports and re-exports the client app:
+
+   ```jac
+   cl {
+       import from .frontend { app as ClientApp }
+
+       def:pub app -> any {
+           return <ClientApp />;
+       }
+   }
+   ```
+
+3. If your `.cl.jac` file references walkers defined in `main.jac`, add walker stub declarations in the client file:
+
+   ```jac
+   # frontend.cl.jac
+   walker AddTodo { has title: str; }  # Stub for RPC calls
+   walker ListTodos {}
+
+   def:pub app -> any { ... }
+   ```
+
+**Note:** `.cl.jac` files can still have their own `.impl.jac` annexes for separating declarations from implementations.
+
+### Version 0.9.8
+
+#### 1. Walker Traversal Semantics Changed to Recursive DFS with Deferred Exits
+
+Walker traversal now uses recursive depth-first semantics where **entry abilities execute when entering a node**, and **exit abilities execute after all descendants are visited** (post-order). Previously, both entry and exit abilities executed on each node before moving to the next.
+
+**Before (v0.9.7 and earlier):**
+
+For a graph `root → A → B → C`, the execution order was:
+
+```
+Enter root → Exit root → Enter A → Exit A → Enter B → Exit B → Enter C → Exit C
+```
+
+Each node's entries AND exits completed before visiting the next node.
+
+**After (v0.9.8+):**
+
+```
+Enter root → Enter A → Enter B → Enter C → Exit C → Exit B → Exit A → Exit root
+```
+
+Entries execute depth-first, exits execute in reverse order (LIFO/stack unwinding).
+
+**Example with sibling nodes:**
+
+```jac
+# Graph: root → a, root → b, root → c (three children)
+
+# Before: a entries, a exits, b entries, b exits, c entries, c exits
+# After:  a entries, b entries, c entries, c exits, b exits, a exits
+```
+
+**Key Behavioral Changes:**
+
+1. **Exit abilities are deferred** until all descendants of a node are visited
+2. **If `disengage` is called during entry/child traversal**, exit abilities for ancestor nodes will NOT execute
+3. **Exit order is LIFO** (last visited node's exits run first)
+4. **`walker.path`** is now populated during traversal, tracking visited nodes in order
+
+**Migration Steps:**
+
+1. Review any code that relies on exit abilities running before visiting child nodes
+2. If your walker uses `disengage` and depends on ancestor exit abilities running, refactor to use entry abilities or remove the disengage
+3. Update tests that assert specific entry/exit execution order
+
+**Example migration for disengage pattern:**
+
+```jac
+# Before: Exit ability would run before disengage stops traversal
+walker MyWalker {
+    can process with MyNode entry {
+        if some_condition { disengage; }
+        visit [-->];
+    }
+    can cleanup with `root exit {
+        # This WOULD run before disengage in old semantics
+        print("Cleanup");
+    }
+}
+
+# After: Use entry ability instead, since exits won't run after disengage
+walker MyWalker {
+    can process with MyNode entry {
+        if some_condition { disengage; }
+        visit [-->];
+    }
+    can cleanup with `root entry {
+        # Use entry to ensure this runs before any disengage
+        print("Cleanup will run");
+    }
+}
+```
+
 ### Version 0.9.5
 
-#### 1. Build Artifacts Consolidated to `.jac/` Directory
+#### 1. `jac serve` Renamed to `jac start`, `jac scale` Now Uses `--scale` Flag
+
+The `jac serve` command has been renamed to `jac start` for better clarity. Additionally, the `jac scale` command (from jac-scale plugin) is now accessed via `jac start --scale` instead of a separate command.
+
+**Before (v0.9.4 and earlier):**
+
+```bash
+# Start local server
+jac serve main.jac
+
+# Deploy to Kubernetes (jac-scale plugin)
+jac scale main.jac
+jac scale main.jac -b  # with build
+```
+
+**After (v0.9.5+):**
+
+```bash
+# Start local server
+jac start main.jac
+
+# Deploy to Kubernetes (jac-scale plugin)
+jac start main.jac --scale
+jac start main.jac --scale --build  # with build
+```
+
+**Migration Steps:**
+
+1. Replace all `jac serve` commands with `jac start`
+2. Replace `jac scale` commands with `jac start --scale`
+3. Replace `jac scale -b` with `jac start --scale --build`
+4. Update any CI/CD scripts or documentation that reference these commands
+
+**Key Changes:**
+
+- `jac serve` → `jac start`
+- `jac scale` → `jac start --scale`
+- `jac scale -b` → `jac start --scale --build` (or `jac start --scale -b`)
+- The `jac destroy` command remains unchanged for removing Kubernetes deployments
+
+#### 2. Build Artifacts Consolidated to `.jac/` Directory
 
 All Jac project build artifacts are now organized under a single `.jac/` directory instead of being scattered across the project root. This is a breaking change for existing projects.
 
@@ -98,7 +332,6 @@ The `let` keyword has been removed from Jaclang. Variable declarations now use d
 with entry {
     let x = 10;
     let name = "Alice";
-    let [count, setCount] = useState(0);
 }
 ```
 
@@ -108,7 +341,6 @@ with entry {
 with entry {
     x = 10;
     name = "Alice";
-    [count, setCount] = useState(0);
 }
 ```
 
@@ -117,6 +349,8 @@ with entry {
 - Remove the `let` keyword from all variable declarations
 - Use direct assignment (`x = value`) instead of `let x = value`
 - This applies to all contexts including destructuring assignments
+
+> **Note for client-side code:** In `cl {}` blocks and `.cl.jac` files, prefer using `has` for reactive state (see v0.9.5 reactive state feature) instead of explicit `useState` destructuring.
 
 ### Version 0.8.10
 

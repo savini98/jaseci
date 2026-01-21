@@ -9,7 +9,7 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import jwt as pyjwt
 import pytest
@@ -33,7 +33,6 @@ class TestJacScaleServe:
     test_file: Path
     port: int
     base_url: str
-    session_file: Path
     server_process: subprocess.Popen[str] | None = None
 
     @classmethod
@@ -50,11 +49,8 @@ class TestJacScaleServe:
         cls.port = get_free_port()
         cls.base_url = f"http://localhost:{cls.port}"
 
-        # Use unique session file for tests
-        cls.session_file = cls.fixtures_dir / f"test_serve_{cls.port}.session"
-
-        # Clean up any existing session files before starting
-        cls._cleanup_session_files()
+        # Clean up any existing database files before starting
+        cls._cleanup_db_files()
 
         # Start the server process
         cls.server_process = None
@@ -77,29 +73,35 @@ class TestJacScaleServe:
         # Run garbage collection to clean up lingering socket objects
         gc.collect()
 
-        # Clean up session files
-        cls._cleanup_session_files()
+        # Clean up database files
+        cls._cleanup_db_files()
 
     @classmethod
     def _start_server(cls) -> None:
         """Start the jac-scale server in a subprocess."""
+        import sys
+
+        # Get the jac executable from the same directory as the current Python interpreter
+        jac_executable = Path(sys.executable).parent / "jac"
+
         # Build the command to start the server
+        # Use just the filename and set cwd to fixtures directory
+        # This is required for proper bytecode caching and module resolution
         cmd = [
-            "jac",
-            "serve",
-            str(cls.test_file),
-            "--session",
-            str(cls.session_file),
+            str(jac_executable),
+            "start",
+            cls.test_file.name,
             "--port",
             str(cls.port),
         ]
 
-        # Start the server process
+        # Start the server process with cwd set to fixtures directory
         cls.server_process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            cwd=str(cls.fixtures_dir),
         )
 
         # Wait for server to be ready
@@ -143,39 +145,74 @@ class TestJacScaleServe:
             )
 
     @classmethod
-    def _cleanup_session_files(cls) -> None:
-        """Delete session files including user database files and anchor_store.db."""
-        if cls.session_file.exists():
-            session_dir = cls.session_file.parent
-            prefix = cls.session_file.name
+    def _cleanup_db_files(cls) -> None:
+        """Delete SQLite database files and legacy shelf files."""
+        import shutil
 
-            for file in session_dir.iterdir():
-                if file.name.startswith(prefix):
-                    with contextlib.suppress(Exception):
-                        file.unlink()
-
-        # Clean up anchor_store.db files created by ShelfDB in cwd
+        # Clean up SQLite database files (WAL mode creates -wal and -shm files)
         for pattern in [
+            "*.db",
+            "*.db-wal",
+            "*.db-shm",
+            # Legacy shelf files
             "anchor_store.db.dat",
             "anchor_store.db.bak",
             "anchor_store.db.dir",
         ]:
-            for anchor_file in glob.glob(pattern):
+            for db_file in glob.glob(pattern):
                 with contextlib.suppress(Exception):
-                    Path(anchor_file).unlink()
+                    Path(db_file).unlink()
 
-        session_pattern = str(cls.fixtures_dir / "test_serve_*.session*")
-        for file_path in glob.glob(session_pattern):
-            with contextlib.suppress(Exception):
-                Path(file_path).unlink()
+        # Clean up database files in fixtures directory
+        for pattern in ["*.db", "*.db-wal", "*.db-shm"]:
+            for db_file in glob.glob(str(cls.fixtures_dir / pattern)):
+                with contextlib.suppress(Exception):
+                    Path(db_file).unlink()
 
         # Clean up .jac directory created during serve
         client_build_dir = cls.fixtures_dir / ".jac"
         if client_build_dir.exists():
-            import shutil
-
             with contextlib.suppress(Exception):
                 shutil.rmtree(client_build_dir)
+
+    @staticmethod
+    def _extract_transport_response_data(
+        json_response: dict[str, Any] | list[Any],
+    ) -> dict[str, Any] | list[Any]:
+        """Extract data from TransportResponse envelope format.
+
+        Handles both success and error responses.
+        """
+        # Handle jac-scale's tuple response format [status, body]
+        if isinstance(json_response, list) and len(json_response) == 2:
+            body: dict[str, Any] = json_response[1]
+            json_response = body
+
+        # Handle TransportResponse envelope format
+        # If response has 'ok', 'type', 'data', 'error' keys, extract data/error
+        if (
+            isinstance(json_response, dict)
+            and "ok" in json_response
+            and "data" in json_response
+        ):
+            if json_response.get("ok") and json_response.get("data") is not None:
+                # Success case: return the data field
+                return json_response["data"]
+            elif not json_response.get("ok") and json_response.get("error"):
+                # Error case: return error info in a format tests expect
+                error_info = json_response["error"]
+                result: dict[str, Any] = {
+                    "error": error_info.get("message", "Unknown error")
+                }
+                if "code" in error_info:
+                    result["error_code"] = error_info["code"]
+                if "details" in error_info:
+                    result["error_details"] = error_info["details"]
+                return result
+
+        # FastAPI validation errors (422) have "detail" field - return as-is
+        # These come from Pydantic validation before our endpoint is called
+        return json_response
 
     def _request(
         self,
@@ -218,13 +255,7 @@ class TestJacScaleServe:
 
         assert response is not None, "No response received"
         json_response: Any = response.json()
-
-        # Handle jac-scale's tuple response format [status, body]
-        if isinstance(json_response, list) and len(json_response) == 2:
-            body: dict[str, Any] = json_response[1]
-            return body
-
-        return json_response  # type: ignore[return-value]
+        return self._extract_transport_response_data(json_response)  # type: ignore[return-value]
 
     def _create_expired_token(self, username: str, days_ago: int = 1) -> str:
         """Create an expired JWT token for testing."""
@@ -718,7 +749,9 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 201
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         assert "token" in data
         assert "username" in data
         assert data["username"] == "status201"
@@ -740,7 +773,9 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 400
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         assert "error" in data
 
     def test_status_code_user_login_200_success(self) -> None:
@@ -760,7 +795,7 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 200
-        data = response.json()
+        data = self._extract_transport_response_data(response.json())
         assert "token" in data
 
     def test_status_code_user_login_400_missing_credentials(self) -> None:
@@ -772,7 +807,9 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code in [400, 422]  # 422 from FastAPI validation
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         # Either custom error or FastAPI validation error
         assert "error" in data or "detail" in data
 
@@ -799,7 +836,9 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 400
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         assert data["error"] == "Username and password required"
 
     def test_status_code_user_login_401_invalid_credentials(self) -> None:
@@ -819,7 +858,9 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 401
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         assert data["error"] == "Invalid credentials"
 
         # Non-existent user
@@ -838,7 +879,11 @@ class TestJacScaleServe:
             json={"username": "status200refresh", "password": "password123"},
             timeout=5,
         )
-        token = create_response.json()["token"]
+        create_data = cast(
+            dict[str, Any],
+            self._extract_transport_response_data(create_response.json()),
+        )
+        token = create_data["token"]
 
         # Refresh token
         response = requests.post(
@@ -847,7 +892,9 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 200
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         assert "token" in data
         assert data["message"] == "Token refreshed successfully"
 
@@ -860,7 +907,9 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 400
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         assert data["error"] == "Token is required"
 
         # Null token - FastAPI validation may return 422
@@ -880,7 +929,9 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 401
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         assert data["error"] == "Invalid or expired token"
 
         # Malformed JWT
@@ -899,7 +950,11 @@ class TestJacScaleServe:
             json={"username": "status200walker", "password": "password123"},
             timeout=5,
         )
-        token = create_response.json()["token"]
+        create_data = cast(
+            dict[str, Any],
+            self._extract_transport_response_data(create_response.json()),
+        )
+        token = create_data["token"]
 
         # Execute walker
         response = requests.post(
@@ -918,7 +973,11 @@ class TestJacScaleServe:
             json={"username": "status200func", "password": "password123"},
             timeout=5,
         )
-        token = create_response.json()["token"]
+        create_data = cast(
+            dict[str, Any],
+            self._extract_transport_response_data(create_response.json()),
+        )
+        token = create_data["token"]
 
         # Execute function
         response = requests.post(
@@ -928,13 +987,15 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 200
-        data = response.json()
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
         assert "result" in data
 
     def test_status_code_page_404_not_found(self) -> None:
-        """Test GET /page/{name} returns 404 for non-existent page."""
+        """Test GET /cl/{name} returns 404 for non-existent page."""
         response = requests.get(
-            f"{self.base_url}/page/nonexistent_page_xyz",
+            f"{self.base_url}/cl/nonexistent_page_xyz",
             timeout=5,
         )
         assert response.status_code == 404
@@ -1013,7 +1074,11 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert register_response.status_code == 201
-        token1 = register_response.json()["token"]
+        data = cast(
+            dict[str, Any],
+            self._extract_transport_response_data(register_response.json()),
+        )
+        token1 = data["token"]
 
         # Login - 200
         login_response = requests.post(
@@ -1022,7 +1087,10 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert login_response.status_code == 200
-        token2 = login_response.json()["token"]
+        data = cast(
+            dict[str, Any], self._extract_transport_response_data(login_response.json())
+        )
+        token2 = data["token"]
 
         # Refresh token - 200
         refresh_response = requests.post(
@@ -1031,7 +1099,11 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert refresh_response.status_code == 200
-        token3 = refresh_response.json()["token"]
+        data = cast(
+            dict[str, Any],
+            self._extract_transport_response_data(refresh_response.json()),
+        )
+        token3 = data["token"]
 
         # Failed login - 401
         fail_response = requests.post(
@@ -1053,7 +1125,7 @@ class TestJacScaleServe:
             json={"title": "Private Task", "priority": 1},
             timeout=5,
         )
-        assert response.status_code == 422
+        assert response.status_code == 401
 
     @pytest.mark.xfail(reason="possible issue with user.json", strict=False)
     def test_private_walker_200_with_auth(self) -> None:
@@ -1074,7 +1146,10 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 200
-        data = response.json()["reports"][0]
+        response_data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
+        data = response_data["reports"][0]
         assert "message" in data
         assert data["message"] == "Private task created"
         assert "task" in data
@@ -1087,7 +1162,10 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 200
-        data = response.json()["reports"][0]
+        response_data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
+        data = response_data["reports"][0]
         assert "message" in data
         assert data["message"] == "This is a public endpoint"
         assert "auth_required" in data
@@ -1111,6 +1189,647 @@ class TestJacScaleServe:
             timeout=5,
         )
         assert response.status_code == 200
-        data = response.json()["reports"][0]
+        response_data = cast(
+            dict[str, Any], self._extract_transport_response_data(response.json())
+        )
+        data = response_data["reports"][0]
         assert "message" in data
         assert data["message"] == "This is a public endpoint"
+
+    def test_custom_response_headers_from_config(self) -> None:
+        """Test that custom response headers from jac.toml are applied."""
+        # Make a request and check for custom headers defined in fixtures/jac.toml
+        response = requests.get(f"{self.base_url}/docs", timeout=5)
+
+        # Check for custom headers configured in jac.toml [environments.response.headers]
+        assert "x-custom-test-header" in response.headers
+        assert response.headers["x-custom-test-header"] == "test-value"
+
+        # Check for COOP/COEP headers (needed for SharedArrayBuffer support)
+        assert "cross-origin-opener-policy" in response.headers
+        assert response.headers["cross-origin-opener-policy"] == "same-origin"
+        assert "cross-origin-embedder-policy" in response.headers
+        assert response.headers["cross-origin-embedder-policy"] == "require-corp"
+
+    def test_update_username_success(self) -> None:
+        """Test successfully updating username and logging in with new username."""
+        # Create user
+        username = f"olduser_{uuid.uuid4().hex[:8]}"
+        create_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": username, "password": "password123"},
+        )
+        original_token = create_result["token"]
+        original_root_id = create_result["root_id"]
+
+        # Update username
+        new_username = f"newuser_{uuid.uuid4().hex[:8]}"
+        update_result = self._request(
+            "PUT",
+            "/user/username",
+            {"current_username": username, "new_username": new_username},
+            token=original_token,
+        )
+
+        assert "username" in update_result
+        assert update_result["username"] == new_username
+        assert "token" in update_result  # New token with updated username
+        assert "root_id" in update_result
+        assert (
+            update_result["root_id"] == original_root_id
+        )  # Root ID should remain same
+
+        # Login with new username should work
+        login_result = self._request(
+            "POST",
+            "/user/login",
+            {"username": new_username, "password": "password123"},
+        )
+        assert login_result["username"] == new_username
+        assert "token" in login_result
+
+        # Old username should fail to login
+        login_response = requests.post(
+            f"{self.base_url}/user/login",
+            json={"username": username, "password": "password123"},
+            timeout=5,
+        )
+        assert login_response.status_code == 401
+
+    def test_update_username_requires_auth(self) -> None:
+        """Test that username update requires authentication."""
+        # Create user
+        username = f"authtest_{uuid.uuid4().hex[:8]}"
+        self._request(
+            "POST",
+            "/user/register",
+            {"username": username, "password": "password123"},
+        )
+
+        # Try to update without token
+        response = requests.put(
+            f"{self.base_url}/user/username",
+            json={"current_username": username, "new_username": "newname"},
+            timeout=5,
+        )
+        assert response.status_code == 401
+
+    def test_update_username_cannot_update_other_users(self) -> None:
+        """Test that users cannot update other users' usernames."""
+        # Create user1
+        user1_name = f"user1_{uuid.uuid4().hex[:8]}"
+        user1_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": user1_name, "password": "pass1"},
+        )
+        user1_token = user1_result["token"]
+
+        # Create user2
+        user2_name = f"user2_{uuid.uuid4().hex[:8]}"
+        self._request(
+            "POST",
+            "/user/register",
+            {"username": user2_name, "password": "pass2"},
+        )
+
+        # User1 tries to update user2's username
+        response = requests.put(
+            f"{self.base_url}/user/username",
+            json={"current_username": user2_name, "new_username": "hacked"},
+            headers={"Authorization": f"Bearer {user1_token}"},
+            timeout=5,
+        )
+        assert response.status_code == 403
+
+    def test_update_username_duplicate_fails(self) -> None:
+        """Test that updating to an existing username fails."""
+        # Create user1
+        user1_name = f"user1_{uuid.uuid4().hex[:8]}"
+        user1_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": user1_name, "password": "pass1"},
+        )
+        user1_token = user1_result["token"]
+
+        # Create user2
+        user2_name = f"user2_{uuid.uuid4().hex[:8]}"
+        self._request(
+            "POST",
+            "/user/register",
+            {"username": user2_name, "password": "pass2"},
+        )
+
+        # Try to update user1 to user2 (already exists)
+        response = requests.put(
+            f"{self.base_url}/user/username",
+            json={"current_username": user1_name, "new_username": user2_name},
+            headers={"Authorization": f"Bearer {user1_token}"},
+            timeout=5,
+        )
+        assert response.status_code == 400
+
+    def test_update_username_empty_validation(self) -> None:
+        """Test that empty username is rejected."""
+        # Create user
+        username = f"testuser_{uuid.uuid4().hex[:8]}"
+        user_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": username, "password": "password123"},
+        )
+        token = user_result["token"]
+
+        # Try to update to empty username
+        response = requests.put(
+            f"{self.base_url}/user/username",
+            json={"current_username": username, "new_username": ""},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+        assert response.status_code == 400
+
+    # ==================== PASSWORD UPDATE TESTS ====================
+
+    def test_update_password_success(self) -> None:
+        """Test successfully updating password and logging in with new password."""
+        # Create user
+        username = f"passuser_{uuid.uuid4().hex[:8]}"
+        create_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": username, "password": "oldpass123"},
+        )
+        token = create_result["token"]
+
+        # Update password
+        update_result = self._request(
+            "PUT",
+            "/user/password",
+            {
+                "username": username,
+                "current_password": "oldpass123",
+                "new_password": "newpass456",
+            },
+            token=token,
+        )
+
+        assert "username" in update_result
+        assert update_result["username"] == username
+        assert "message" in update_result or "success" in str(update_result).lower()
+
+        # Login with new password should work
+        login_result = self._request(
+            "POST",
+            "/user/login",
+            {"username": username, "password": "newpass456"},
+        )
+        assert login_result["username"] == username
+
+        # Old password should fail
+        login_response = requests.post(
+            f"{self.base_url}/user/login",
+            json={"username": username, "password": "oldpass123"},
+            timeout=5,
+        )
+        assert login_response.status_code == 401
+
+    def test_update_password_requires_auth(self) -> None:
+        """Test that password update requires authentication."""
+        # Create user
+        username = f"noauthuser_{uuid.uuid4().hex[:8]}"
+        self._request(
+            "POST",
+            "/user/register",
+            {"username": username, "password": "password123"},
+        )
+
+        # Try to update without token
+        response = requests.put(
+            f"{self.base_url}/user/password",
+            json={
+                "username": username,
+                "current_password": "password123",
+                "new_password": "newpass",
+            },
+            timeout=5,
+        )
+        assert response.status_code == 401
+
+    def test_update_password_wrong_current_password(self) -> None:
+        """Test that wrong current password is rejected."""
+        # Create user
+        username = f"wrongpass_{uuid.uuid4().hex[:8]}"
+        user_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": username, "password": "correctpass"},
+        )
+        token = user_result["token"]
+
+        # Try to update with wrong current password
+        response = requests.put(
+            f"{self.base_url}/user/password",
+            json={
+                "username": username,
+                "current_password": "wrongpass",
+                "new_password": "newpass",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+        assert response.status_code == 400
+
+    def test_update_password_cannot_update_other_users(self) -> None:
+        """Test that users cannot update other users' passwords."""
+        # Create user1
+        user1_name = f"passuser1_{uuid.uuid4().hex[:8]}"
+        user1_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": user1_name, "password": "pass1"},
+        )
+        user1_token = user1_result["token"]
+
+        # Create user2
+        user2_name = f"passuser2_{uuid.uuid4().hex[:8]}"
+        self._request(
+            "POST",
+            "/user/register",
+            {"username": user2_name, "password": "pass2"},
+        )
+
+        # User1 tries to update user2's password
+        response = requests.put(
+            f"{self.base_url}/user/password",
+            json={
+                "username": user2_name,
+                "current_password": "pass2",
+                "new_password": "hacked",
+            },
+            headers={"Authorization": f"Bearer {user1_token}"},
+            timeout=5,
+        )
+        assert response.status_code == 403
+
+    def test_update_password_empty_validation(self) -> None:
+        """Test that empty passwords are rejected."""
+        # Create user
+        username = f"emptypass_{uuid.uuid4().hex[:8]}"
+        user_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": username, "password": "oldpass"},
+        )
+        token = user_result["token"]
+
+        # Try to update to empty new password
+        response = requests.put(
+            f"{self.base_url}/user/password",
+            json={
+                "username": username,
+                "current_password": "oldpass",
+                "new_password": "",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+        assert response.status_code == 400
+
+    # ==================== INTEGRATION TESTS ====================
+
+    def test_username_and_password_update_flow(self) -> None:
+        """Integration test:  Update username, then password, verify both work."""
+        # Create user
+        username = f"original_{uuid.uuid4().hex[:8]}"
+        create_result = self._request(
+            "POST",
+            "/user/register",
+            {"username": username, "password": "oldpass"},
+        )
+        token = create_result["token"]
+        root_id = create_result["root_id"]
+
+        # Update username
+        new_username = f"updated_{uuid.uuid4().hex[:8]}"
+        username_update = self._request(
+            "PUT",
+            "/user/username",
+            {"current_username": username, "new_username": new_username},
+            token=token,
+        )
+        new_token = username_update["token"]
+        assert username_update["root_id"] == root_id
+
+        # Update password with new username and new token
+        password_update = self._request(
+            "PUT",
+            "/user/password",
+            {
+                "username": new_username,
+                "current_password": "oldpass",
+                "new_password": "newpass",
+            },
+            token=new_token,
+        )
+        assert password_update["username"] == new_username
+
+        # Login with new username and new password
+        login_result = self._request(
+            "POST",
+            "/user/login",
+            {"username": new_username, "password": "newpass"},
+        )
+        assert login_result["username"] == new_username
+        assert login_result["root_id"] == root_id
+
+        # Old username should fail
+        old_username_response = requests.post(
+            f"{self.base_url}/user/login",
+            json={"username": username, "password": "newpass"},
+            timeout=5,
+        )
+        assert old_username_response.status_code == 401
+
+        # Old password should fail
+        old_password_response = requests.post(
+            f"{self.base_url}/user/login",
+            json={"username": new_username, "password": "oldpass"},
+            timeout=5,
+        )
+        assert old_password_response.status_code == 401
+
+
+class TestJacScaleServeDevMode:
+    """Test jac-scale serve with --dev mode (dynamic routing).
+
+    This tests that the dynamic routing endpoints correctly parse request body
+    parameters, which is essential for HMR support.
+    """
+
+    fixtures_dir: Path
+    test_file: Path
+    port: int
+    base_url: str
+    server_process: subprocess.Popen[str] | None = None
+
+    @classmethod
+    def setup_class(cls) -> None:
+        """Set up test class - runs once for all tests."""
+        cls.fixtures_dir = Path(__file__).parent / "fixtures"
+        cls.test_file = cls.fixtures_dir / "test_api.jac"
+
+        if not cls.test_file.exists():
+            raise FileNotFoundError(f"Test fixture not found: {cls.test_file}")
+
+        cls.port = get_free_port()
+        cls.base_url = f"http://localhost:{cls.port}"
+
+        cls._cleanup_db_files()
+        cls.server_process = None
+        cls._start_server_dev_mode()
+
+    @classmethod
+    def teardown_class(cls) -> None:
+        """Tear down test class."""
+        if cls.server_process:
+            cls.server_process.terminate()
+            try:
+                cls.server_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                cls.server_process.kill()
+                cls.server_process.wait()
+
+        time.sleep(0.5)
+        gc.collect()
+        cls._cleanup_db_files()
+
+    @classmethod
+    def _start_server_dev_mode(cls) -> None:
+        """Start the jac-scale server in dev mode (dynamic routing).
+
+        In dev mode, the REST API runs on port+1 while Vite runs on port.
+        We connect directly to the REST API port to avoid Vite dependency issues.
+        """
+        import sys
+
+        jac_executable = Path(sys.executable).parent / "jac"
+        # Use --api-only to skip Vite dev server (if supported), otherwise use base port
+        # The REST API in dev mode runs on base_port + 1
+        vite_port = cls.port
+        api_port = cls.port + 1
+        cls.base_url = f"http://localhost:{api_port}"
+
+        cmd = [
+            str(jac_executable),
+            "start",
+            str(cls.test_file),
+            "--port",
+            str(vite_port),
+            "--dev",  # Enable dev mode for dynamic routing
+        ]
+
+        cls.server_process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        max_attempts = 50
+        server_ready = False
+
+        for _ in range(max_attempts):
+            if cls.server_process.poll() is not None:
+                stdout, stderr = cls.server_process.communicate()
+                raise RuntimeError(
+                    f"Server process terminated unexpectedly.\n"
+                    f"STDOUT: {stdout}\nSTDERR: {stderr}"
+                )
+
+            try:
+                # Connect to the REST API port (port+1), not Vite port
+                response = requests.get(f"{cls.base_url}/docs", timeout=2)
+                if response.status_code in (200, 404):
+                    print(
+                        f"Dev mode server started successfully on API port {api_port}"
+                    )
+                    server_ready = True
+                    break
+            except (requests.ConnectionError, requests.Timeout):
+                time.sleep(2)
+
+        if not server_ready:
+            cls.server_process.terminate()
+            try:
+                stdout, stderr = cls.server_process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                cls.server_process.kill()
+                stdout, stderr = cls.server_process.communicate()
+
+            raise RuntimeError(
+                f"Server failed to start in dev mode after {max_attempts} attempts.\n"
+                f"STDOUT: {stdout}\nSTDERR: {stderr}"
+            )
+
+    @classmethod
+    def _cleanup_db_files(cls) -> None:
+        """Delete SQLite database files."""
+        import shutil
+
+        for pattern in [
+            "*.db",
+            "*.db-wal",
+            "*.db-shm",
+            "anchor_store.db.dat",
+            "anchor_store.db.bak",
+            "anchor_store.db.dir",
+        ]:
+            for db_file in glob.glob(pattern):
+                with contextlib.suppress(Exception):
+                    Path(db_file).unlink()
+
+        for pattern in ["*.db", "*.db-wal", "*.db-shm"]:
+            for db_file in glob.glob(str(cls.fixtures_dir / pattern)):
+                with contextlib.suppress(Exception):
+                    Path(db_file).unlink()
+
+        client_build_dir = cls.fixtures_dir / ".jac"
+        if client_build_dir.exists():
+            with contextlib.suppress(Exception):
+                shutil.rmtree(client_build_dir)
+
+    @staticmethod
+    def _extract_data(json_response: dict[str, Any]) -> dict[str, Any]:
+        """Extract data from TransportResponse envelope."""
+        if isinstance(json_response, dict) and "ok" in json_response:
+            if json_response.get("ok") and json_response.get("data") is not None:
+                return json_response["data"]
+            elif not json_response.get("ok") and json_response.get("error"):
+                error_info = json_response["error"]
+                return {"error": error_info.get("message", "Unknown error")}
+        return json_response
+
+    def test_dev_mode_walker_body_parsing(self) -> None:
+        """Test that walkers in dev mode correctly parse request body parameters.
+
+        This is a regression test for the fix where dynamic routing endpoints
+        weren't parsing JSON body content into walker fields.
+        """
+        # Register user
+        register_response = requests.post(
+            f"{self.base_url}/user/register",
+            json={"username": f"devtest_{uuid.uuid4().hex[:8]}", "password": "pass"},
+            timeout=10,
+        )
+        assert register_response.status_code == 201
+        token = self._extract_data(register_response.json())["token"]
+
+        # Call walker with body parameters - this is what was broken
+        response = requests.post(
+            f"{self.base_url}/walker/CreateTask",
+            json={"title": "Watch Mode Task", "priority": 5},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+
+        assert response.status_code == 200, (
+            f"Expected 200, got {response.status_code}: {response.text}"
+        )
+        data = self._extract_data(response.json())
+
+        # Verify the walker received and processed the body parameters
+        assert "result" in data or "reports" in data, f"Unexpected response: {data}"
+
+    def test_dev_mode_function_body_parsing(self) -> None:
+        """Test that functions in dev mode correctly parse request body parameters."""
+        # Register user
+        register_response = requests.post(
+            f"{self.base_url}/user/register",
+            json={"username": f"devfunc_{uuid.uuid4().hex[:8]}", "password": "pass"},
+            timeout=10,
+        )
+        assert register_response.status_code == 201
+        token = self._extract_data(register_response.json())["token"]
+
+        # Call function with body parameters
+        response = requests.post(
+            f"{self.base_url}/function/add_numbers",
+            json={"a": 42, "b": 58},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+
+        assert response.status_code == 200, (
+            f"Expected 200, got {response.status_code}: {response.text}"
+        )
+        data = self._extract_data(response.json())
+
+        # Verify the function received and processed the body parameters
+        assert "result" in data, f"Expected 'result' in response: {data}"
+        assert data["result"] == 100, f"Expected 100, got {data['result']}"
+
+    def test_dev_mode_public_walker_no_auth(self) -> None:
+        """Test that public walkers work without auth in dev mode."""
+        response = requests.post(
+            f"{self.base_url}/walker/PublicInfo",
+            json={},
+            timeout=10,
+        )
+
+        assert response.status_code == 200
+        data = self._extract_data(response.json())
+        assert "reports" in data
+        assert data["reports"][0]["message"] == "This is a public endpoint"
+
+    def test_dev_mode_private_walker_requires_auth(self) -> None:
+        """Test that private walkers require auth in dev mode."""
+        response = requests.post(
+            f"{self.base_url}/walker/PrivateCreateTask",
+            json={"title": "Private Task", "priority": 1},
+            timeout=10,
+        )
+
+        assert response.status_code == 401
+
+    # Async Walker Test
+    def test_async_walker_basic_execution(self) -> None:
+        """Test that async walkers execute correctly with await."""
+        # Create user
+        username = f"asyncuser_{uuid.uuid4().hex[:8]}"
+        register_response = requests.post(
+            f"{self.base_url}/user/register",
+            json={"username": username, "password": "password123"},
+            timeout=10,
+        )
+        assert register_response.status_code == 201
+        token = self._extract_data(register_response.json())["token"]
+
+        # Spawn async walker
+        response = requests.post(
+            f"{self.base_url}/walker/AsyncCreateTask",
+            json={"title": "Async Test Task", "delay_ms": 50},
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+
+        assert response.status_code == 200, (
+            f"Expected 200, got {response.status_code}: {response.text}"
+        )
+        data = self._extract_data(response.json())
+
+        # Verify reports show the async execution flow
+        assert "reports" in data, f"Expected 'reports' in response: {data}"
+        reports = data["reports"]
+
+        # Should have 3 reports: started, after_async_wait, completed
+        assert len(reports) >= 3, f"Expected at least 3 reports, got {len(reports)}"
+
+        # Check the execution order
+        assert reports[0]["status"] == "started"
+        assert reports[0]["title"] == "Async Test Task"
+        assert reports[1]["status"] == "after_async_wait"
+        assert reports[2]["status"] == "completed"
+        assert "task" in reports[2]

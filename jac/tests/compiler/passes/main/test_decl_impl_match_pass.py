@@ -1,25 +1,25 @@
 """Test pass module."""
 
 import io
-from collections.abc import Callable
+from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager
+from pathlib import Path
 
 import pytest
 
 import jaclang.pycore.unitree as uni
 from jaclang import JacRuntime as Jac
-from jaclang.cli import cli
+from jaclang.cli.commands import execution  # type: ignore[attr-defined]
 from jaclang.pycore.program import JacProgram
 
 
 @pytest.fixture(autouse=True)
-def setup_jac_runtime(fixture_path: Callable[[str], str]):
+def setup_jac_runtime(
+    fixture_path: Callable[[str], str], fresh_jac_context: Path
+) -> Generator[None, None, None]:
     """Set up and tear down Jac runtime for each test."""
-    Jac.reset_machine()
-    Jac.set_base_path(fixture_path("./"))
     Jac.attach_program(JacProgram())
     yield
-    Jac.reset_machine()
 
 
 def test_parameter_count_mismatch(fixture_path: Callable[[str], str]) -> None:
@@ -97,7 +97,7 @@ def test_run_base2(
 ) -> None:
     """Test that the walker and node can be created dynamically."""
     with capture_stdout() as captured_output:
-        cli.run(fixture_path("base2.jac"))
+        execution.run(fixture_path("base2.jac"))
     output = captured_output.getvalue().strip()
     assert "56" in output
 

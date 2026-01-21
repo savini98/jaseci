@@ -289,10 +289,10 @@ The `package.json` file is dynamically generated from `config.json` by `ViteBund
 
 #### Package Installation Workflow
 
-The `jac install --cl` command manages npm packages through `config.json`:
+The `jac add --npm` command manages npm packages through `config.json`:
 
 ```
-1. Developer runs: jac install --cl lodash
+1. Developer runs: jac add --npm lodash
    ↓
 2. PackageInstaller updates config.json (adds lodash to dependencies)
    ↓
@@ -324,31 +324,31 @@ The `jac install --cl` command manages npm packages through `config.json`:
 
 #### CLI Commands
 
-**Install Package:**
+**Add Package:**
 
 ```bash
-jac install --cl lodash              # Add to dependencies
-jac install --cl -D @types/react     # Add to devDependencies
-jac install --cl lodash@^4.17.21     # Install with specific version
+jac add --npm lodash              # Add to dependencies
+jac add --npm -d @types/react     # Add to devDependencies
+jac add --npm lodash@^4.17.21     # Add with specific version
 ```
 
 **Install All Packages:**
 
 ```bash
-jac install --cl                     # Install all packages from config.json
+jac add --npm                     # Install all packages from jac.toml
 ```
 
-**Uninstall Package:**
+**Remove Package:**
 
 ```bash
-jac uninstall --cl lodash            # Remove from dependencies
-jac uninstall --cl -D @types/react  # Remove from devDependencies
+jac remove --npm lodash            # Remove from dependencies
+jac remove --npm -d @types/react   # Remove from devDependencies
 ```
 
 **Project Creation:**
 
 ```bash
-jac create --cl my-app            # Creates jac.toml with organized folder structure
+jac create --use client my-app            # Creates jac.toml with organized folder structure
 ```
 
 #### Benefits
@@ -575,11 +575,11 @@ export default defineConfig({
 **Package Management Workflow**:
 
 ```
-1. Developer runs: jac install --cl lodash
+1. Developer runs: jac add --npm lodash
    ↓
-2. PackageInstaller updates config.json (package.dependencies)
+2. PackageInstaller updates jac.toml (dependencies.npm)
    ↓
-3. ViteBundler generates package.json from config.json
+3. ViteBundler generates package.json from jac.toml
    ↓
 4. npm install runs (installs packages)
    ↓
@@ -588,14 +588,14 @@ export default defineConfig({
 6. Root package.json removed (keeps only .jac/client/configs/)
 ```
 
-**Uninstall Workflow**:
+**Remove Workflow**:
 
 ```
-1. Developer runs: jac uninstall --cl lodash
+1. Developer runs: jac remove --npm lodash
    ↓
-2. PackageInstaller removes package from config.json
+2. PackageInstaller removes package from jac.toml
    ↓
-3. ViteBundler regenerates package.json from updated config.json
+3. ViteBundler regenerates package.json from updated jac.toml
    ↓
 4. npm install runs (removes package from node_modules)
    ↓
@@ -619,3 +619,52 @@ export default defineConfig({
 - `runtime_path`: Path to client runtime file
 - `vite_output_dir`: Build output (defaults to `compiled/dist/assets`)
 - `vite_minify`: Enable/disable minification
+
+### HTML Meta Data Configuration
+
+The Jac Client provides a comprehensive **HTML meta data configuration system** that allows developers to customize SEO, social media, and browser metadata for their client applications through `jac.toml`.
+
+#### Meta Data Configuration in jac.toml
+
+Meta data is configured in the `[plugin.client.app_meta_data]` section of `jac.toml`:
+
+```toml
+[plugin.client.app_meta_data]
+charset = "UTF-8"
+title = "My Awesome App"
+viewport = "width=device-width, initial-scale=1"
+description = "A powerful application built with Jac"
+robots = "index, follow"
+canonical = "https://example.com/app"
+
+# OpenGraph metadata for social media
+og_type = "website"
+og_title = "My Awesome App"
+og_description = "A powerful application built with Jac"
+og_url = "https://example.com/app"
+og_image = "https://example.com/og-image.png"
+
+# Browser/PWA metadata
+theme_color = "#4a90e2"
+icon = "/assets/favicon.ico"
+```
+
+#### Meta Data Processing Flow
+
+The meta data system follows a structured processing pipeline:
+
+```
+1. Load configuration from jac.toml
+   ↓
+2. Extract [plugin.client.app_meta_data] section
+   ↓
+3. Merge with default values (see meta_defaults)
+   ↓
+4. Apply HEAD_SCHEMA to structure tags
+   ↓
+5. Generate HTML head content with build_head()
+   ↓
+6. Inject into page template with CSS links
+   ↓
+7. Serve rendered HTML with proper meta tags
+```
