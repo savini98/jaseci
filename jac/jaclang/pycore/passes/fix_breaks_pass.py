@@ -178,19 +178,19 @@ class FixDynBreaksPass(UniPass):
         if not has_dyn_cf_break:
             return
 
-        print(
-            f"\n=== Transforming IfStmt at line {node.loc.first_line} with dynamic control flow break ==="
-        )
+        # print(
+        #     f"\n=== Transforming IfStmt at line {node.loc.first_line} with dynamic control flow break ==="
+        # )
 
         # Get reasons from new or old attribute
-        if hasattr(node, "dyn_cf_reasons"):
-            print(f"Reasons: {'; '.join(node.dyn_cf_reasons)}")  # type: ignore
-        elif hasattr(node, "graph_break_reasons"):
-            print(f"Reasons: {'; '.join(node.graph_break_reasons)}")  # type: ignore
+        # if hasattr(node, "dyn_cf_reasons"):
+        #     print(f"Reasons: {'; '.join(node.dyn_cf_reasons)}")  # type: ignore
+        # elif hasattr(node, "graph_break_reasons"):
+        #     print(f"Reasons: {'; '.join(node.graph_break_reasons)}")  # type: ignore
 
         # Check if we have exactly one statement in if and else branches
         if not node.body or len(node.body) != 1:
-            print("  -> Skipping: if body doesn't have exactly 1 statement")
+            # print("  -> Skipping: if body doesn't have exactly 1 statement")
             return
 
         if (
@@ -198,7 +198,7 @@ class FixDynBreaksPass(UniPass):
             or not node.else_body.body
             or len(node.else_body.body) != 1
         ):
-            print("  -> Skipping: else body doesn't have exactly 1 statement")
+            # print("  -> Skipping: else body doesn't have exactly 1 statement")
             return
 
         a0 = node.body[0]
@@ -209,7 +209,7 @@ class FixDynBreaksPass(UniPass):
         if isinstance(a0, uni.Assignment) and isinstance(b0, uni.Assignment):
             lhs = self.check_same_lhs(a0, b0)
             if lhs is not None:
-                print(f"  -> Transforming assignment: {lhs.value} = torch.where(...)")
+                # print(f"  -> Transforming assignment: {lhs.value} = torch.where(...)")
 
                 # Extract expressions into temporary variables
                 temp_assigns, cond_ref, true_ref, false_ref = self.extract_expressions(
@@ -242,16 +242,16 @@ class FixDynBreaksPass(UniPass):
                 # Combine all statements: temp assignments + final assignment
                 all_stmts = temp_assigns + [result_assign]
                 self.replace_node(all_stmts, node, "body")
-                print("  -> Successfully transformed to torch.where assignment")
+                # print("  -> Successfully transformed to torch.where assignment")
                 return
 
         # Case 2: Both branches are return statements
         elif isinstance(a0, uni.ReturnStmt) and isinstance(b0, uni.ReturnStmt):
             aexpr, bexpr = a0.expr, b0.expr
             if aexpr is None or bexpr is None:
-                print("  -> Skipping: return statement has no expression")
+                # print("  -> Skipping: return statement has no expression")
                 return
-            print("  -> Transforming return: return torch.where(...)")
+            # print("  -> Transforming return: return torch.where(...)")
 
             # Extract expressions into temporary variables
             temp_assigns, cond_ref, true_ref, false_ref = self.extract_expressions(
@@ -279,7 +279,7 @@ class FixDynBreaksPass(UniPass):
             # Combine all statements: temp assignments + return
             all_stmts = temp_assigns + [return_stmt]
             self.replace_node(all_stmts, node, "body")
-            print("  -> Successfully transformed to torch.where return")
+            # print("  -> Successfully transformed to torch.where return")
             return
 
         # Case 3: Both branches are method calls with same method name
@@ -295,7 +295,7 @@ class FixDynBreaksPass(UniPass):
                 if a_method == b_method and set(a_kwargs.keys()) == set(
                     b_kwargs.keys()
                 ):
-                    print(f"  -> Transforming method call: {a_method}(...)")
+                    # print(f"  -> Transforming method call: {a_method}(...)")
 
                     # Only transform if first argument differs (the value to select)
                     if len(a_args) >= 2 and len(b_args) >= 2:
@@ -387,9 +387,9 @@ class FixDynBreaksPass(UniPass):
                                 # Replace with all statements: temp extractions + where assignment + method call
                                 all_stmts = temp_assigns + [result_assign, method_node]
                                 self.replace_node(all_stmts, node, "body")
-                                print(
-                                    f"  -> Successfully transformed to torch.where + {a_method} call"
-                                )
+                                # print(
+                                #     f"  -> Successfully transformed to torch.where + {a_method} call"
+                                # )
                                 return
 
-            print("  -> Skipping: method call pattern not supported")
+            # print("  -> Skipping: method call pattern not supported")

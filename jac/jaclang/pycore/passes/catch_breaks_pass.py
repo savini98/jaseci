@@ -42,7 +42,6 @@ class CatchBreaksPass(UniPass):
                 if dec_txt == "torch.compile" or dec_txt.startswith("torch.compile ("):
                     self._torch_compiled_abilities.append(node)
                     should_analyze = True
-                    # print(f"Found @torch.compile on function: {node.name_spec.value if hasattr(node, 'name_spec') else 'unknown'}")
                     break
 
         # Check if the ability is inside a torch.compile decorated class
@@ -51,9 +50,9 @@ class CatchBreaksPass(UniPass):
             and self._current_archetype in self._torch_compiled_archetypes
         ):
             should_analyze = True
-            print(
-                f"Found function inside @torch.compile class: {node.name_spec.value if hasattr(node, 'name_spec') else 'unknown'}"
-            )
+            # print(
+            #     f"Found function inside @torch.compile class: {node.name_spec.value if hasattr(node, 'name_spec') else 'unknown'}"
+            # )
 
         if should_analyze:
             _ = BreakFinder(node)  # Analysis happens in __init__
@@ -109,26 +108,7 @@ class BreakFinder(CFGTracer):
         """Report all detected graph breaks."""
         total_breaks = len(self.graph_break_stmts) + len(self.side_effect_stmts)
         if total_breaks > 0:
-            print(
-                f"\n=== SUMMARY: Found {total_breaks} statement(s) with dynamo graph breaks ==="
-            )
-            if self.graph_break_stmts:
-                print(
-                    f"\n  Dynamic Control Flow Breaks ({len(self.graph_break_stmts)}):"
-                )
-                for idx, stmt in enumerate(self.graph_break_stmts, 1):
-                    print(
-                        f"    {idx}. IfStmt at line {stmt.loc.first_line}: has_break_dyn_cf={getattr(stmt, 'has_break_dyn_cf', False)}"
-                    )
-            if self.side_effect_stmts:
-                print(f"\n  Side Effect Breaks ({len(self.side_effect_stmts)}):")
-                for idx, stmt in enumerate(self.side_effect_stmts, 1):
-                    stmt_type = type(stmt).__name__
-                    print(
-                        f"    {idx}. {stmt_type} at line {stmt.loc.first_line}: has_break_se={getattr(stmt, 'has_break_se', False)}"
-                    )
-        else:
-            print("\n=== SUMMARY: No dynamo graph breaks detected ===")
+            pass
 
     def gather_external_symbols(self, node: uni.IfStmt | uni.ElseIf) -> set[uni.Symbol]:
         """Gather external symbols used in this expression statement."""
@@ -329,13 +309,12 @@ class BreakFinder(CFGTracer):
             return False, ""
 
         visited.add(symbol.sym_name)
-        indent = "  " * depth
 
-        print(f"{indent}Tracing symbol: {symbol.sym_name}")
+        # print(f"{indent}Tracing symbol: {symbol.sym_name}")
 
         # Check if symbol is a function parameter (dynamic value)
         if self.is_symbol_function_parameter(symbol):
-            print(f"{indent}  -> Is function parameter (dynamic)")
+            # print(f"{indent}  -> Is function parameter (dynamic)")
             return True, f"depends on function parameter '{symbol.sym_name}'"
 
         # Check if symbol's definition contains graph-breaking operations
@@ -372,9 +351,9 @@ class BreakFinder(CFGTracer):
                         # List of torch operations that cause graph breaks
                         graph_breaking_ops = ["max", "min", "sum"]
                         if method_name in graph_breaking_ops:
-                            print(
-                                f"{indent}  -> Contains torch.{method_name}() (graph-breaking op)"
-                            )
+                            # print(
+                            #     f"{indent}  -> Contains torch.{method_name}() (graph-breaking op)"
+                            # )
                             return True, f"uses torch.{method_name}()"
 
         # Recursively check all symbols used in the definition
@@ -383,7 +362,7 @@ class BreakFinder(CFGTracer):
             # Look up the symbol
             dep_symbol = current.sym_tab.lookup(name=name_node.value, deep=True)
             if dep_symbol and dep_symbol.sym_name not in visited:
-                print(f"{indent}  -> Depends on: {dep_symbol.sym_name}")
+                # print(f"{indent}  -> Depends on: {dep_symbol.sym_name}")
                 has_break, reason = self.trace_symbol_dependencies(
                     dep_symbol, visited, depth + 1
                 )
@@ -407,10 +386,10 @@ class BreakFinder(CFGTracer):
                 self.side_effect_stmts.append(stmt)
                 stmt.has_break_se = True  # type: ignore
                 stmt.side_effect_reason = se_reason  # type: ignore
-                print(
-                    f"\n  *** SIDE EFFECT BREAK DETECTED - Marked {type(stmt).__name__} at line {stmt.loc.first_line} ***"
-                )
-                print(f"  Reason: {se_reason}")
+                # print(
+                # #     f"\n  *** SIDE EFFECT BREAK DETECTED - Marked {type(stmt).__name__} at line {stmt.loc.first_line} ***"
+                # )
+                # print(f"  Reason: {se_reason}")
 
         # Check for dynamic control flow breaks in if statements
         if isinstance(stmt, uni.IfStmt):
@@ -421,15 +400,15 @@ class BreakFinder(CFGTracer):
             self.analyzed_stmts.add(stmt_id)
 
             symbols = self.gather_external_symbols(stmt)
-            print(
-                f"\nExternal symbols in IfStmt at line {stmt.loc.first_line}: {symbols}"
-            )
+            # print(
+            #     f"\nExternal symbols in IfStmt at line {stmt.loc.first_line}: {symbols}"
+            # )
 
             has_graph_break = False
             graph_break_reasons = []
 
             for sym in symbols:
-                print(f"\nAnalyzing symbol: {sym.sym_name}, Type: {sym.sym_type}")
+                # print(f"\nAnalyzing symbol: {sym.sym_name}, Type: {sym.sym_type}")
 
                 # Check if symbol is used with .sum() in the condition
                 has_sum_in_condition = self.check_symbol_has_method_call_in_expr(
@@ -439,7 +418,7 @@ class BreakFinder(CFGTracer):
                     reason = (
                         f"Symbol '{sym.sym_name}' is used with .sum() in the condition"
                     )
-                    print(f"  -> {reason}")
+                    # print(f"  -> {reason}")
                     has_graph_break = True
                     graph_break_reasons.append(reason)
                     continue  # No need to trace further
@@ -450,17 +429,17 @@ class BreakFinder(CFGTracer):
                     reason = (
                         f"Symbol '{sym.sym_name}' contains .sum() in its definition"
                     )
-                    print(f"  -> {reason}")
+                    # print(f"  -> {reason}")
                     has_graph_break = True
                     graph_break_reasons.append(reason)
                     continue
 
                 # Trace symbol dependencies recursively
-                print(f"  -> Tracing dependencies for '{sym.sym_name}':")
+                # print(f"  -> Tracing dependencies for '{sym.sym_name}':")
                 has_break, trace_reason = self.trace_symbol_dependencies(sym)
                 if has_break:
                     reason = f"Symbol '{sym.sym_name}' {trace_reason}"
-                    print(f"  -> GRAPH BREAK: {reason}")
+                    # print(f"  -> GRAPH BREAK: {reason}")
                     has_graph_break = True
                     graph_break_reasons.append(reason)
 
@@ -473,7 +452,3 @@ class BreakFinder(CFGTracer):
                 # Keep old names for backward compatibility
                 stmt.has_dynamo_graph_break = True  # type: ignore
                 stmt.graph_break_reasons = graph_break_reasons  # type: ignore
-                print(
-                    f"\n  *** DYNAMIC CONTROL FLOW BREAK DETECTED - Marked IfStmt at line {stmt.loc.first_line} ***"
-                )
-                print(f"  Reasons: {'; '.join(graph_break_reasons)}")
