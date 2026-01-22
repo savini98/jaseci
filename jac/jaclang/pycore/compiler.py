@@ -39,13 +39,10 @@ def get_symtab_ir_sched() -> list[type[Transform[uni.Module, uni.Module]]]:
 
 def get_ir_gen_sched() -> list[type[Transform[uni.Module, uni.Module]]]:
     """Full IR generation schedule."""
-    from jaclang.compiler.passes.main import (
-        CatchBreaksPass,
-        CFGBuildPass,
-        FixDynBreaksPass,
-        FixSEBreaksPass,
-        SemDefMatchPass,
-    )
+    from jaclang.compiler.passes.main import CFGBuildPass, SemDefMatchPass
+    from jaclang.pycore.passes.catch_breaks_pass import CatchBreaksPass
+    from jaclang.pycore.passes.fix_se_breaks_pass import FixSEBreaksPass
+    from jaclang.pycore.passes.fix_breaks_pass import FixDynBreaksPass
 
     return [
         SymTabBuildPass,
