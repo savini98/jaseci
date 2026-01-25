@@ -1,8 +1,6 @@
 import torch;
 class Cfg {
-    def __init__(
-        self: Cfg, max_position_embeddings: Any = 8, has_original: Any = False
-    ) {
+    def init(self: Cfg, max_position_embeddings: Any = 8, has_original: Any = False) {
         self.max_position_embeddings = max_position_embeddings;
         if has_original {
             self.original_max_position_embeddings = max_position_embeddings // 2;
@@ -12,7 +10,7 @@ class Cfg {
 
 @torch.compile()
 class ToyModel(torch.nn.Module) {
-    def __init__(self: ToyModel, cfg: Cfg) {
+    def init(self: ToyModel, cfg: Cfg) {
         super.init();
         self.config = cfg;
         self.long_inv_freq = torch.tensor([10.0, 20.0, 30.0]);
@@ -27,7 +25,7 @@ class ToyModel(torch.nn.Module) {
         self: ToyModel, position_ids: Any, device: Any = 'cpu'
     ) {
         seq_len = torch.max(position_ids) + 1;
-        if hasattr(self.config, 'original_max_position_embeddings') {
+        if self.config?.original_max_position_embeddings {
             original_max_position_embeddings = self.config.original_max_position_embeddings;
         } else {
             original_max_position_embeddings = self.config.max_position_embeddings;

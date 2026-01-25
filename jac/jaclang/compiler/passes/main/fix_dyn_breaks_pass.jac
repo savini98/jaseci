@@ -23,6 +23,7 @@ class FixDynBreaksPass(UniPass) {
             pos_end=0
         );
     }
+
     """Replace old node with new nodes in parent's body and kid lists."""
     def replace_node(
         self: FixDynBreaksPass,
@@ -64,6 +65,7 @@ class FixDynBreaksPass(UniPass) {
             }
         }
     }
+
     """Return the common LHS target if both are simple assignment with same target."""
     def check_same_lhs(
         self: FixDynBreaksPass, assign_a: uni.UniNode, assign_b: uni.UniNode
@@ -83,6 +85,7 @@ class FixDynBreaksPass(UniPass) {
         }
         return ta;
     }
+
     """Check if node is a method call and return (target, method_name, args, kwargs)."""
     def check_method_call(
         self: FixDynBreaksPass, <>node: uni.ExprStmt
@@ -120,6 +123,7 @@ class FixDynBreaksPass(UniPass) {
         }
         return (call.target.target, method_name, args, kwargs);
     }
+
     """
         Always extract expressions into temporary variables for clarity.
         Returns (assignments_list, cond_name, true_name, false_name).
@@ -340,4 +344,3 @@ class FixDynBreaksPass(UniPass) {
         }
     }
 }
-

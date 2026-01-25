@@ -10,6 +10,7 @@ class CatchBreaksPass(UniPass) {
         self._current_archetype: (uni.Archetype | None) = None;
         return super.before_pass();
     }
+
     """Enter archetype (class)."""
     def enter_archetype(self: CatchBreaksPass, <>node: uni.Archetype) -> None {
         self._current_archetype = <>node;
@@ -26,12 +27,14 @@ class CatchBreaksPass(UniPass) {
             }
         }
     }
+
     """Exit archetype (class)."""
     def exit_archetype(self: CatchBreaksPass, <>node: uni.Archetype) -> None {
         if (self._current_archetype == <>node) {
             self._current_archetype = None;
         }
     }
+
     """Enter ability (function/method)."""
     def enter_ability(self: CatchBreaksPass, <>node: uni.Ability) -> None {
         should_analyze = False;
@@ -59,6 +62,7 @@ class CatchBreaksPass(UniPass) {
         }
     }
 }
+
 """CFG Tracer to trace control flow graphs."""
 class CFGTracer {
     """Initialize CFGTracer."""
@@ -66,6 +70,7 @@ class CFGTracer {
         self.ability = ability;
         self.run_analysis(self.ability);
     }
+
     """Analyze symbols."""
     def run_analysis(self: CFGTracer, current_node: uni.UniCFGNode) -> None {
         self.analysis_on_basicblock(current_node);
@@ -76,6 +81,7 @@ class CFGTracer {
             self.run_analysis(succ);
         }
     }
+
     """Perform analysis."""
     def analysis_on_basicblock(self: CFGTracer, current_node: uni.UniCFGNode) -> None {
         basicblock = current_node.get_current_bb();
@@ -83,9 +89,11 @@ class CFGTracer {
             self.analysis_on_stmt(stmt);
         }
     }
+
     """Perform analysis."""
     def analysis_on_stmt(self: CFGTracer, stmt: uni.UniCFGNode) -> None { }
 }
+
 """Break Finder to find break statements."""
 class BreakFinder(CFGTracer) {
     with entry {
@@ -110,6 +118,7 @@ class BreakFinder(CFGTracer) {
         super.init(ability);
         self.report_graph_breaks();
     }
+
     """Report all detected graph breaks."""
     def report_graph_breaks(self: BreakFinder) -> None {
         total_breaks = len(self.graph_break_stmts) + len(self.side_effect_stmts);
@@ -117,6 +126,7 @@ class BreakFinder(CFGTracer) {
             ;
         }
     }
+
     """Gather external symbols used in this expression statement."""
     def gather_external_symbols(
         self: BreakFinder, <>node: (uni.IfStmt | uni.ElseIf)
@@ -131,6 +141,7 @@ class BreakFinder(CFGTracer) {
         }
         return symbols;
     }
+
     """Check if a symbol is used with a specific method call in an expression (e.g., b.sum())."""
     def check_symbol_has_method_call_in_expr(
         self: BreakFinder, expr: uni.Expr, symbol: uni.Symbol, method_name: str
@@ -180,6 +191,7 @@ class BreakFinder(CFGTracer) {
         }
         return False;
     }
+
     """Check if symbol's definition expression contains a specific method call (e.g., .sum())."""
     def check_symbol_has_method_call(
         self: BreakFinder, symbol: uni.Symbol, method_name: str
@@ -210,6 +222,7 @@ class BreakFinder(CFGTracer) {
         }
         return False;
     }
+
     """Check if a symbol is a function parameter (argument)."""
     def is_symbol_function_parameter(self: BreakFinder, symbol: uni.Symbol) -> bool {
         if not symbol.defn {
@@ -228,6 +241,7 @@ class BreakFinder(CFGTracer) {
         }
         return False;
     }
+
     """
         Check if a node contains side-effect causing function calls.
         Returns (has_side_effect, reason).
@@ -291,6 +305,7 @@ class BreakFinder(CFGTracer) {
         }
         return (False, '');
     }
+
     """
         Recursively trace a symbol's dependencies to find graph-breaking operations.
         Returns (has_graph_break, reason).
@@ -426,4 +441,3 @@ class BreakFinder(CFGTracer) {
         }
     }
 }
-

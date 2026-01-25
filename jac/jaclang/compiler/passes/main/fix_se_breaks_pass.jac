@@ -13,6 +13,7 @@ class FixSEBreaksPass(UniPass) {
         self.needs_se_buffer = False;
         return super.before_pass();
     }
+
     """Generate a Name node."""
     def gen_name(
         self: FixSEBreaksPass, <>node: uni.UniNode, name: Tok, value: str
@@ -29,6 +30,7 @@ class FixSEBreaksPass(UniPass) {
             pos_end=0
         );
     }
+
     """Replace side-effect call with a call to append to the buffer."""
     def _replace_side_effect_call(
         self: FixSEBreaksPass, <>node: uni.FuncCall
@@ -73,6 +75,7 @@ class FixSEBreaksPass(UniPass) {
             kid=([func_target] + args)
         );
     }
+
     """Exit function call - replace if marked with side effect break by CatchBreaksPass."""
     def exit_func_call(self: FixSEBreaksPass, <>node: uni.FuncCall) -> None {
         if not getattr(<>node, 'has_break_se', False) {
@@ -92,6 +95,7 @@ class FixSEBreaksPass(UniPass) {
             }
         }
     }
+
     """Exit ability - wrap if it needs side effect buffering."""
     def exit_ability(self: FixSEBreaksPass, <>node: uni.Ability) -> None {
         if not getattr(<>node, 'needs_se_buffer', False) {
@@ -138,6 +142,7 @@ class FixSEBreaksPass(UniPass) {
         }
         self._add_buffer_flush(body, body_parent, <>node);
     }
+
     """Add buffer flush logic before return statements."""
     def _add_buffer_flush(
         self: FixSEBreaksPass,
@@ -177,6 +182,7 @@ class FixSEBreaksPass(UniPass) {
             }
         }
     }
+
     """Recursively find all return statements with their parent context.
 
         Returns list of (return_stmt, parent_body_list, parent_node) tuples.
@@ -241,4 +247,3 @@ class FixSEBreaksPass(UniPass) {
         ;
     }
 }
-
