@@ -10,13 +10,13 @@ This module contains the bootstrap-critical compiler passes:
 - def_impl_match_pass: Declaration-implementation matching
 - semantic_analysis_pass: Semantic analysis
 - ast_gen/: Shared AST generation utilities
+
+Note: CatchBreaksPass, FixDynBreaksPass, FixSEBreaksPass are now .jac files
+and should be imported from jaclang.compiler.passes.main when needed.
 """
 
 from jaclang.pycore.passes.annex_pass import JacAnnexPass
-from jaclang.pycore.passes.catch_breaks_pass import CatchBreaksPass
 from jaclang.pycore.passes.def_impl_match_pass import DeclImplMatchPass
-from jaclang.pycore.passes.fix_dyn_breaks_pass import FixDynBreaksPass
-from jaclang.pycore.passes.fix_se_breaks_pass import FixSEBreaksPass
 from jaclang.pycore.passes.pyast_gen_pass import PyastGenPass
 from jaclang.pycore.passes.pybc_gen_pass import PyBytecodeGenPass
 from jaclang.pycore.passes.semantic_analysis_pass import SemanticAnalysisPass
@@ -35,7 +35,4 @@ __all__ = [
     "JacAnnexPass",
     "DeclImplMatchPass",
     "SemanticAnalysisPass",
-    "CatchBreaksPass",
-    "FixDynBreaksPass",
-    "FixSEBreaksPass",
 ]
