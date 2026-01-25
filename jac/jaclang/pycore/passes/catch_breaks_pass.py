@@ -279,7 +279,10 @@ class BreakFinder(CFGTracer):
             for part in parts:
                 for pattern in self._LOGGING_PATTERNS:
                     if pattern in part.lower():
-                        return True, f"calls {'.'.join(reversed(parts))}() (logging operation)"
+                        return (
+                            True,
+                            f"calls {'.'.join(reversed(parts))}() (logging operation)",
+                        )
 
         return False, ""
 
@@ -373,7 +376,7 @@ class BreakFinder(CFGTracer):
             if stmt_id not in self.analyzed_stmts:
                 self.analyzed_stmts.add(stmt_id)
                 self.side_effect_stmts.append(stmt)
-                
+
                 # Mark the specific function call node with side effect flag
                 func_calls = stmt.get_all_sub_nodes(uni.FuncCall)
                 for call in func_calls:
@@ -381,7 +384,7 @@ class BreakFinder(CFGTracer):
                     if is_se:
                         call.has_break_se = True  # type: ignore
                         call.side_effect_reason = se_reason  # type: ignore
-                
+
                 # Also mark the statement itself
                 stmt.has_break_se = True  # type: ignore
                 stmt.side_effect_reason = se_reason  # type: ignore
