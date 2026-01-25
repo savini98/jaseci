@@ -15,7 +15,7 @@ This module contains the bootstrap-critical compiler passes:
 from jaclang.pycore.passes.annex_pass import JacAnnexPass
 from jaclang.pycore.passes.catch_breaks_pass import CatchBreaksPass
 from jaclang.pycore.passes.def_impl_match_pass import DeclImplMatchPass
-from jaclang.pycore.passes.fix_breaks_pass import FixDynBreaksPass
+from jaclang.pycore.passes.fix_dyn_breaks_pass import FixDynBreaksPass
 from jaclang.pycore.passes.fix_se_breaks_pass import FixSEBreaksPass
 from jaclang.pycore.passes.pyast_gen_pass import PyastGenPass
 from jaclang.pycore.passes.pybc_gen_pass import PyBytecodeGenPass

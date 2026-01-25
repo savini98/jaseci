@@ -88,6 +88,12 @@ class CFGTracer:
 class BreakFinder(CFGTracer):
     """Break Finder to find break statements."""
 
+    # List of function names that cause side effects and should be hoisted
+    _SIDE_EFFECT_CALLS = {"print", "input"}
+
+    # Logging patterns that should be hoisted
+    _LOGGING_PATTERNS = ["log", "logger", "logging", "warn", "error", "info", "debug"]
+
     def __init__(self, ability: uni.Ability):
         """Initialize BreakFinder."""
         self.breaks: list = []
@@ -226,71 +232,54 @@ class BreakFinder(CFGTracer):
         Check if a node contains side-effect causing function calls.
         Returns (has_side_effect, reason).
         """
-        # List of built-in functions and modules that cause graph breaks
-        side_effect_funcs = {
-            "print": "I/O operation",
-            "input": "I/O operation",
-            "open": "file I/O",
-            "write": "I/O operation",
-            "read": "I/O operation",
-        }
-
-        # Logging-related patterns
-        logging_patterns = [
-            "log",
-            "logger",
-            "logging",
-            "warn",
-            "error",
-            "info",
-            "debug",
-        ]
-
         # Get all function calls in the node
         func_calls = node.get_all_sub_nodes(uni.FuncCall)
 
         for call in func_calls:
-            # Check direct function name
-            if isinstance(call.target, uni.Name):
-                func_name = call.target.value
+            is_se, reason = self._is_side_effect_call(call)
+            if is_se:
+                return True, reason
 
-                # Check if it's a built-in function name
-                if func_name in side_effect_funcs:
-                    # Verify it's actually the built-in, not a redefined variable
-                    # Look up the symbol in the symbol table
-                    if hasattr(node, "sym_tab") and node.sym_tab:
-                        symbol = node.sym_tab.lookup(name=func_name, deep=True)
-                        # If symbol is found and it has a definition, it's user-defined
-                        if symbol and symbol.defn:
-                            # User has redefined this name, skip it
-                            continue
-                    # It's the built-in function
-                    return True, f"calls {func_name}() ({side_effect_funcs[func_name]})"
+        return False, ""
 
-                # Check for logging patterns
-                for pattern in logging_patterns:
-                    if pattern in func_name.lower():
-                        # For logging, we're less strict since it's less likely to be redefined
-                        return True, f"calls {func_name}() (logging operation)"
+    def _is_side_effect_call(self, node: uni.FuncCall) -> tuple[bool, str]:
+        """Check if a function call has side effects and should be buffered."""
+        if isinstance(node.target, uni.Name):
+            func_name = node.target.value
 
-            # Check for method calls like logger.info(), logging.debug(), etc.
-            elif isinstance(call.target, uni.AtomTrailer) and call.target.is_attr:
-                if isinstance(call.target.right, uni.Name):
-                    method_name = call.target.right.value
-                    # Check if it's a logging method
-                    for pattern in logging_patterns:
-                        if pattern in method_name.lower():
-                            return True, f"calls .{method_name}() (logging operation)"
+            # Check if it's a builtin side-effecting function
+            # Verify it's not user-redefined by checking symbol table
+            if func_name in self._SIDE_EFFECT_CALLS:
+                if hasattr(node, "sym_tab") and node.sym_tab:
+                    symbol = node.sym_tab.lookup(name=func_name, deep=True)
+                    if symbol and symbol.defn:
+                        # User has redefined this name, skip it
+                        return False, ""
+                return True, f"calls {func_name}() (I/O operation)"
 
-                    # Check target for logging modules
-                    if isinstance(call.target.target, uni.Name):
-                        target_name = call.target.target.value
-                        for pattern in logging_patterns:
-                            if pattern in target_name.lower():
-                                return (
-                                    True,
-                                    f"calls {target_name}.{method_name}() (logging operation)",
-                                )
+            # Check for logging patterns
+            for pattern in self._LOGGING_PATTERNS:
+                if pattern in func_name.lower():
+                    return True, f"calls {func_name}() (logging operation)"
+
+        elif isinstance(node.target, uni.AtomTrailer):
+            # Handle method calls like logger.info(), logging.debug()
+            parts = []
+            current = node.target
+
+            while isinstance(current, uni.AtomTrailer):
+                if hasattr(current, "right") and isinstance(current.right, uni.Name):
+                    parts.append(current.right.value)
+                current = current.target
+                if isinstance(current, uni.Name):
+                    parts.append(current.value)
+                    break
+
+            # Check if any part matches logging patterns
+            for part in parts:
+                for pattern in self._LOGGING_PATTERNS:
+                    if pattern in part.lower():
+                        return True, f"calls {'.'.join(reversed(parts))}() (logging operation)"
 
         return False, ""
 
@@ -384,6 +373,16 @@ class BreakFinder(CFGTracer):
             if stmt_id not in self.analyzed_stmts:
                 self.analyzed_stmts.add(stmt_id)
                 self.side_effect_stmts.append(stmt)
+                
+                # Mark the specific function call node with side effect flag
+                func_calls = stmt.get_all_sub_nodes(uni.FuncCall)
+                for call in func_calls:
+                    is_se, _ = self._is_side_effect_call(call)
+                    if is_se:
+                        call.has_break_se = True  # type: ignore
+                        call.side_effect_reason = se_reason  # type: ignore
+                
+                # Also mark the statement itself
                 stmt.has_break_se = True  # type: ignore
                 stmt.side_effect_reason = se_reason  # type: ignore
                 # print(

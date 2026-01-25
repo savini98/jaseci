@@ -13,12 +13,6 @@ from jaclang.pycore.passes.uni_pass import UniPass
 class FixSEBreaksPass(UniPass):
     """Fix Side Effect Breaks Pass - buffers side-effecting operations for deferred execution."""
 
-    # List of function names that cause side effects and should be hoisted
-    _SIDE_EFFECT_CALLS = {"print", "input"}
-
-    # Logging patterns that should be hoisted
-    _LOGGING_PATTERNS = ["log", "logger", "logging", "warn", "error", "info", "debug"]
-
     def before_pass(self) -> None:
         """Initialize pass state."""
         self.needs_se_buffer = False
@@ -37,47 +31,6 @@ class FixSEBreaksPass(UniPass):
             pos_start=0,
             pos_end=0,
         )
-
-    def _is_side_effect_call(self, node: uni.FuncCall) -> bool:
-        """Check if a function call has side effects and should be buffered."""
-        if isinstance(node.target, uni.Name):
-            func_name = node.target.value
-
-            # Check if it's a builtin side-effecting function
-            # Verify it's not user-redefined by checking symbol table
-            if func_name in self._SIDE_EFFECT_CALLS:
-                if hasattr(node, "sym_tab") and node.sym_tab:
-                    symbol = node.sym_tab.lookup(name=func_name, deep=True)
-                    if symbol and symbol.defn:
-                        # User has redefined this name, skip it
-                        return False
-                return True
-
-            # Check for logging patterns
-            for pattern in self._LOGGING_PATTERNS:
-                if pattern in func_name.lower():
-                    return True
-
-        elif isinstance(node.target, uni.AtomTrailer):
-            # Handle method calls like logger.info(), logging.debug()
-            parts = []
-            current = node.target
-
-            while isinstance(current, uni.AtomTrailer):
-                if hasattr(current, "right") and isinstance(current.right, uni.Name):
-                    parts.append(current.right.value)
-                current = current.target
-                if isinstance(current, uni.Name):
-                    parts.append(current.value)
-                    break
-
-            # Check if any part matches logging patterns
-            for part in parts:
-                for pattern in self._LOGGING_PATTERNS:
-                    if pattern in part.lower():
-                        return True
-
-        return False
 
     def _replace_side_effect_call(self, node: uni.FuncCall) -> uni.FuncCall:
         """Replace side-effect call with a call to append to the buffer."""
@@ -133,28 +86,27 @@ class FixSEBreaksPass(UniPass):
         )
 
     def exit_func_call(self, node: uni.FuncCall) -> None:
-        """Exit function call - mark ability if it contains side effects."""
+        """Exit function call - replace if marked with side effect break by CatchBreaksPass."""
         # Only process if marked as side effect break by CatchBreaksPass
-        if not getattr(node.parent, "has_break_se", False):
+        if not getattr(node, "has_break_se", False):
             return
 
-        if self._is_side_effect_call(node):
-            # Find the containing ability
-            ability_node = node.find_parent_of_type(uni.Ability)
-            if ability_node is not None:
-                # Mark this ability as needing side effect buffering
-                ability_node.needs_se_buffer = True  # type: ignore[attr-defined]
+        # Find the containing ability
+        ability_node = node.find_parent_of_type(uni.Ability)
+        if ability_node is not None:
+            # Mark this ability as needing side effect buffering
+            ability_node.needs_se_buffer = True  # type: ignore[attr-defined]
 
-            # Replace the call with buffer append
-            new_call = self._replace_side_effect_call(node)
+        # Replace the call with buffer append
+        new_call = self._replace_side_effect_call(node)
 
-            # Update parent references
-            if isinstance(node.parent, uni.ExprStmt):
-                node.parent.expr = new_call
-                new_call.parent = node.parent
-                if hasattr(node.parent, "kid") and node in node.parent.kid:
-                    idx = node.parent.kid.index(node)
-                    node.parent.kid[idx] = new_call
+        # Update parent references
+        if isinstance(node.parent, uni.ExprStmt):
+            node.parent.expr = new_call
+            new_call.parent = node.parent
+            if hasattr(node.parent, "kid") and node in node.parent.kid:
+                idx = node.parent.kid.index(node)
+                node.parent.kid[idx] = new_call
 
     def exit_ability(self, node: uni.Ability) -> None:
         """Exit ability - wrap if it needs side effect buffering."""
