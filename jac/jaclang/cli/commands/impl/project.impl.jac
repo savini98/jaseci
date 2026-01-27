@@ -6,6 +6,7 @@ Direct implementations - no delegation.
 import subprocess;
 import shlex;
 import sys;
+import base64;
 import from pathlib { Path }
 
 """Initialize a new Jac project."""
@@ -93,12 +94,22 @@ impl create(
     console.print(f"  ✔ jac.toml", style="success");
     # Generate files from template
     for (file_path, content) in tmpl.files.items() {
-        rendered = content.replace("{{name}}", project_name);
         full_path = project_path / file_path;
         full_path.parent.mkdir(parents=True, exist_ok=True);
         if not full_path.exists() or force {
-            with open(full_path, "w") as f {
-                f.write(rendered);
+            # Check if content is base64-encoded binary (prefixed with "base64:")
+            if content.startswith("base64:") {
+                # Decode binary content and write as bytes
+                binary_data = base64.b64decode(content[7:]);
+                with open(full_path, "wb") as f {
+                    f.write(binary_data);
+                }
+            } else {
+                # Text file - apply template substitution and write as text
+                rendered = content.replace("{{name}}", project_name);
+                with open(full_path, "w") as f {
+                    f.write(rendered);
+                }
             }
             console.print(f"  ✔ {file_path}", style="success");
         }
@@ -135,7 +146,7 @@ impl create(
         steps.append(f"cd {name}");
     }
     steps.append("jac install         Install dependencies");
-    steps.append("jac run main.jac    Start development");
+    steps.append("jac start main.jac    Start development");
     console.print_next_steps(steps);
     console.print("\n🚀 Happy coding!\n", style="bold green");
     return 0;
@@ -520,7 +531,7 @@ impl script(name: str = '', list_scripts: bool = False) -> int {
                 style="muted"
             );
             console.print('  [scripts]', style="muted");
-            console.print('  dev = "jac run main.jac"', style="muted");
+            console.print('  dev = "jac start main.jac"', style="muted");
             console.print('  test = "jac test"', style="muted");
             return 0;
         }

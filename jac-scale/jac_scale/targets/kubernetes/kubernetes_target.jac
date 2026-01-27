@@ -174,10 +174,7 @@ class KubernetesTarget(DeploymentTarget) {
         return service;
     }
 
-    """Build the bash command for setting up Jaseci runtime environment.
-
-    This replaces the hard-coded command with a configurable version.
-    """
+    """Build the bash command for setting up Jaseci runtime environment."""
     def _build_runtime_setup_command(
         self: KubernetesTarget, app_config: AppConfig
     ) -> list[str] {
@@ -188,36 +185,61 @@ class KubernetesTarget(DeploymentTarget) {
         commands.append('export DEBIAN_FRONTEND=noninteractive');
         commands.append('apt-get update');
 
-        # Install base packages
-        base_packages = ['git', 'npm', 'nodejs'];
+        # Install base packages (curl and unzip needed for Bun installation)
+        base_packages = ['git', 'curl', 'unzip'];
         if config.additional_packages {
             base_packages.extend(config.additional_packages);
         }
         commands.append(f"apt-get install -y {' '.join(base_packages)}");
 
-        # Clone and setup Jaseci if enabled
-        if config.install_jaseci {
+        # Install Bun (required for jac-client frontend builds)
+        commands.append('curl -fsSL https://bun.sh/install | bash');
+        commands.append('export BUN_INSTALL="$HOME/.bun"');
+        commands.append('export PATH="$BUN_INSTALL/bin:$PATH"');
+
+        if app_config.experimental {
             commands.append('rm -rf jaseci');
-            # Clone repository
             clone_cmd = f"git clone --branch {config.jaseci_branch} --single-branch {config.jaseci_repo_url}";
             commands.append(clone_cmd);
             commands.append('cd ./jaseci');
-            # Checkout specific commit if provided
             if config.jaseci_commit {
                 commands.append(f"git checkout {config.jaseci_commit}");
             }
-            # Update submodules
             commands.append('git submodule update --init --recursive');
-            # Setup virtual environment
-            commands.append('python -m venv venv');
-            commands.append('source venv/bin/activate');
-            # Install Jaseci components
             commands.append('pip install pluggy');
             commands.append('pip install -e ./jac');
             commands.append('pip install -e ./jac-scale');
             commands.append('pip install -e ./jac-client');
             commands.append('pip install -e ./jac-byllm');
             commands.append('cd ..');
+        } else {
+            packages = config.plugin_versions or {};
+            jaclang_v = packages.get('jaclang', 'latest');
+            scale_v = packages.get('jac_scale', 'latest');
+            client_v = packages.get('jac_client', 'latest');
+            byllm_v = packages.get('jac_byllm', 'latest');
+            if jaclang_v == 'latest' {
+                commands.append('pip install jaclang');
+            } else {
+                commands.append(f'pip install jaclang=={jaclang_v}');
+            }
+            if scale_v == 'latest' {
+                commands.append('pip install jac-scale');
+            } else {
+                commands.append(f'pip install jac-scale=={scale_v}');
+            }
+            if client_v == 'latest' {
+                commands.append('pip install jac-client');
+            } else {
+                commands.append(f'pip install jac-client=={client_v}');
+            }
+            if byllm_v and byllm_v != 'none' {
+                if byllm_v == 'latest' {
+                    commands.append('pip install byllm');
+                } else {
+                    commands.append(f'pip install byllm=={byllm_v}');
+                }
+            }
         }
 
         # Change to app directory (project is already copied there via volume mount)
@@ -602,12 +624,6 @@ class KubernetesTarget(DeploymentTarget) {
         delete_if_exists(
             apps_v1.delete_namespaced_deployment, app_name, namespace, 'Deployment'
         );
-        delete_if_exists(
-            core_v1.delete_namespaced_service,
-            f"{app_name}-service",
-            namespace,
-            'Service'
-        );
         time.sleep(self.k8s_config.resource_deletion_wait);
 
         # 13. Deploy databases
@@ -618,7 +634,17 @@ class KubernetesTarget(DeploymentTarget) {
             self.logger.info(f'Deploying Jaseci-app app...');
         }
         apps_v1.create_namespaced_deployment(namespace=namespace, body=deployment);
-        core_v1.create_namespaced_service(namespace=namespace, body=service);
+        try {
+            core_v1.read_namespaced_service(
+                name=f"{app_name}-service", namespace=namespace
+            );
+        } except ApiException as e {
+            if (e.status == 404) {
+                core_v1.create_namespaced_service(namespace=namespace, body=service);
+            } else {
+                raise ;
+            }
+        }
 
         # 15. Wait for deployment and get service URL
         self._wait_for_deployment(app_name, namespace, health_check_path, is_aws);
