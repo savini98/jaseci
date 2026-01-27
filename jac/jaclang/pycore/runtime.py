@@ -1265,8 +1265,20 @@ class JacBasics:
                 # Register in JacRuntime
                 JacRuntimeInterface.load_module("__main__", module)
 
-                # Execute the module
-                if spec.loader:
+                # Execute the module - use Jac compiler for .py files to apply
+                if spec.origin and spec.origin.endswith(".py"):
+                    # Route .py files through Jac's compiler pipeline
+                    codeobj = JacRuntime.get_compiler().get_bytecode(
+                        full_target=spec.origin,
+                        target_program=JacRuntime.get_program(),
+                    )
+                    if codeobj:
+                        exec(codeobj, module.__dict__)
+                    else:
+                        # Fallback to standard loader if compilation fails
+                        if spec.loader:
+                            spec.loader.exec_module(module)
+                elif spec.loader:
                     spec.loader.exec_module(module)
             elif reload_module and module_name in sys.modules:
                 # Handle reload case
