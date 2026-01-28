@@ -2062,7 +2062,7 @@ impl PyastBuildPass.proc_attribute(<>node: py_ast.Attribute) -> uni.AtomTrailer 
     }
     attribute = uni.Name(
         orig_src=self.orig_src,
-        name=Tok.NAME,
+        name=Tok.KW_INIT if (<>node.attr == '__init__') else Tok.NAME,
         value='init' if (<>node.attr == '__init__') else <>node.attr,
         line=<>node.lineno,
         end_line=<>node.end_lineno or <>node.lineno,

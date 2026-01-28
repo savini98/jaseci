@@ -2785,10 +2785,11 @@ class PyastGenPass(BaseAstGenPass[ast3.AST]):
                 attr_name = node.right.sym_name
                 # Restore dunder names when target is super()
                 # Jac converts __init__ to init, but super() needs __init__
+                # Only convert when node.right.name == KW_INIT (indicates original was __init__)
                 if (
                     isinstance(node.target, uni.SpecialVarRef)
                     and node.target.name == Tok.KW_SUPER
-                    and attr_name == "init"
+                    and node.right.name == Tok.KW_INIT
                 ):
                     attr_name = "__init__"
                 node.gen.py_ast = [
