@@ -329,3 +329,51 @@ def test_validate_tree_parent_micro_suite(micro_jac_file: str) -> None:
     assert parent_scrub(code_gen)
     code_gen = JacProgram().compile(micro_jac_file)
     assert parent_scrub(code_gen)
+
+
+def test_super_init_py_to_jac_roundtrip(fixture_path: Callable[[str], str]) -> None:
+    """Test that super().__init__() works when Python code goes through Jac pipeline.
+
+    This test verifies two things:
+    1. Python imports work correctly through Jac's compilation pipeline (runtime.py fix)
+    2. super().__init__() calls work correctly (pyast_gen_pass.py fix)
+    """
+    import os
+
+    # Compile Python file through Jac's pipeline (Python AST -> Jac IR -> Python AST)
+    code_gen = (prog := JacProgram()).compile(fixture_path("super_init.py"))
+    assert not prog.errors_had, f"Compilation errors: {prog.errors_had}"
+
+    if code_gen.gen.py_ast and isinstance(code_gen.gen.py_ast[0], ast3.Module):
+        compiled = compile(code_gen.gen.py_ast[0], filename="<ast>", mode="exec")
+        captured = io.StringIO()
+        original_stdout = sys.stdout
+
+        # Add fixture directory to sys.path for import resolution
+        fixture_dir = os.path.dirname(fixture_path("super_init.py"))
+        sys.path.insert(0, fixture_dir)
+        try:
+            sys.stdout = captured
+            module = types.ModuleType("__main__")
+            module.__dict__["__file__"] = code_gen.loc.mod_path
+            exec(compiled, module.__dict__)
+        finally:
+            sys.stdout = original_stdout
+            sys.path.remove(fixture_dir)
+
+        output = captured.getvalue()
+        # Verify super().__init__() calls work correctly in inheritance chain
+        assert "Base init" in output, f"Expected 'Base init' in output, got: {output}"
+        assert "Child init" in output, f"Expected 'Child init' in output, got: {output}"
+        assert "GrandChild init" in output, (
+            f"Expected 'GrandChild init' in output, got: {output}"
+        )
+        # Verify the order of initialization (base classes init before derived)
+        lines = output.strip().split("\n")
+        assert lines == [
+            "Base init",
+            "Child init",
+            "Base init",
+            "Child init",
+            "GrandChild init",
+        ], f"Unexpected initialization order: {lines}"

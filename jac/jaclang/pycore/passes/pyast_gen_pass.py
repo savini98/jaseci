@@ -2782,11 +2782,20 @@ class PyastGenPass(BaseAstGenPass[ast3.AST]):
             node.gen.py_ast = []
         if node.is_attr:
             if isinstance(node.right, uni.AstSymbolNode):
+                attr_name = node.right.sym_name
+                # Restore dunder names when target is super()
+                # Jac converts __init__ to init, but super() needs __init__
+                if (
+                    isinstance(node.target, uni.SpecialVarRef)
+                    and node.target.name == Tok.KW_SUPER
+                    and attr_name == "init"
+                ):
+                    attr_name = "__init__"
                 node.gen.py_ast = [
                     self.sync(
                         ast3.Attribute(
                             value=cast(ast3.expr, node.target.gen.py_ast[0]),
-                            attr=node.right.sym_name,
+                            attr=attr_name,
                             ctx=cast(ast3.expr_context, node.right.py_ctx_func()),
                         )
                     )
