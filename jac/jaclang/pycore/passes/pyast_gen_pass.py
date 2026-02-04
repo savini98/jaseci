@@ -2646,7 +2646,7 @@ class PyastGenPass(BaseAstGenPass[ast3.AST]):
                     conversion=node.conversion,
                     format_spec=(
                         cast(ast3.expr, node.format_spec.gen.py_ast[0])
-                        if node.format_spec and node.format_spec.gen.py_ast
+                        if node.format_spec
                         else None
                     ),
                 )
