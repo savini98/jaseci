@@ -2789,6 +2789,7 @@ class PyastGenPass(BaseAstGenPass[ast3.AST]):
                 if (
                     isinstance(node.target, uni.SpecialVarRef)
                     and node.target.name == Tok.KW_SUPER
+                    and isinstance(node.right, uni.Name)
                     and node.right.name == Tok.KW_INIT
                 ):
                     attr_name = "__init__"
