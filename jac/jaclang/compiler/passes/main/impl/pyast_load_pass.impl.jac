@@ -1596,7 +1596,7 @@ impl PyastBuildPass.proc_formatted_value(
             format_part=value,
             conversion=<>node.conversion,
             format_spec=fmt_spec,
-            kid=[value]
+            kid=[value, fmt_spec] if fmt_spec else [value]
         );
     } else {
         raise self.ice() ;
