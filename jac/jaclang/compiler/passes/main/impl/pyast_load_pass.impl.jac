@@ -2659,11 +2659,16 @@ impl PyastBuildPass.proc_class_def(
         raise self.ice('Length mismatch in decorators on class') ;
     }
     valid_decorators = decorators or None;
-    kid = [name, *base_classes, *valid_body, doc]
-    if (doc and base_classes)
-    else [name, *base_classes, *valid_body]
-    if base_classes
-    else [name, *valid_body, doc] if doc else [name, *valid_body];
+    kid: list = [];
+    if valid_decorators {
+        kid.extend(valid_decorators);
+    }
+    kid.append(name);
+    kid.extend(base_classes);
+    kid.extend(valid_body);
+    if doc {
+        kid.append(doc);
+    }
     return uni.Archetype(
         arch_type=arch_type,
         name=name,
