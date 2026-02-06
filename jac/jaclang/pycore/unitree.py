@@ -5496,6 +5496,9 @@ class String(Literal):
 
     def unparse(self) -> str:
         super().unparse()
+        if self.parent and isinstance(self.parent, FormattedValue):
+            # When String is a format_spec in FormattedValue, return raw value
+            return self.value
         if self.parent and isinstance(self.parent, FString):
             # Escape special chars in f-string literal parts:
             # { -> {{ and } -> }} (f-string interpolation delimiters)

@@ -1587,10 +1587,44 @@ impl PyastBuildPass.proc_formatted_value(
     prev_in_fstring = self.in_fstring_expr;
     self.in_fstring_expr = True;
     value = self.convert(<>node.value);
-    fmt_spec = cast(uni.Expr, self.convert(<>node.format_spec))
-    if <>node.format_spec
-    else None;
     self.in_fstring_expr = prev_in_fstring;
+    # Handle format_spec specially - it should be a plain string, not an f-string
+    fmt_spec = None;
+    if <>node.format_spec {
+        if isinstance(<>node.format_spec, py_ast.JoinedStr) {
+            # format_spec is a JoinedStr, extract the string content
+            fmt_parts: list[str] = [];
+            for part in <>node.format_spec.values {
+                if isinstance(part, py_ast.Constant) and isinstance(part.value, str) {
+                    fmt_parts.append(part.value);
+                } elif isinstance(part, py_ast.FormattedValue) {
+                    nested_fmt = self.convert(part);
+                    if isinstance(nested_fmt, uni.FormattedValue) {
+                        fmt_spec = nested_fmt;
+                        break;
+                    }
+                }
+            }
+            if not fmt_spec and fmt_parts {
+                # Create a plain String node for the format spec
+                fmt_str = ''.join(fmt_parts);
+                fmt_spec = uni.String(
+                    orig_src=self.orig_src,
+                    name='STRING',
+                    value=fmt_str,
+                    line=<>node.format_spec.lineno,
+                    end_line=<>node.format_spec.end_lineno or <>node.format_spec.lineno,
+                    col_start=<>node.format_spec.col_offset,
+                    col_end=<>node.format_spec.end_col_offset
+                    or <>node.format_spec.col_offset,
+                    pos_start=0,
+                    pos_end=0
+                );
+            }
+        } else {
+            fmt_spec = cast(uni.Expr, self.convert(<>node.format_spec));
+        }
+    }
     if isinstance(value, uni.Expr) {
         ret = uni.FormattedValue(
             format_part=value,
