@@ -4,6 +4,8 @@ This document provides a summary of new features, improvements, and bug fixes in
 
 ## jaclang 0.10.5 (Unreleased)
 
+- **Fix: `sv import` of `def:pub` Functions Generates RPC Stubs**: Fixed `sv import from module { func }` in `.cl.jac` files not generating for `def:pub` server functions.
+
 ## jaclang 0.10.4 (Latest Release)
 
 - **`jac check/lint --ignore` Multi-Arg & Wildcard Support**: Enhanced `--ignore` flag to accept multiple space-separated patterns (`--ignore dir1 dir2 dir3`) instead of comma-separated strings. Added wildcard support using glob patterns (e.g., `--ignore "jac-*" test`) for flexible directory matching.

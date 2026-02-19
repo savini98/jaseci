@@ -1634,6 +1634,15 @@ impl app.fetchTasks -> None {
 
 The `.cl.jac` file focuses on what the component *looks like* and what state it has. The `.impl.jac` file focuses on what the methods *do*. It's optional -- you could keep everything in one file -- but it keeps things readable as the app grows.
 
+**`sv import`** brings server functions into client code. When a `.cl.jac` file calls `def:pub` functions defined in a server module, it needs `sv import` so the compiler generates HTTP stubs instead of raw function calls:
+
+```jac
+sv import from main {
+    get_tasks, add_task, toggle_task, delete_task,
+    generate_list, get_shopping_list, clear_shopping_list
+}
+```
+
 **`cl { }` blocks** let you embed client-side code in a server file. This is useful for the entry point:
 
 ```jac
@@ -1843,6 +1852,11 @@ All the complete files are in the collapsible sections below. Create each file, 
     """AI Day Planner -- Client-Side UI."""
 
     import from "@jac/runtime" { jacSignup, jacLogin, jacLogout, jacIsLoggedIn }
+
+    sv import from main {
+        get_tasks, add_task, toggle_task, delete_task,
+        generate_list, get_shopping_list, clear_shopping_list
+    }
 
     import "./styles.css";
 
