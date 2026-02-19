@@ -902,16 +902,30 @@ impl Lexer.scan_jsx_content -> Token {
         self.push_mode(LexerMode.NORMAL);  # Parse expression in normal mode
         return self.make_token(TokenKind.LBRACE, "{", start_line, start_col, start_pos);
     }
-    # Text content - collect until we hit <, {, or end
+    # Text content - collect until we hit a meaningful JSX delimiter or end.
+    # Only break on `<` when it starts a valid JSX construct (tag, closing
+    # tag, or fragment).  A bare `<` (e.g. `<--`) is consumed as text,
+    # matching TSX behaviour where bare `<` in content is invalid and must
+    # be written as `{"<"}`.
     value = "";
     while not self.at_end() {
         ch = self.current();
-        if ch == "<" or ch == "{" {
+        if ch == "{" {
             break;
+        }
+        if ch == "<" {
+            nxt = self.peek();
+            # Only break when `<` begins a real JSX token:
+            #   </  (closing tag / fragment close)
+            #   <>  (fragment open)
+            #   <A  (nested element — alpha means tag name)
+            if nxt == "/" or nxt == ">" or self.is_alpha(nxt) {
+                break;
+            }
         }
         # Note: # is NOT treated as a comment inside JSX children.
         # JSX text content is like HTML — # is a regular text character.
-        # Use {/* ... */} style in JSX expressions for comments if needed.
+        # Use {#* ... *#} style in JSX expressions for comments if needed.
         value += self.advance();
     }
     if len(value) > 0 {
