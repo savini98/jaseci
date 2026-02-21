@@ -499,11 +499,8 @@ That single function is now:
 
 - A server-side function you can call from Jac code
 - An HTTP endpoint that clients can call over the network
-- Auto-documented with the docstring
 
 No route configuration, no controllers, no request parsing. The function **is** the API.
-
-**Docstrings** in Jac come *before* the declaration (unlike Python where they go inside the function body). They're enclosed in triple quotes `"""..."""`.
 
 **Building the CRUD Endpoints**
 
@@ -611,7 +608,6 @@ You can also visit [http://localhost:8000/graph](http://localhost:8000/graph) to
 
 - **`def:pub`** -- functions that auto-become HTTP endpoints
 - **`import from module { name }`** -- import Python (or any) packages
-- **`"""..."""`** -- docstrings (placed before the declaration)
 - **List comprehensions** -- `[expr for x in list]` and `[expr for x in list if cond]`
 - **Dictionaries** -- `{"key": value}` for structured data
 - **`jac start`** -- run the web server
@@ -1076,8 +1072,8 @@ This enum constrains the AI to return *exactly one* of these values. Without it,
 Here's the key feature:
 
 ```jac
-"""Categorize a task based on its title."""
 def categorize(title: str) -> Category by llm();
+sem categorize = "Categorize a task based on its title";
 ```
 
 That's the **entire function**. There's no body -- `by llm()` tells Jac to have the LLM generate the return value. The compiler extracts meaning from:
@@ -1085,9 +1081,12 @@ That's the **entire function**. There's no body -- `by llm()` tells Jac to have 
 - The **function name** -- `categorize` tells the LLM what to do
 - The **parameter names and types** -- `title: str` is what the LLM receives
 - The **return type** -- `Category` constrains output to one of the enum values
-- The **docstring** -- additional context for the LLM
+- The **`sem` hint** -- additional context for the LLM
 
-The function name, parameter names, types, and docstring **are the specification**. The LLM fulfills it.
+The function name, parameter names, types, and `sem` hint **are the specification**. The LLM fulfills it.
+
+!!! info "`sem` vs docstrings"
+    Use **`sem`** to provide semantic context for any declaration that the LLM needs to understand. While docstrings describe code for humans (and auto-generate API docs), `sem` is specifically designed to guide the LLM compiler. Always prefer `sem` for `by llm()` functions and their parameters.
 
 **Wire It Into the Task Flow**
 
@@ -1176,8 +1175,8 @@ Without `sem`, `cost: float` is ambiguous (cost in what currency? per unit or to
 Now the AI function:
 
 ```jac
-"""Generate a shopping list of ingredients needed for a described meal."""
 def generate_shopping_list(meal_description: str) -> list[Ingredient] by llm();
+sem generate_shopping_list = "Generate a shopping list of ingredients needed for a described meal";
 ```
 
 The LLM returns a `list[Ingredient]` -- a list of typed objects, each with name, quantity, unit, cost, and carb flag. Jac validates the structure automatically.
@@ -1471,11 +1470,11 @@ h2 { margin: 0 0 16px 0; font-size: 1.2rem; color: #444; }
     sem Ingredient.cost = "Estimated cost in USD";
     sem Ingredient.carby = "True if this ingredient is high in carbohydrates";
 
-    """Categorize a task based on its title."""
     def categorize(title: str) -> Category by llm();
+    sem categorize = "Categorize a task based on its title";
 
-    """Generate a shopping list of ingredients needed for a described meal."""
     def generate_shopping_list(meal_description: str) -> list[Ingredient] by llm();
+    sem generate_shopping_list = "Generate a shopping list of ingredients needed for a described meal";
 
     # --- Data Nodes ---
 
@@ -1927,11 +1926,11 @@ All the complete files are in the collapsible sections below. Create each file, 
     sem Ingredient.cost = "Estimated cost in USD";
     sem Ingredient.carby = "True if this ingredient is high in carbohydrates";
 
-    """Categorize a task based on its title."""
     def categorize(title: str) -> Category by llm();
+    sem categorize = "Categorize a task based on its title";
 
-    """Generate a shopping list of ingredients needed for a described meal."""
     def generate_shopping_list(meal_description: str) -> list[Ingredient] by llm();
+    sem generate_shopping_list = "Generate a shopping list of ingredients needed for a described meal";
 
     # --- Data Nodes ---
 
@@ -2913,11 +2912,11 @@ All the complete files are in the collapsible sections below. Create each file, 
     sem Ingredient.cost = "Estimated cost in USD";
     sem Ingredient.carby = "True if this ingredient is high in carbohydrates";
 
-    """Categorize a task based on its title."""
     def categorize(title: str) -> Category by llm();
+    sem categorize = "Categorize a task based on its title";
 
-    """Generate a shopping list of ingredients needed for a described meal."""
     def generate_shopping_list(meal_description: str) -> list[Ingredient] by llm();
+    sem generate_shopping_list = "Generate a shopping list of ingredients needed for a described meal";
 
     # --- Data Nodes ---
 
@@ -3600,7 +3599,7 @@ Here's a quick reference of every Jac concept covered in this tutorial:
 
 **Graph:** `root`, `++>` (create + connect), `+>: Edge :+>` (typed edge), `[root-->]` (query), `(?:Type)` (filter), `del` (delete)
 
-**Functions:** `def`, `def:pub`, `def:priv`, `by llm()`, `lambda`, `async`/`await`, docstrings
+**Functions:** `def`, `def:pub`, `def:priv`, `by llm()`, `lambda`, `async`/`await`
 
 **Walkers:** `walker`, `walker:priv`, `can with Type entry/exit`, `visit`, `here`, `self`, `visitor`, `report`, `disengage`, `spawn`
 
