@@ -4,6 +4,7 @@ This document provides a summary of new features, improvements, and bug fixes in
 
 ## jac-client 0.2.20 (Unreleased)
 
+- **HMR Server-Side Reloading Refactor**: Improved HMR functionality with better handling of `.impl.jac` files and optimized caching to avoid unnecessary recompilations during development
 - 3 minor refactor/change.
 
 ## jac-client 0.2.19 (Latest Release)
