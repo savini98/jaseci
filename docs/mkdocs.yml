@@ -62,19 +62,11 @@ nav:
           - Appendices: "reference/language/appendices.md"
           - Walker Responses: "reference/language/walker-responses.md"
           - Graph Operations: "reference/language/graph-operations.md"
-      - Examples:
-          - Overview: "tutorials/examples/index.md"
-          - LittleX (Twitter Clone): "tutorials/examples/littlex.md"
-          - EmailBuddy (AI Assistant): "tutorials/examples/emailbuddy.md"
-          - RAG Chatbot: "tutorials/examples/rag-chatbot.md"
-          - RPG Level Generator: "tutorials/examples/rpg.md"
-      - Troubleshooting: "tutorials/troubleshooting.md"
 
   - Community:
       - Contributing: "community/contributing.md"
       - Breaking Changes: "community/breaking-changes.md"
-      - Contributors: "community/contributors.md"
-      - Top Voices: "community/top_voices.md"
+      - PR Leaderboard: "community/contributors.md"
       - Release Notes:
           - Jaclang: "community/release_notes/jaclang.md"
           - byLLM: "community/release_notes/byllm.md"
