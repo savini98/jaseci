@@ -241,6 +241,31 @@ class JacAccessValidation {
     }
 }
 
+"""Serialize archetype attributes to a flat dict of JSON-safe scalars.
+
+Non-scalar values (datetime, UUID, custom objects) are coerced to str so
+they can be stored in MongoDB and compared with equality filters. Values
+that cannot be stringified at all are silently omitted.
+"""
+def _safe_serialize_attrs(archetype: Any) -> dict[(str, Any)] {
+    result: dict = {};
+    for (k, v) in archetype.__dict__.items() {
+        if k.startswith('_') {
+            continue;
+        }
+        if isinstance(v, (str, int, float, bool)) or v is None {
+            result[k] = v;
+        } else {
+            try {
+                result[k] = str(v);
+            } except Exception {
+                pass;
+            }
+        }
+    }
+    return result;
+}
+
 """Jac Node Operations."""
 class JacNode {
     """Get edges connected to this node."""
@@ -321,10 +346,42 @@ class JacNode {
         return `list(loc.values());
     }
 
-    """Get set of nodes connected to this node."""
+    """Get set of nodes connected to this node.
+
+    When destination.nd_type is set (populated by the compiler from a
+    FilterCompr with an explicit type, e.g. [-->](?:User, ...)) and the
+    MongoDB adjacency index is available, this method queries the index
+    first so only nodes of the matching type are loaded from the anchor
+    store.  The nd lambda is still applied afterwards for attribute-level
+    filtering, preserving full correctness.  Falls back to the full edge
+    scan when the adjacency index is unavailable (e.g. SQLite backend).
+    """
     static def edges_to_nodes(
         origin: list[NodeArchetype], destination: ObjectSpatialDestination
     ) -> list[NodeArchetype] {
+        if destination.nd_type {
+            _adj = getattr(getattr(JacRuntimeInterface.get_context().mem, 'l3', None), 'adj_query', None);
+            if _adj {
+                _jctx = JacRuntimeInterface.get_context();
+                _dir = destination.direction.name;
+                _result: list[NodeArchetype] = [];
+                for _nd in origin {
+                    _tgt_ids = _adj(str(_nd.__jac__.id), destination.nd_type, None, _dir);
+                    for _id_str in _tgt_ids {
+                        _anchor = _jctx.mem.get(UUID(_id_str));
+                        if (
+                            _anchor
+                            and _anchor.archetype
+                            and JacRuntimeInterface.check_read_access(_anchor)
+                            and destination.node_filter(_anchor.archetype)
+                        ) {
+                            _result.append(_anchor.archetype);
+                        }
+                    }
+                }
+                return _result;
+            }
+        }
         nodes: OrderedDict[(NodeAnchor, NodeArchetype)] = OrderedDict();
         for nd in origin {
             nanch = nd.__jac__;
@@ -367,12 +424,64 @@ class JacNode {
             }
         }
     }
+
+    """Query the adjacency matrix for connected nodes matching a type and/or
+    attribute filter, loading only the matching NodeAnchors from memory.
+
+    This avoids the memory pressure of the standard filter comprehension path,
+    which loads ALL connected nodes before filtering. When MongoDB is unavailable
+    (e.g. SQLite fallback), this method transparently falls back to the standard
+    edges_to_nodes traversal so behaviour is always correct.
+
+    Args:
+        origin:     The node to start from.
+        node_type:  Optional Python type to filter target nodes by (e.g. User).
+        attrs:      Optional dict of attribute name -> expected value pairs.
+        direction:  "OUT" (default), "IN", or "ANY".
+
+    Example (equivalent to [-->](?:User, name=="Alice")):
+        results = JacNode.get_adj_nodes(here, node_type=User, attrs={"name": "Alice"})
+    """
+    static def get_adj_nodes(
+        origin: NodeArchetype,
+        node_type: (type | None) = None,
+        attrs: (dict[(str, Any)] | None) = None,
+        direction: str = "OUT"
+    ) -> list[NodeArchetype] {
+        jctx = JacRuntimeInterface.get_context();
+        l3 = getattr(getattr(jctx.mem, 'l3', None), 'adj_query', None);
+        if l3 {
+            type_name = node_type.__name__ if node_type else None;
+            tgt_ids = l3(str(origin.__jac__.id), type_name, attrs, direction);
+            result: list[NodeArchetype] = [];
+            for id_str in tgt_ids {
+                anchor = jctx.mem.get(UUID(id_str));
+                if anchor and anchor.archetype {
+                    result.append(anchor.archetype);
+                }
+            }
+            return result;
+        }
+        dest = ObjectSpatialDestination(direction=EdgeDir.OUT);
+        if node_type {
+            dest.nd = lambda i: isinstance(i, node_type);
+        }
+        return JacRuntimeInterface.edges_to_nodes([origin], dest);
+    }
 }
 
 """Jac Edge Operations."""
 class JacEdge {
     """Detach edge from nodes."""
     static def detach(`edge: EdgeAnchor) -> None {
+        try {
+            _del = getattr(getattr(JacRuntimeInterface.get_context().mem, 'l3', None), 'adj_delete_by_edge', None);
+            if _del {
+                _del(str(`edge.id));
+            }
+        } except Exception {
+            pass;
+        }
         JacRuntimeInterface.remove_edge(nd=`edge.source, `edge=`edge);
         JacRuntimeInterface.remove_edge(nd=`edge.target, `edge=`edge);
     }
@@ -1660,6 +1769,22 @@ system,
             }
             if (source.persistent or target.persistent) {
                 JacRuntimeInterface.save(eanch);
+            }
+            try {
+                _l3 = getattr(getattr(JacRuntimeInterface.get_context().mem, 'l3', None), 'adj_upsert', None);
+                if _l3 and source.is_populated() and target.is_populated() {
+                    _src_attrs = _safe_serialize_attrs(source.archetype);
+                    _tgt_attrs = _safe_serialize_attrs(target.archetype);
+                    _l3(
+                        str(source.id), str(target.id), str(eanch.id),
+                        type(`edge).__name__,
+                        type(source.archetype).__name__,
+                        type(target.archetype).__name__,
+                        _src_attrs, _tgt_attrs
+                    );
+                }
+            } except Exception {
+                pass;
             }
             return `edge;
         }

@@ -11,6 +11,31 @@ import from jaclang.runtimelib.utils { storage_key, to_uuid }
 
 glob logger = logging.getLogger(__name__);
 
+"""Serialize archetype attributes to a flat dict of JSON-safe scalars.
+
+Mirrors the same helper in runtime.jac so the adjacency collection only
+ever contains values that MongoDB can store and query with equality filters.
+Non-scalar values are coerced to str; un-stringifiable values are omitted.
+"""
+def _safe_attrs(archetype: Any) -> dict[(str, Any)] {
+    result: dict = {};
+    for (k, v) in archetype.__dict__.items() {
+        if k.startswith('_') {
+            continue;
+        }
+        if isinstance(v, (str, int, float, bool)) or v is None {
+            result[k] = v;
+        } else {
+            try {
+                result[k] = str(v);
+            } except Exception {
+                pass;
+            }
+        }
+    }
+    return result;
+}
+
 """Post-initialization: connect to MongoDB."""
 impl MongoBackend.postinit -> None {
     if self.client is None and self.mongo_url {
@@ -18,6 +43,10 @@ impl MongoBackend.postinit -> None {
             self.client = MongoClient(self.mongo_url);
             self.db = self.client[self.db_name];
             self.collection = self.db[self.collection_name];
+            self.adj_collection = self.db['adjacency'];
+            self.adj_collection.create_index([("src", 1), ("tgt_type", 1)]);
+            self.adj_collection.create_index([("tgt", 1), ("src_type", 1)]);
+            self.adj_collection.create_index("edge_id");
         } except Exception as e {
             logger.debug(f"MongoDB connection failed: {e}");
             self.client = None;
@@ -66,7 +95,7 @@ impl MongoBackend.get(id: UUID) -> (Anchor | None) {
     return None;
 }
 
-"""Store anchor in MongoDB."""
+"""Store anchor in MongoDB and refresh adjacency attrs if it is a NodeAnchor."""
 impl MongoBackend.put(anchor: Anchor) -> None {
     if self.client is None or not anchor.persistent {
         return;
@@ -81,6 +110,14 @@ impl MongoBackend.put(anchor: Anchor) -> None {
         );
     } except Exception as e {
         logger.debug(f"MongoDB put failed: {e}");
+    }
+    if isinstance(anchor, NodeAnchor) and anchor.is_populated() {
+        try {
+            attrs = _safe_attrs(anchor.archetype);
+            self.adj_refresh_node(str(_id), attrs);
+        } except Exception as e {
+            logger.debug(f"MongoDB put adj_refresh failed: {e}");
+        }
     }
 }
 
@@ -235,5 +272,139 @@ impl MongoBackend._load_anchor(raw: dict[(str, Any)]) -> (Anchor | None) {
     } except Exception as e {
         logger.debug(f"MongoDB _load_anchor failed: {e}");
         return None;
+    }
+}
+
+"""Upsert one entry in the adjacency matrix collection.
+
+Each document represents a single directed edge with enough metadata
+to answer type+attribute filter queries without loading the full anchor.
+Document _id is src:tgt:edge so duplicate connects are idempotent.
+"""
+impl MongoBackend.adj_upsert(
+    src_id: str,
+    tgt_id: str,
+    edge_id: str,
+    edge_type: str,
+    src_type: str,
+    tgt_type: str,
+    src_attrs: dict[(str, Any)],
+    tgt_attrs: dict[(str, Any)]
+) -> None {
+    if self.client is None {
+        return;
+    }
+    try {
+        doc = {
+            "src": src_id,
+            "tgt": tgt_id,
+            "edge_id": edge_id,
+            "edge_type": edge_type,
+            "src_type": src_type,
+            "tgt_type": tgt_type,
+            "src_attrs": src_attrs,
+            "tgt_attrs": tgt_attrs
+        };
+        self.adj_collection.update_one(
+            {"_id": f"{src_id}:{tgt_id}:{edge_id}"},
+            {"$set": doc},
+            upsert=True
+        );
+    } except Exception as e {
+        logger.debug(f"adj_upsert failed: {e}");
+    }
+}
+
+"""Remove all adjacency entries for a given edge (both directions)."""
+impl MongoBackend.adj_delete_by_edge(edge_id: str) -> None {
+    if self.client is None {
+        return;
+    }
+    try {
+        self.adj_collection.delete_many({"edge_id": edge_id});
+    } except Exception as e {
+        logger.debug(f"adj_delete_by_edge failed: {e}");
+    }
+}
+
+"""Query the adjacency matrix for connected node IDs without loading archetypes.
+
+Returns a list of UUID strings for nodes that pass the type and attribute
+filters, using only the lightweight adjacency index — no anchor deserialization.
+
+direction "OUT": edges leaving origin  (filter applies to target nodes)
+direction "IN":  edges entering origin (filter applies to source nodes)
+direction "ANY": both directions combined
+"""
+impl MongoBackend.adj_query(
+    origin_id: str,
+    node_type: (str | None) = None,
+    attrs: (dict[(str, Any)] | None) = None,
+    direction: str = "OUT"
+) -> list[str] {
+    if self.client is None {
+        return [];
+    }
+    try {
+        result_ids: list[str] = [];
+        if direction in ["OUT", "ANY"] {
+            query: dict = {"src": origin_id};
+            if node_type {
+                query["tgt_type"] = node_type;
+            }
+            if attrs {
+                for (k, v) in attrs.items() {
+                    query[f"tgt_attrs.{k}"] = v;
+                }
+            }
+            for doc in self.adj_collection.find(query, {"tgt": 1}) {
+                result_ids.append(doc["tgt"]);
+            }
+        }
+        if direction in ["IN", "ANY"] {
+            query = {"tgt": origin_id};
+            if node_type {
+                query["src_type"] = node_type;
+            }
+            if attrs {
+                for (k, v) in attrs.items() {
+                    query[f"src_attrs.{k}"] = v;
+                }
+            }
+            for doc in self.adj_collection.find(query, {"src": 1}) {
+                if doc["src"] not in result_ids {
+                    result_ids.append(doc["src"]);
+                }
+            }
+        }
+        return result_ids;
+    } except Exception as e {
+        logger.debug(f"adj_query failed: {e}");
+        return [];
+    }
+}
+
+"""Refresh adjacency entries when a node's attributes change.
+
+Called automatically from put() whenever a NodeAnchor is persisted.
+Updates src_attrs for all edges where this node is the source, and
+tgt_attrs for all edges where this node is the target, so subsequent
+attribute-filter queries always see the current values.
+"""
+impl MongoBackend.adj_refresh_node(node_id: str, attrs: dict[(str, Any)]) -> None {
+    if self.client is None {
+        return;
+    }
+    try {
+        self.adj_collection.update_many(
+            {"src": node_id},
+            {"$set": {"src_attrs": attrs}}
+        );
+        self.adj_collection.update_many(
+            {"tgt": node_id},
+            {"$set": {"tgt_attrs": attrs}}
+        );
+    } except Exception as e {
+        logger.debug(f"adj_refresh_node failed: {e}");
     }
 }

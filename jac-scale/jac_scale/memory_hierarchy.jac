@@ -77,6 +77,7 @@ obj MongoBackend(PersistentMemory) {
     has client: MongoClient | None = None,
         db: Any by postinit,
         collection: Any by postinit,
+        adj_collection: Any by postinit,
         db_name: str = 'jac_db',
         collection_name: str = 'anchors',
         mongo_url: str = _db_config['mongodb_uri'];
@@ -110,6 +111,25 @@ obj MongoBackend(PersistentMemory) {
     def bulk_put(anchors: Iterable[Anchor]) -> None;
     # Internal
     def _load_anchor(raw: dict[(str, Any)]) -> (Anchor | None);
+    # Adjacency matrix operations
+    def adj_upsert(
+        src_id: str,
+        tgt_id: str,
+        edge_id: str,
+        edge_type: str,
+        src_type: str,
+        tgt_type: str,
+        src_attrs: dict[(str, Any)],
+        tgt_attrs: dict[(str, Any)]
+    ) -> None;
+    def adj_delete_by_edge(edge_id: str) -> None;
+    def adj_query(
+        origin_id: str,
+        node_type: (str | None) = None,
+        attrs: (dict[(str, Any)] | None) = None,
+        direction: str = "OUT"
+    ) -> list[str];
+    def adj_refresh_node(node_id: str, attrs: dict[(str, Any)]) -> None;
 }
 
 """

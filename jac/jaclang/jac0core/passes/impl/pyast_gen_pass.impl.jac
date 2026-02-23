@@ -2953,6 +2953,22 @@ impl PyastGenPass.exit_edge_ref_trailer(
                     )
                 )
             );
+            if (
+                isinstance(filt, uni.FilterCompr)
+                and filt.f_type
+                and hasattr(filt.f_type.gen.py_ast[0], 'id')
+            ) {
+                keywords.append(
+                    self.sync(
+                        ast3.keyword(
+                            arg='nd_type',
+                            value=self.sync(
+                                ast3.Constant(value=filt.f_type.gen.py_ast[0].id)
+                            )
+                        )
+                    )
+                );
+            }
         }
         pynode = self.sync(
             ast3.Call(
