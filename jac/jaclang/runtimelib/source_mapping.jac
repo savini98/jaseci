@@ -8,8 +8,10 @@ Supports two mapping layers:
 import json;
 import os;
 import re;
+import time;
 import from pathlib { Path }
 import from collections { namedtuple }
+import from typing { Any }
 
 glob SourceLocation = namedtuple("SourceLocation", ["file", "line", "column"]);
 
@@ -301,6 +303,75 @@ def _is_node_modules(path: str) -> bool {
     return "node_modules" in path;
 }
 
+"""Compute a cache signature from .map file modification times."""
+def _get_map_signature(base_path: str) -> str {
+    client_dir = Path(base_path) / ".jac" / "client";
+    parts: list[str] = [];
+    for sub in ["compiled", "dist"] {
+        d = client_dir / sub;
+        if d.is_dir() {
+            for f in sorted(d.rglob("*.js.map")) {
+                try {
+                    parts.append(f"{f}:{os.path.getmtime(f)}");
+                } except OSError {
+                    continue;
+                }
+            }
+        }
+    }
+    return "|".join(parts);
+}
+
+# Global cache: base_path -> (signature, SourceMapper)
+glob _mapper_cache: dict[str, tuple[str, Any]] = {};
+
+# ---------------------------------------------------------------------------
+# Rate limiter for client error reports
+# ---------------------------------------------------------------------------
+"""Rate limiter that deduplicates by message and caps errors per window."""
+obj ErrorRateLimiter {
+    has _seen: dict[str, float] = {},
+        _count: int = 0,
+        _window_start: float = 0.0,
+        max_per_window: int = 20,
+        window_seconds: float = 60.0,
+        dedup_seconds: float = 10.0;
+
+    """Check if this error should be logged. Returns True if allowed."""
+    def should_log(message: str) -> bool {
+        now: float = time.time();
+        # Reset window if expired
+        if now - self._window_start > self.window_seconds {
+            self._window_start = now;
+            self._count = 0;
+        }
+        # Check rate limit
+        if self._count >= self.max_per_window {
+            return False;
+        }
+        # Check dedup — skip if same message was logged recently
+        last_seen = self._seen.get(message, 0.0);
+        if now - last_seen < self.dedup_seconds {
+            return False;
+        }
+        # Allow this error
+        self._seen[message] = now;
+        self._count += 1;
+        # Prune old entries to avoid memory growth
+        if len(self._seen) > 100 {
+            cutoff = now - self.dedup_seconds;
+            self._seen = {
+                k: v
+                for (k, v) in self._seen.items()
+                if v > cutoff
+            };
+        }
+        return True;
+    }
+}
+
+glob _error_rate_limiter = ErrorRateLimiter();
+
 """Main entry point for resolving JS locations to .jac source.
 
 Supports two-layer resolution:
@@ -312,8 +383,20 @@ obj SourceMapper {
         _per_file_maps: dict[str, SourceMap] = {},
         _base_path: str = "";
 
-    """Create a SourceMapper from a project's .jac/client/ directory."""
+    """Create a SourceMapper from a project's .jac/client/ directory.
+    Caches the result and invalidates when .map files change.
+    """
     static def from_bundle(base_path: str) -> SourceMapper {
+        # Check cache
+        sig: str = _get_map_signature(base_path);
+        cached: tuple[str, Any] | None = _mapper_cache.get(base_path);
+        if cached is not None and cached[0] == sig {
+            return SourceMapper(
+                _source_map=cached[1]._source_map,
+                _per_file_maps=cached[1]._per_file_maps,
+                _base_path=cached[1]._base_path
+            );
+        }
         client_dir = Path(base_path) / ".jac" / "client";
         compiled_dir = client_dir / "compiled";
         dist_dir = client_dir / "dist";
@@ -326,13 +409,15 @@ obj SourceMapper {
             for map_file in compiled_dir.rglob("*.js.map") {
                 try {
                     with open(map_file, encoding="utf-8") as f {
-                        raw = json.load(f);
+                        raw: dict = dict(json.load(f));
                     }
-                    sources = raw.get("sources", []);
-                    mappings = raw.get("mappings", "");
+                    sources: list[str] = list(raw.get("sources", []));
+                    mappings: str = str(raw.get("mappings", ""));
                     index = _parse_mappings(mappings, len(sources));
-                    js_name = map_file.name[:-(len(".map"))];
-                    rel_path = str(map_file.relative_to(compiled_dir))[:-(len(".map"))];
+                    js_name: str = str(map_file.name)[:-(len(".map"))];
+                    rel_path: str = str(map_file.relative_to(compiled_dir))[:-(
+                        len(".map")
+                    )];
                     sm = SourceMap(sources=sources, source_comments={}, _index=index);
                     per_file_maps[js_name] = sm;
                     per_file_maps[rel_path] = sm;
@@ -349,10 +434,10 @@ obj SourceMapper {
             for map_file in dist_dir.glob("*.js.map") {
                 try {
                     with open(map_file, encoding="utf-8") as f {
-                        raw = json.load(f);
+                        raw: dict = dict(json.load(f));
                     }
-                    sources = raw.get("sources", []);
-                    mappings = raw.get("mappings", "");
+                    sources: list[str] = list(raw.get("sources", []));
+                    mappings: str = str(raw.get("mappings", ""));
                     index = _parse_mappings(mappings, len(sources));
                     source_map = SourceMap(
                         sources=sources, source_comments=source_comments, _index=index
@@ -364,9 +449,12 @@ obj SourceMapper {
             }
         }
 
-        return SourceMapper(
+        mapper = SourceMapper(
             _source_map=source_map, _per_file_maps=per_file_maps, _base_path=base_path
         );
+        # Store in cache
+        _mapper_cache[base_path] = (sig, mapper);
+        return mapper;
     }
 
     """Resolve a bundled JS line:col to a .jac source location."""

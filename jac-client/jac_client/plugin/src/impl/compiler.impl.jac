@@ -298,6 +298,27 @@ impl ViteCompiler.compile_dependencies_recursively(
             }
             (_, line_map) = es_to_js_with_map(hub_mod.gen.es_ast);
             if line_map {
+                # Compute exact offset: count the lines in the written file
+                # before the raw generated code starts.
+                # Written file = source_header + combined_js
+                # combined_js = runtime_imports_prefix + raw_js
+                # So offset = lines in (source_header + runtime_imports_prefix)
+                raw_js = hub_mod.gen.js or '';
+                full_output = source_header + combined_js;
+                # Find where raw_js starts in full_output
+                raw_start_idx = full_output.find(raw_js);
+                if raw_start_idx > 0 {
+                    prefix = full_output[:raw_start_idx];
+                    header_lines = prefix.count('\n');
+                } else {
+                    header_lines = 0;
+                }
+                if header_lines > 0 {
+                    line_map = [
+                        (out + header_lines, src_l, src_c)
+                        for (out, src_l, src_c) in line_map
+                    ];
+                }
                 map_json = generate_source_map_json(
                     source_file=str(module_path),
                     output_file=output_path.name,

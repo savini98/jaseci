@@ -9,8 +9,10 @@ import from jaclang.compiler.passes.ecmascript { estree as es }
 """Generate JavaScript code from ESTree AST."""
 obj JSCodeGenerator {
     def init(indent: str = '  ') -> None;
-    # Source mapping: list of (output_line, source_line, source_col) per statement
-    has line_map: list[tuple[int, int, int]] = [];
+    # Source mapping: maps output line -> (source_line, source_col)
+    has line_map: list[tuple[int, int, int]] = [],
+        _current_line: int = 1,
+        _line_to_src: dict[int, tuple[int, int]] = {};
 
     def indent -> str;
     def generate(nd: (es.Node | None)) -> str;
