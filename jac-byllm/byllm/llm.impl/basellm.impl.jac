@@ -483,9 +483,20 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                 if isinstance(usage, dict)
                 else getattr(usage, "total_tokens", 0)
         );
+        # Stage 3: when a MemoryPolicy is wired through Memory, dispatch
+        # to it for compaction decisions and bypass the framework's
+        # threshold-based compaction. The policy mutates the graph
+        # itself; we don't need to reach into mt_run.messages here.
+        policy = mt_run.memory_policy;
+        graph_for_policy = mt_run.memory;
+        if policy is not None and graph_for_policy is not None {
+            if policy.should_compact(graph_for_policy, mt_run) {
+                policy.compact(graph_for_policy, mt_run);
+            }
+        }
         # Threshold-based proactive compaction: check current input size against the
         # context window and compact before the next iteration crosses the limit.
-        if comp_enabled and ctx_window > 0 {
+        elif comp_enabled and ctx_window > 0 {
             prompt_tokens = int(
                 usage.get("prompt_tokens", 0)
                     if isinstance(usage, dict)
@@ -1235,8 +1246,18 @@ impl BaseLLM._invoke_streaming(
                     if isinstance(usage, dict)
                     else getattr(usage, "total_tokens", 0)
             );
+            # Stage 3 policy dispatch (mirrors invoke()): when a
+            # MemoryPolicy is wired, route compaction through it; the
+            # framework's threshold-based path is bypassed for this turn.
+            policy = mt_run.memory_policy;
+            graph_for_policy = mt_run.memory;
+            if policy is not None and graph_for_policy is not None {
+                if policy.should_compact(graph_for_policy, mt_run) {
+                    policy.compact(graph_for_policy, mt_run);
+                }
+            }
             # Threshold-based proactive compaction - identical logic to invoke().
-            if comp_enabled and ctx_window > 0 {
+            elif comp_enabled and ctx_window > 0 {
                 prompt_tokens = int(
                     usage.get("prompt_tokens", 0)
                         if isinstance(usage, dict)

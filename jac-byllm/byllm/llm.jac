@@ -50,7 +50,11 @@ import from byllm.memory {
     Memory,
     MemoryGraph,
     MemoryToolResult,
-    MemoryMessage
+    MemoryMessage,
+    MemoryCompactionSummary,
+    MemoryPolicy,
+    AgePolicy,
+    EvictionDecision
 }
 
 # Load configuration purely from jac.toml

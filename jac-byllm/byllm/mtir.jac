@@ -18,7 +18,7 @@ import from byllm.types {
     ToolCallResultMsg
 }
 import from byllm.mcp { McpTool }
-import from byllm.memory { Memory, MemoryGraph }
+import from byllm.memory { Memory, MemoryGraph, MemoryPolicy }
 
 """Intermediate representation for LLM function calls.
 
@@ -63,7 +63,12 @@ obj MTRuntime {
         # and messages are auto-recorded into this graph as the agent
         # runs; the caller inspects it via `Memory.graph` after the call.
         # Stays None for callers who don't opt in.
-        memory: MemoryGraph | None = None;
+        memory: MemoryGraph | None = None,
+        # Strategy interface (Stage 3+) for pruning, compaction, and
+        # materialization. Set from `Memory.policy` in the factory.
+        # When non-None, byLLM dispatches to it at iteration boundaries
+        # instead of running its own inline compaction logic.
+        memory_policy: MemoryPolicy | None = None;
 
     static def factory(mtir: MTIR) -> MTRuntime;
     def dispatch_params -> dict[str, object];

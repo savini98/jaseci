@@ -224,6 +224,10 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
     if isinstance(memory_obj, Memory) {
         graph: MemoryGraph = memory_obj.get_or_create_graph();
         mt_run.memory = graph;
+        # Stage 3: propagate the policy from the Memory holder onto
+        # mt_run so the loop can dispatch to it without keeping a
+        # reference to the holder itself.
+        mt_run.memory_policy = memory_obj.policy;
         # Bump the per-call turn counter on the graph so generated IDs
         # carry the right turn even when the agent itself hasn't tracked
         # it (the agent code can override later via its own turn logic).

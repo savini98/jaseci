@@ -194,6 +194,22 @@ test "memory primitive populates graph (Stage 2)" {
     assert "PASS  persist=False yielded a separate graph node" in stdout_value;
 }
 
+test "memory AgePolicy compacts and is no-op without policy (Stage 3)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("memory_age_policy", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  AgePolicy created a CompactionSummary node" in stdout_value;
+    assert "PASS  AgePolicy hid older messages/tool results" in stdout_value;
+    assert "PASS  CompactionSummary dropped_*_count is non-zero" in stdout_value;
+    assert (
+        "PASS  no-policy run is unchanged from Stage 2 (no summary, nothing hidden)"
+        in stdout_value
+    );
+}
+
 test "logging stream no tools" {
     captured_output = io.StringIO();
     sys.stdout = captured_output;

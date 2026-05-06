@@ -104,6 +104,202 @@ edge ReferencedBy {
 }
 
 
+"""Decision returned by `MemoryPolicy.select_eviction()`.
+
+Each entry tells the pruner what to do with one MemoryToolResult node:
+soft-trim (replace visible_content with head+tail), hard-clear (replace
+with a placeholder), or skip. The kind is a string rather than an enum
+to keep the surface stable across versions and make custom kinds
+trivial for subclassing policies.
+"""
+obj EvictionDecision {
+    has tool_result: MemoryToolResult,
+        kind: str = "skip",       # skip | soft_trim | hard_clear
+        head_chars: int = 1500,
+        tail_chars: int = 1500,
+        placeholder: str = "[Old tool result content cleared]";
+}
+
+
+"""Strategy interface for memory pruning, compaction, and materialization.
+
+Concrete policies subclass this. The default methods are no-ops so a
+caller-supplied policy can override only what it needs (e.g. only the
+compaction step) without having to reimplement the rest. byLLM dispatches
+into the policy at well-defined boundaries:
+
+  - `should_prune`     : called pre-LLM-call. True triggers `select_eviction`.
+  - `select_eviction`  : returns a list of EvictionDecisions to apply to
+                         visible MemoryToolResults.
+  - `should_compact`   : called pre-LLM-call after pruning. True triggers
+                         `compact` and bypasses the framework's existing
+                         token-threshold compaction path for this turn.
+  - `compact`          : returns a MemoryCompactionSummary if a summary
+                         was produced, else None. The policy is
+                         expected to mutate the graph itself (hide
+                         compacted nodes, attach the summary). Returning
+                         None signals "no compaction was applied this
+                         call" and the framework leaves the loop alone.
+  - `materialize`      : returns the message list that should be sent to
+                         the LLM this iteration. Default returns None
+                         meaning "use mt_run.messages as-is".
+"""
+obj MemoryPolicy {
+    def should_prune(graph: MemoryGraph, mt_run: object) -> bool;
+    def select_eviction(
+        graph: MemoryGraph, mt_run: object
+    ) -> list[EvictionDecision];
+    def should_compact(graph: MemoryGraph, mt_run: object) -> bool;
+    def compact(
+        graph: MemoryGraph, mt_run: object
+    ) -> MemoryCompactionSummary | None;
+    def materialize(graph: MemoryGraph, mt_run: object) -> list | None;
+}
+
+
+impl MemoryPolicy.should_prune(graph: MemoryGraph, mt_run: object) -> bool {
+    return False;
+}
+
+impl MemoryPolicy.select_eviction(
+    graph: MemoryGraph, mt_run: object
+) -> list[EvictionDecision] {
+    return [];
+}
+
+impl MemoryPolicy.should_compact(graph: MemoryGraph, mt_run: object) -> bool {
+    return False;
+}
+
+impl MemoryPolicy.compact(
+    graph: MemoryGraph, mt_run: object
+) -> MemoryCompactionSummary | None {
+    return None;
+}
+
+impl MemoryPolicy.materialize(
+    graph: MemoryGraph, mt_run: object
+) -> list | None {
+    return None;
+}
+
+
+"""Age-based memory policy — the framework default.
+
+Compaction-only for now. Fires `should_compact` when the visible
+memory-resident token estimate (sum of MemoryMessage.token_estimate +
+estimated tokens of visible MemoryToolResult.visible_content) crosses a
+configurable threshold against `usable_budget_tokens`. Compaction picks
+the oldest items beyond a `preserve_recent_turns` window and replaces
+them with a synthetic placeholder summary.
+
+This is a deliberately simple default. A future ReferenceAwarePolicy
+(Stage 4) will subclass it and replace `select_eviction` /
+`compact` with its score-based variants. A LLM-backed compactor will
+override `compact` to call out to byLLM; this base version returns a
+free-form text summary built from the eligible content's first lines.
+
+Configurable parameters:
+  - `usable_budget_tokens`     : the token budget the policy aims to stay under
+  - `compact_threshold_ratio`  : fill fraction at or above which compaction fires
+  - `preserve_recent_turns`    : how many recent turns are protected from compaction
+"""
+obj AgePolicy(MemoryPolicy) {
+    has usable_budget_tokens: int = 8000,
+        compact_threshold_ratio: float = 0.5,
+        preserve_recent_turns: int = 2;
+
+    override def should_compact(graph: MemoryGraph, mt_run: object) -> bool;
+    override def compact(
+        graph: MemoryGraph, mt_run: object
+    ) -> MemoryCompactionSummary | None;
+}
+
+
+impl AgePolicy.should_compact(graph: MemoryGraph, mt_run: object) -> bool {
+    if self.usable_budget_tokens <= 0 {
+        return False;
+    }
+    total_tokens = 0;
+    for m in [graph -->](?:MemoryMessage) {
+        if m.visible {
+            total_tokens += m.token_estimate;
+        }
+    }
+    for tr in [graph -->](?:MemoryToolResult) {
+        if tr.visible {
+            # Approximate tokens at chars/4 — matches research-agent default.
+            total_tokens += len(tr.visible_content) // 4;
+        }
+    }
+    for s in [graph -->](?:MemoryCompactionSummary) {
+        if s.visible {
+            total_tokens += s.token_estimate;
+        }
+    }
+    fill_ratio = total_tokens / float(self.usable_budget_tokens);
+    return fill_ratio >= self.compact_threshold_ratio;
+}
+
+
+impl AgePolicy.compact(
+    graph: MemoryGraph, mt_run: object
+) -> MemoryCompactionSummary | None {
+    cutoff = graph.turn_count - self.preserve_recent_turns;
+    if cutoff <= 0 {
+        return None;
+    }
+    msgs_to_compact = [
+        m for m in [graph -->](?:MemoryMessage)
+        if m.visible and m.turn <= cutoff
+    ];
+    trs_to_compact = [
+        tr for tr in [graph -->](?:MemoryToolResult)
+        if tr.visible and tr.produced_at_turn <= cutoff
+    ];
+    if not msgs_to_compact and not trs_to_compact {
+        return None;
+    }
+    # Build a minimal free-form summary from the eligible content's first
+    # lines. A future LLM-backed AgePolicy variant overrides this method.
+    snippets = [];
+    for m in msgs_to_compact {
+        head = m.content.split("\n")[0][:120];
+        if head {
+            snippets.append(f"[{m.role} t{m.turn}] {head}");
+        }
+    }
+    for tr in trs_to_compact {
+        head = tr.full_content.split("\n")[0][:120];
+        snippets.append(f"[tool {tr.tool_name} t{tr.produced_at_turn}] {head}");
+    }
+    summary_text = "Older context summary:\n" + "\n".join(snippets);
+
+    turn_starts = [m.turn for m in msgs_to_compact] + [
+        tr.produced_at_turn for tr in trs_to_compact
+    ];
+    covers_start = min(turn_starts) if turn_starts else 0;
+
+    summary = MemoryCompactionSummary(
+        generated_at=time.time(),
+        covers_turn_start=covers_start,
+        covers_turn_end=cutoff,
+        summary_text=summary_text,
+        dropped_message_count=len(msgs_to_compact),
+        dropped_tool_result_count=len(trs_to_compact),
+        token_estimate=len(summary_text) // 4
+    );
+    graph ++> summary;
+    for m in msgs_to_compact {
+        m.visible = False;
+    }
+    for tr in trs_to_compact {
+        tr.visible = False;
+    }
+    return summary;
+}
+
+
 """Public memory config. Pass to `by llm(memory=...)` to opt in.
 
 Holds the live `MemoryGraph` after the first call so the caller can
@@ -111,10 +307,17 @@ inspect it. With `persist=True` the same graph is reused across
 invocations of the decorated function (within the same process). With
 `persist=False` a fresh graph is created on every invocation —
 discarding the previous one.
+
+Optional `policy` is the strategy interface for pruning/compaction/
+materialization. When None (default for Stage 2), byLLM records into
+the graph but doesn't act on it. When set, byLLM dispatches to the
+policy's hooks at iteration boundaries, replacing the framework's
+inline compaction code path.
 """
 obj Memory {
     has persist: bool = True,
         session_id: str = "",
+        policy: MemoryPolicy | None = None,
         # Set by byLLM at call time. Points at the live MemoryGraph node.
         graph: MemoryGraph | None = None;
 
