@@ -145,6 +145,41 @@ test "streaming with react" {
     assert "Test passed!" in stdout_value;
 }
 
+test "structured streaming basic (typed return + stream, no tools)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("structured_streaming_basic", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "type(result) = StructuredStream" in stdout_value;
+    assert "PASS  parsed.citations matches" in stdout_value;
+}
+
+test "structured streaming with tools" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("structured_streaming_with_tools", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  parsed is StructuredAnswer instance" in stdout_value;
+    assert "PASS  parsed.citations matches" in stdout_value;
+}
+
+test "structured streaming smart default field" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("structured_streaming_smart_default", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert (
+        "PASS  resolver picked 'summary' (first str field, no 'answer' present)"
+        in stdout_value
+    );
+}
+
 test "logging stream no tools" {
     captured_output = io.StringIO();
     sys.stdout = captured_output;

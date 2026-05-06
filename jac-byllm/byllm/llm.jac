@@ -40,7 +40,12 @@ import from byllm.types {
 import from byllm.config_loader { get_byllm_config }
 import from byllm.telemetry { _emit_agent_telemetry, _current_invocation_id }
 import from byllm.parallel { dispatch_batch, _index_by_identity, _PARALLEL_TOOL_HINT }
-import from byllm.schema { inject_schema_hint }
+import from byllm.schema { inject_schema_hint, json_to_instance }
+import from byllm.streaming_parser {
+    StreamingFieldExtractor,
+    StructuredStream,
+    resolve_streaming_text_field
+}
 
 # Load configuration purely from jac.toml
 glob _byllm_config = get_byllm_config(),

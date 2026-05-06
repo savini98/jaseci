@@ -183,11 +183,19 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
     # Prepare return type.
     return_type = get_type_hints(caller).get("return");
     is_streaming = bool(call_params.get("stream", False));
-    if is_streaming and return_type is not str {
-        raise ConfigurationError(
-            "Streaming responses are only supported for str return types."
-        );
-    }
+    # Typed+streaming flow:
+    #
+    # - Without tools: dispatch_streaming sends `response_format` straight
+    #   to the provider, the model emits structured JSON, and
+    #   StreamingFieldExtractor surfaces tokens from the designated text
+    #   field while the rest of the JSON is buffered for full parsing on
+    #   completion.
+    # - With tools: the ReAct loop runs as usual; finish_tool is still
+    #   injected so the loop has a clean termination signal. When
+    #   finish_tool fires, `_stream_final_answer` detects typed mode and
+    #   makes a streaming follow-up call with tools cleared (so the model
+    #   produces structured JSON via response_format) — that follow-up is
+    #   what gets streamed token-by-token.
     if len(tools) > 0 {
         finish_tool = Tool.make_finish_tool(return_type or str);
         tools.append(finish_tool);

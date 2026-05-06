@@ -329,14 +329,26 @@ impl BaseLLM.invoke(mt_run: MTRuntime) -> object {
     if mt_run.stream and mt_run.call_params.get("logging", False) {
         return self._invoke_streaming(mt_run);
     }
-    # If streaming without tools, stream immediately
+    # If streaming without tools, stream immediately. Typed returns get
+    # wrapped in a StructuredStream so the caller can iterate streamed
+    # tokens AND retrieve the fully-parsed object via `.parsed`.
     if mt_run.stream and len(mt_run.tools) == 0 {
-        return self.dispatch_streaming(mt_run);
+        gen = self.dispatch_streaming(mt_run);
+        if mt_run.resp_type is not None and mt_run.resp_type is not str {
+            return StructuredStream(_generator=gen, _runtime=mt_run);
+        }
+        return gen;
     }
     # Streaming ReAct: defer write_back until the inner generator exhausts,
-    # otherwise the streamed assistant message is missed.
+    # otherwise the streamed assistant message is missed. Typed returns get
+    # wrapped in a StructuredStream so the caller can iterate the streamed
+    # answer-field tokens AND retrieve the fully-parsed object via `.parsed`.
     if mt_run.stream {
-        return self._invoke_react_loop_streaming(mt_run);
+        gen = self._invoke_react_loop_streaming(mt_run);
+        if mt_run.resp_type is not None and mt_run.resp_type is not str {
+            return StructuredStream(_generator=gen, _runtime=mt_run);
+        }
+        return gen;
     }
     try {
         return self._invoke_react_loop(mt_run);
@@ -794,7 +806,19 @@ impl BaseLLM.dispatch_no_streaming(mt_run: MTRuntime) -> CompletionResult {
 
 """Dispatch the LLM call with streaming.
 
-Makes a streaming API call and yields content chunks as they arrive.
+Two modes:
+
+- Plain text streaming (the original behavior). Used when the by-llm
+  function returns `str`. Yields each chunk's `delta.content` verbatim.
+- Structured streaming. Used when the by-llm function declares a typed
+  return AND streaming is on. Sets `response_format` from `mt_run`'s
+  output schema, threads each chunk through a `StreamingFieldExtractor`
+  for the designated text field (`call_params["streaming_text_field"]`,
+  default `"answer"`), and yields only the characters of that field.
+  After the stream completes, the buffered raw JSON is parsed and the
+  resulting typed instance is stored on `mt_run.streaming_result` so
+  the caller can retrieve fields beyond the streamed text (citations,
+  metadata, etc.).
 """
 impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None] {
     # Construct the parameters for the LLM call
@@ -804,6 +828,25 @@ impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
     self.log_info(f"Calling LLM: {self.model_name} with params:\n{log_params}");
     self.api_base = params.pop("api_base", DEFAULT_BASE_URL);
     params.pop("api_key", None);
+
+    # Decide whether this is a structured-streaming pass.
+    is_structured = (
+        mt_run.resp_type is not None and mt_run.resp_type is not str
+    );
+    explicit_field = (
+        mt_run.call_params.get("streaming_text_field")
+        or self.call_params.get("streaming_text_field")
+    );
+    text_field = resolve_streaming_text_field(
+        explicit_field,
+        mt_run.get_output_schema() if is_structured else None
+    );
+    extractor = (
+        StreamingFieldExtractor(field_name=text_field)
+            if is_structured
+            else None
+    );
+
     response = self.model_call_with_stream(params);
     for chunk in response {
         # Final chunk carries usage when stream_options.include_usage is set.
@@ -813,7 +856,35 @@ impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
         }
         if chunk?.choices and chunk?.choices?[0]?.delta {
             delta = chunk.choices[0].delta;
-            yield delta.content or "";
+            content = delta.content or "";
+            if is_structured and extractor is not None {
+                tokens = extractor.feed(content);
+                if tokens {
+                    yield tokens;
+                }
+            } else {
+                yield content;
+            }
+        }
+    }
+
+    # Post-stream: parse the buffered JSON and stash the typed instance.
+    if is_structured and extractor is not None {
+        raw_text: str = extractor.get_raw().strip();
+        target_type = mt_run.resp_type;
+        if raw_text and target_type is not None {
+            try {
+                parsed_dict = json.loads(raw_text);
+                mt_run.streaming_result = json_to_instance(
+                    parsed_dict, target_type
+                );
+            } except Exception as e {
+                logger.warning(
+                    "byLLM structured streaming: failed to parse final JSON "
+                    f"({type(e).__name__}: {e}). raw={raw_text[:200]!r}"
+                );
+                mt_run.streaming_result = None;
+            }
         }
     }
 }
@@ -883,16 +954,33 @@ impl BaseLLM._stream_final_answer(mt_run: MTRuntime) -> Generator[str, None, Non
         "Be comprehensive and synthesize all the information gathered.",
     );
     mt_run.add_scaffolding_message(final_instruction);
-    # Keep only finish_tool so Anthropic sees a valid tools= param
-    # (conversation history may already contain tool_use blocks)
+
+    # Two flavors of "final answer streaming":
+    #
+    # - str return: keep finish_tool in the tools= list (so Anthropic still
+    #   sees a valid tools= param, and conversation tool_use blocks line up),
+    #   force tool_choice="none" so the model produces plain text.
+    # - typed return: clear tools entirely. dispatch_streaming detects
+    #   `mt_run.resp_type` is non-str and routes through
+    #   StreamingFieldExtractor against the response_format JSON schema,
+    #   yielding tokens from the designated text field. After the stream
+    #   completes, mt_run.streaming_result is populated with the parsed
+    #   typed instance (citations etc. come along on that object).
+    is_typed = (
+        mt_run.resp_type is not None and mt_run.resp_type is not str
+    );
+
     original_tools = mt_run.tools;
-    finish_tool_obj = mt_run.get_tool("finish_tool");
-    mt_run.tools = [finish_tool_obj] if finish_tool_obj else [];
-    # Force text generation - tool_choice="none" tells the LLM
-    # "tools are defined but do NOT call any, just produce text"
-    # Save caller's original tool_choice (if any) so we can restore it after.
     original_tool_choice = mt_run.call_params.pop("tool_choice", None);
-    mt_run.call_params["tool_choice"] = "none";
+
+    if is_typed {
+        mt_run.tools = [];
+    } else {
+        finish_tool_obj = mt_run.get_tool("finish_tool");
+        mt_run.tools = [finish_tool_obj] if finish_tool_obj else [];
+        mt_run.call_params["tool_choice"] = "none";
+    }
+
     accumulated: str = "";
     try {
         # Make the actual streaming call - this is REAL streaming from the LLM!

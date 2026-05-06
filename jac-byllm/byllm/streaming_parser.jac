@@ -29,6 +29,64 @@ The buffer of received raw chunks is preserved on the extractor so
 callers can `json.loads(extractor.raw)` once `is_done()` is true.
 """
 
+"""Pick the streaming text field for a typed return.
+
+Resolution order:
+  1. Explicit `streaming_text_field` in call_params
+  2. `"answer"` if the response_format schema has a top-level string property
+     by that name (the convention used by `MemoryAwareReply` and the docs
+     in `byllm-react-implementation-plan.md`)
+  3. The first top-level `string` property in the schema
+  4. `"answer"` as a last-resort fallback (extractor will simply never
+     match and yield nothing — caller still gets `.parsed` after stream
+     ends, but no token-level streaming)
+
+`response_schema` is the JSON schema dict (the value of `response_format`'s
+inner `json_schema.schema`, or whatever shape `mt_run.get_output_schema`
+returns). When it can't be introspected, we fall back to "answer".
+"""
+def resolve_streaming_text_field(
+    explicit: str | None,
+    response_schema: dict | None
+) -> str {
+    if explicit {
+        return explicit;
+    }
+    if response_schema is None {
+        return "answer";
+    }
+    # The schema may be wrapped in {"type": "json_schema", "json_schema":
+    # {"schema": {...}}} (OpenAI shape) or be the raw schema dict.
+    schema = response_schema;
+    if isinstance(schema, dict) and "json_schema" in schema {
+        inner = schema.get("json_schema") or {};
+        if isinstance(inner, dict) {
+            schema = inner.get("schema") or schema;
+        }
+    }
+    props = (
+        schema.get("properties")
+            if isinstance(schema, dict)
+            else None
+    );
+    if not isinstance(props, dict) {
+        return "answer";
+    }
+    if "answer" in props {
+        candidate = props.get("answer");
+        if isinstance(candidate, dict) and candidate.get("type") == "string" {
+            return "answer";
+        }
+    }
+    for (name, spec) in props.items() {
+        if isinstance(spec, dict) and spec.get("type") == "string" {
+            return name;
+        }
+    }
+    return "answer";
+}
+
+
 obj StreamingFieldExtractor {
     """Extracts characters from a designated top-level JSON string field
     as JSON chunks arrive.
@@ -211,6 +269,63 @@ impl StreamingFieldExtractor.is_done() -> bool {
 
 impl StreamingFieldExtractor.get_raw() -> str {
     return self._raw;
+}
+
+
+import from typing { Iterator }
+
+
+obj StructuredStream {
+    """Iterable wrapper around a structured-streaming generator.
+
+    Returned from the public `by llm()` call site when a function declares
+    a typed return AND `stream=True`. Iterating yields the streamed tokens
+    of the designated text field (default `answer`). Once iteration is
+    exhausted (or `parsed` is accessed first), the parsed structured
+    instance — including any non-streamed fields like `citations` — is
+    available via `.parsed`.
+
+    The underlying generator's body is what populates
+    `runtime.streaming_result` on completion, so this wrapper simply
+    drains-then-fetches.
+    """
+
+    has _generator: Iterator[str];
+    has _runtime: object;          # MTRuntime, but typed loosely to avoid cycles
+    has _exhausted: bool = False;
+    has _drain_count: int = 0;     # debug counter; tokens dropped during drain
+
+    def __iter__() -> Iterator[str] {
+        return self;
+    }
+
+    def __next__() -> str {
+        try {
+            return next(self._generator);
+        } except StopIteration as e {
+            self._exhausted = True;
+            raise e;
+        }
+    }
+
+    @property
+    def parsed -> object {
+        if not self._exhausted {
+            try {
+                while True {
+                    next(self._generator);
+                    self._drain_count += 1;
+                }
+            } except StopIteration {
+                self._exhausted = True;
+            }
+        }
+        rt = self._runtime;
+        if rt is None {
+            return None;
+        }
+        return getattr(rt, "streaming_result", None);
+    }
 }
 
 

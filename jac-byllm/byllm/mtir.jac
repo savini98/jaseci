@@ -52,7 +52,11 @@ obj MTRuntime {
         _scaffolding_ids: list[int] = [],
         # Caller's list bound via `by llm(conversation=<list>)`, written
         # back in place after the ReAct loop. None when not conversational.
-        _conversation_list: object = None;
+        _conversation_list: object = None,
+        # Set by `dispatch_streaming` when streaming a structured (typed)
+        # response. Holds the parsed `resp_type` instance once the stream
+        # completes; surfaced to callers via `StructuredStream.parsed`.
+        streaming_result: object = None;
 
     static def factory(mtir: MTIR) -> MTRuntime;
     def dispatch_params -> dict[str, object];
@@ -66,3 +70,5 @@ obj MTRuntime {
     def get_tool_list -> list[dict];
     def get_output_schema -> dict | None;
 }
+
+

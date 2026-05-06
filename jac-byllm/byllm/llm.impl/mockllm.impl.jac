@@ -80,14 +80,64 @@ Simulates streaming by yielding random-sized chunks with artificial delays.
 """
 impl MockLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None] {
     output = self.config["outputs"].pop(0);  # type: ignore
+
+    # Mirror BaseLLM.dispatch_streaming's structured-streaming behavior so
+    # MockLLM-backed tests exercise the typed+stream path deterministically.
+    is_structured = (
+        mt_run.resp_type is not None and mt_run.resp_type is not str
+    );
+    explicit_field = (
+        mt_run.call_params.get("streaming_text_field")
+        or self.call_params.get("streaming_text_field")
+    );
+    text_field = resolve_streaming_text_field(
+        explicit_field,
+        mt_run.get_output_schema() if is_structured else None
+    );
+    extractor = (
+        StreamingFieldExtractor(field_name=text_field)
+            if is_structured
+            else None
+    );
+
     if mt_run.stream {
         while output {
             chunk_len = random.randint(3, 10);
-            yield output[:chunk_len];  # Simulate token chunk
+            chunk = output[:chunk_len];
+            if is_structured and extractor is not None {
+                tokens = extractor.feed(chunk);
+                if tokens {
+                    yield tokens;
+                }
+            } else {
+                yield chunk;
+            }
             time.sleep(random.uniform(0.01, 0.05));  # Simulate network delay
             output = output[chunk_len:];
         }
     }
+
+    # Post-stream: parse the buffered structured JSON and store the typed
+    # instance on mt_run for the caller to retrieve.
+    if is_structured and extractor is not None {
+        raw_text: str = extractor.get_raw().strip();
+        target_type = mt_run.resp_type;
+        if raw_text and target_type is not None {
+            try {
+                parsed_dict = json.loads(raw_text);
+                mt_run.streaming_result = json_to_instance(
+                    parsed_dict, target_type
+                );
+            } except Exception as e {
+                logger.warning(
+                    "MockLLM structured streaming: failed to parse final JSON "
+                    f"({type(e).__name__}: {e}). raw={raw_text[:200]!r}"
+                );
+                mt_run.streaming_result = None;
+            }
+        }
+    }
+
     # Record a usage entry so the end-of-stream usage event fires.
     self._usage_history.append({});
 }
