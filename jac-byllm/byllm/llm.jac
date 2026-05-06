@@ -46,6 +46,12 @@ import from byllm.streaming_parser {
     StructuredStream,
     resolve_streaming_text_field
 }
+import from byllm.memory {
+    Memory,
+    MemoryGraph,
+    MemoryToolResult,
+    MemoryMessage
+}
 
 # Load configuration purely from jac.toml
 glob _byllm_config = get_byllm_config(),

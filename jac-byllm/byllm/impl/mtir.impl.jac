@@ -217,6 +217,44 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
         mt_run._conversation_list = conv_list_ref;
     }
 
+    # Memory: when the caller passed `memory=Memory(...)` to `by llm()`,
+    # ask the Memory holder for its (possibly persisted) MemoryGraph and
+    # attach it to mt_run so downstream auto-recording hooks can find it.
+    memory_obj = call_params.get("memory");
+    if isinstance(memory_obj, Memory) {
+        graph: MemoryGraph = memory_obj.get_or_create_graph();
+        mt_run.memory = graph;
+        # Bump the per-call turn counter on the graph so generated IDs
+        # carry the right turn even when the agent itself hasn't tracked
+        # it (the agent code can override later via its own turn logic).
+        graph.turn_count += 1;
+        current_turn: int = graph.turn_count;
+        # Auto-record the user-side messages already on mt_run.messages
+        # (system + conversation history + new user msg). Keeps the graph
+        # in sync from turn 0 without touching add_message hooks.
+        for m in mt_run.messages {
+            role_str = "";
+            content_str = "";
+            role_attr = getattr(m, "role", None);
+            if role_attr is not None {
+                role_str = str(getattr(role_attr, "value", role_attr));
+            }
+            raw_content = getattr(m, "content", "");
+            if isinstance(raw_content, str) {
+                content_str = raw_content;
+            } else {
+                content_str = str(raw_content);
+            }
+            if role_str {
+                graph.record_message(
+                    role=role_str,
+                    turn=current_turn,
+                    content=content_str
+                );
+            }
+        }
+    }
+
     return mt_run;
 }
 
@@ -234,9 +272,41 @@ impl MTRuntime.dispatch_params -> dict[str, object] {
     return params;
 }
 
-"""Add a message to the conversation history."""
+"""Add a message to the conversation history.
+
+When the caller opted into the memory layer via `memory=Memory(...)`,
+also record the message in the MemoryGraph as a MemoryMessage. We skip
+ToolCallResultMsg here because those are recorded as MemoryToolResult
+(richer schema with args, full_content, tr_id) at the dispatch site.
+"""
 impl MTRuntime.add_message(message: MessageType) -> None {
     self.messages.append(message);
+    graph = self.memory;
+    if graph is None {
+        return;
+    }
+    if isinstance(message, ToolCallResultMsg) {
+        return;
+    }
+    role_str = "";
+    content_str = "";
+    role_attr = getattr(message, "role", None);
+    if role_attr is not None {
+        role_str = str(getattr(role_attr, "value", role_attr));
+    }
+    raw_content = getattr(message, "content", "");
+    if isinstance(raw_content, str) {
+        content_str = raw_content;
+    } else {
+        content_str = str(raw_content);
+    }
+    if role_str {
+        graph.record_message(
+            role=role_str,
+            turn=graph.turn_count,
+            content=content_str
+        );
+    }
 }
 
 

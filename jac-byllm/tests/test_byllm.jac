@@ -180,6 +180,20 @@ test "structured streaming smart default field" {
     );
 }
 
+test "memory primitive populates graph (Stage 2)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("memory_basic", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  persist=True reuses the same graph node" in stdout_value;
+    assert "PASS  tool result recorded as MemoryToolResult" in stdout_value;
+    assert "PASS  tr_id follows the documented scheme" in stdout_value;
+    assert "PASS  assistant message recorded on call 1" in stdout_value;
+    assert "PASS  persist=False yielded a separate graph node" in stdout_value;
+}
+
 test "logging stream no tools" {
     captured_output = io.StringIO();
     sys.stdout = captured_output;

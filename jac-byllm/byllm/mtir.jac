@@ -18,6 +18,7 @@ import from byllm.types {
     ToolCallResultMsg
 }
 import from byllm.mcp { McpTool }
+import from byllm.memory { Memory, MemoryGraph }
 
 """Intermediate representation for LLM function calls.
 
@@ -56,7 +57,13 @@ obj MTRuntime {
         # Set by `dispatch_streaming` when streaming a structured (typed)
         # response. Holds the parsed `resp_type` instance once the stream
         # completes; surfaced to callers via `StructuredStream.parsed`.
-        streaming_result: object = None;
+        streaming_result: object = None,
+        # Per-invocation memory graph. Populated by the factory when the
+        # caller passes `memory=Memory(...)` to `by llm()`. Tool results
+        # and messages are auto-recorded into this graph as the agent
+        # runs; the caller inspects it via `Memory.graph` after the call.
+        # Stays None for callers who don't opt in.
+        memory: MemoryGraph | None = None;
 
     static def factory(mtir: MTIR) -> MTRuntime;
     def dispatch_params -> dict[str, object];

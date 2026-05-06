@@ -351,7 +351,23 @@ impl BaseLLM.invoke(mt_run: MTRuntime) -> object {
         return gen;
     }
     try {
-        return self._invoke_react_loop(mt_run);
+        result = self._invoke_react_loop(mt_run);
+        # Memory: capture the assistant's final reply into the graph.
+        # Doing this here (rather than in MockLLM/dispatch_no_streaming)
+        # avoids touching backward-compat assumptions test fixtures make
+        # about MockLLM's message bookkeeping. Skipped when the caller
+        # didn't opt into memory or the result isn't a plain string
+        # (typed returns + streaming both populate streaming_result via
+        # other paths).
+        graph = mt_run.memory;
+        if graph is not None and isinstance(result, str) {
+            graph.record_message(
+                role="assistant",
+                turn=graph.turn_count,
+                content=result
+            );
+        }
+        return result;
     } finally {
         mt_run.write_back_conversation();
     }
@@ -530,6 +546,18 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                         last_tool = btc.tool.get_name();
                         last_result = str(result_msg.content)[:500];
                         mt_run.add_message(result_msg);
+                        # Auto-record into the memory graph when the
+                        # caller opted in via memory=Memory(...).
+                        graph = mt_run.memory;
+                        if graph is not None {
+                            graph.record_tool_result(
+                                tool_name=last_tool,
+                                args=btc.args,
+                                full_content=str(result_msg.content),
+                                visible_content=str(result_msg.content),
+                                turn=graph.turn_count
+                            );
+                        }
                     }
                 }
             }
@@ -1325,7 +1353,18 @@ impl BaseLLM._invoke_streaming(
                             ordered[idx] = r;
                         }
                         for i in range(len(batch)) {
-                            mt_run.add_message(ordered[i][1]);
+                            (btc_m, result_msg_m, _) = ordered[i];
+                            mt_run.add_message(result_msg_m);
+                            graph = mt_run.memory;
+                            if graph is not None {
+                                graph.record_tool_result(
+                                    tool_name=btc_m.tool.get_name(),
+                                    args=btc_m.args,
+                                    full_content=str(result_msg_m.content),
+                                    visible_content=str(result_msg_m.content),
+                                    turn=graph.turn_count
+                                );
+                            }
                         }
                     }
                 }
