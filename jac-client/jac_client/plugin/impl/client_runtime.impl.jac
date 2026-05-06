@@ -376,13 +376,19 @@ impl jacSignup(
         }
     );
     if response.ok {
+        body_text = await response.text();
         user_id = None;
         try {
-            data = JSON.parse(await response.text());
+            data = JSON.parse(body_text);
             if data["data"] and data["data"]["user_id"] {
                 user_id = data["data"]["user_id"];
             }
-        } except Exception { }
+        } except Exception as e {
+            return {
+                "success": False,
+                "error": f"Signup response was not valid JSON: {e}"
+            };
+        }
         return {"success": True, "user_id": user_id};
     } else {
         error_text = await response.text();
