@@ -210,6 +210,18 @@ test "memory AgePolicy compacts and is no-op without policy (Stage 3)" {
     );
 }
 
+test "memory ReferenceAwarePolicy preserves cited content (Stage 4)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("memory_reference_aware", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  should_prune True at fill_ratio above soft threshold" in stdout_value;
+    assert "PASS  unreferenced (low-ref) candidate was evicted first" in stdout_value;
+    assert "PASS  high-ref content preserved through pressure" in stdout_value;
+}
+
 test "logging stream no tools" {
     captured_output = io.StringIO();
     sys.stdout = captured_output;

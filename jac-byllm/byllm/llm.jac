@@ -54,7 +54,10 @@ import from byllm.memory {
     MemoryCompactionSummary,
     MemoryPolicy,
     AgePolicy,
-    EvictionDecision
+    ReferenceAwarePolicy,
+    EvictionDecision,
+    apply_eviction_decision,
+    record_references_from_text
 }
 
 # Load configuration purely from jac.toml
