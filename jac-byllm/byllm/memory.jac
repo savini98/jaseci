@@ -29,6 +29,7 @@ ID scheme: `tr_<turn>_<tool_name>_<seq>` for tool results,
 """
 
 import time;
+import re;
 
 
 node MemoryGraph {
@@ -101,6 +102,46 @@ node MemoryCompactionSummary {
 
 edge ReferencedBy {
     has cite_turn: int = 0;
+}
+
+
+"""Apply a single eviction decision to its target ToolResult.
+
+Returns the number of tokens (chars/4 estimate) freed from the
+visible_content. Idempotent: calling on an already-cleared node is a
+no-op and returns 0. Stays a free function (not a MemoryPolicy
+method) so the loop can apply decisions returned from any policy
+without dispatching through that policy again.
+"""
+def apply_eviction_decision(decision: object) -> int {
+    tr = getattr(decision, "tool_result", None);
+    if tr is None {
+        return 0;
+    }
+    kind = getattr(decision, "kind", "skip");
+    if kind == "skip" {
+        return 0;
+    }
+    if getattr(tr, "truncation_state", "") == "hard_cleared" {
+        return 0;
+    }
+    before = len(getattr(tr, "visible_content", "")) // 4;
+    if kind == "hard_clear" {
+        tr.visible_content = getattr(decision, "placeholder", "[Old tool result content cleared]");
+        tr.truncation_state = "hard_cleared";
+    } elif kind == "soft_trim" {
+        head = int(getattr(decision, "head_chars", 1500));
+        tail = int(getattr(decision, "tail_chars", 1500));
+        cur: str = str(tr.visible_content);
+        if len(cur) > head + tail {
+            tr.visible_content = cur[:head] + "\n...[soft-trimmed]...\n" + cur[-tail:];
+            if tr.truncation_state == "full" {
+                tr.truncation_state = "head_tail";
+            }
+        }
+    }
+    after = len(tr.visible_content) // 4;
+    return max(0, before - after);
 }
 
 
@@ -297,6 +338,227 @@ impl AgePolicy.compact(
         tr.visible = False;
     }
     return summary;
+}
+
+
+"""Pull "distinctive" tokens out of tool-result text for substring-based
+reference detection. Two patterns chosen to over-index on content
+identifiers and under-index on prose: snake/camel identifiers ≥ 6 chars
+and ALL-CAPS tokens. Path-like matches (containing a slash) are
+deliberately excluded — generic project paths appear in many tool
+outputs and inflate ref counts spuriously (verified empirically in
+direction-1-results.md round 5).
+"""
+def extract_identifiers(text: str, min_len: int = 6) -> list[str] {
+    idents = re.findall(
+        r"[A-Za-z_][A-Za-z0-9_]{" + str(min_len - 1) + r",}",
+        text
+    );
+    caps = re.findall(r"\b[A-Z][A-Z0-9_]{3,}\b", text);
+    seen: dict = {};
+    out: list[str] = [];
+    for x in idents + caps {
+        if x not in seen {
+            seen[x] = True;
+            out.append(x);
+        }
+    }
+    return out;
+}
+
+
+"""Update reference signals on the given graph after an assistant
+message is produced. Walks visible MemoryToolResult nodes from earlier
+turns and increments `reference_count` + `last_referenced_at` whenever
+any of the result's distinctive identifiers appear as substrings in
+the new assistant text. When the corresponding assistant
+MemoryMessage at `current_turn` is found on the graph, also creates a
+`ReferencedBy(cite_turn=current_turn)` edge from it to each matched
+MemoryToolResult — letting downstream walkers see the actual citation
+topology, not just per-node counters. Returns the count of tool results
+that got credit this call.
+
+This is a free function (rather than a method on MemoryPolicy) so the
+loop can call it once per turn regardless of whether a policy is
+attached — reference signal is useful purely for telemetry too.
+"""
+def record_references_from_text(
+    graph: MemoryGraph, assistant_text: str, current_turn: int
+) -> int {
+    if not assistant_text {
+        return 0;
+    }
+    # Locate the assistant MemoryMessage we'll attach citation edges from.
+    # The append-only graph means "the most recent assistant message at
+    # current_turn" is the one record_message just produced.
+    cite_source: MemoryMessage | None = None;
+    for m in [graph -->][?:MemoryMessage] {
+        if m.role == "assistant" and m.turn == current_turn {
+            cite_source = m;
+        }
+    }
+
+    detections = 0;
+    for tr in [graph -->](?:MemoryToolResult) {
+        if tr.produced_at_turn >= current_turn {
+            continue;
+        }
+        idents = extract_identifiers(tr.full_content);
+        hit = False;
+        for ident in idents {
+            if len(ident) >= 6 and ident in assistant_text {
+                hit = True;
+                break;
+            }
+        }
+        if hit {
+            tr.reference_count += 1;
+            tr.last_referenced_at = time.time();
+            detections += 1;
+            if cite_source is not None {
+                cite_source +>:ReferencedBy(cite_turn=current_turn):+> tr;
+            }
+        }
+    }
+    return detections;
+}
+
+
+"""Reference-aware memory policy.
+
+Inherits AgePolicy's compaction behavior. Overrides `should_prune` and
+`select_eviction` to score visible MemoryToolResults on
+(reference_count, recency, age, size) and pick eviction order from
+lowest-score upward. Stops eviction as soon as the visible tool-result
+fill drops below `target_ratio * usable_budget_tokens` — the
+`<=` early-stop variant proven in direction-1-results.md round 6.
+
+Calibrated weights and behavior match the research-agent baseline that
+produced 0/3 → 3/3 recall improvement at OVERFLOW_USABLE_TOKENS=3000.
+"""
+obj ReferenceAwarePolicy(AgePolicy) {
+    has weight_ref_count: float = 10.0,
+        weight_recency: float = 1.0,
+        weight_age: float = -1.0,
+        weight_size: float = -0.5,
+        soft_threshold_ratio: float = 0.3,
+        hard_threshold_ratio: float = 0.5,
+        target_ratio: float = 0.5,
+        keep_last_turns: int = 1,
+        soft_head_chars: int = 1500,
+        soft_tail_chars: int = 1500;
+
+    override def should_prune(graph: MemoryGraph, mt_run: object) -> bool;
+    override def select_eviction(
+        graph: MemoryGraph, mt_run: object
+    ) -> list[EvictionDecision];
+
+    def _score(tr: MemoryToolResult, current_turn: int) -> float;
+}
+
+
+impl ReferenceAwarePolicy.should_prune(graph: MemoryGraph, mt_run: object) -> bool {
+    if self.usable_budget_tokens <= 0 {
+        return False;
+    }
+    total_tokens = 0;
+    for m in [graph -->](?:MemoryMessage) {
+        if m.visible {
+            total_tokens += m.token_estimate;
+        }
+    }
+    for tr in [graph -->](?:MemoryToolResult) {
+        if tr.visible {
+            total_tokens += len(tr.visible_content) // 4;
+        }
+    }
+    fill_ratio = total_tokens / float(self.usable_budget_tokens);
+    return fill_ratio >= self.soft_threshold_ratio;
+}
+
+
+impl ReferenceAwarePolicy._score(
+    tr: MemoryToolResult, current_turn: int
+) -> float {
+    age = float(current_turn - tr.produced_at_turn);
+    size_tokens = float(len(tr.visible_content) // 4);
+    recency = 1.0 if tr.last_referenced_at > 0.0 else 0.0;
+    return (
+        self.weight_ref_count * float(tr.reference_count)
+        + self.weight_recency * recency
+        + self.weight_age * age
+        + self.weight_size * (size_tokens / 1000.0)
+    );
+}
+
+
+impl ReferenceAwarePolicy.select_eviction(
+    graph: MemoryGraph, mt_run: object
+) -> list[EvictionDecision] {
+    keep_floor = graph.turn_count - self.keep_last_turns;
+    candidates = [
+        tr for tr in [graph -->](?:MemoryToolResult)
+        if tr.visible
+            and tr.truncation_state != "hard_cleared"
+            and tr.produced_at_turn <= keep_floor
+    ];
+    current_turn = graph.turn_count;
+    candidates.sort(
+        key=lambda tr: MemoryToolResult : self._score(tr, current_turn)
+    );
+
+    # Compute starting tool-result token total and evict-mode threshold.
+    running_tool_tokens = 0;
+    total_tokens = 0;
+    for tr_all in [graph -->](?:MemoryToolResult) {
+        if tr_all.visible {
+            tk = len(tr_all.visible_content) // 4;
+            running_tool_tokens += tk;
+            total_tokens += tk;
+        }
+    }
+    for m in [graph -->](?:MemoryMessage) {
+        if m.visible {
+            total_tokens += m.token_estimate;
+        }
+    }
+    fill_ratio = (
+        total_tokens / float(self.usable_budget_tokens)
+            if self.usable_budget_tokens > 0
+            else 0.0
+    );
+    hard_mode = fill_ratio >= self.hard_threshold_ratio;
+    target = int(self.target_ratio * float(self.usable_budget_tokens));
+
+    decisions: list[EvictionDecision] = [];
+    for tr in candidates {
+        # Early-stop: stop evicting once tool-result fill is at or below
+        # target. The `<=` (not `<`) is load-bearing — round 6 finding.
+        if running_tool_tokens <= target {
+            break;
+        }
+        before = len(tr.visible_content) // 4;
+        kind = "hard_clear" if hard_mode else "soft_trim";
+        decisions.append(EvictionDecision(
+            tool_result=tr,
+            kind=kind,
+            head_chars=self.soft_head_chars,
+            tail_chars=self.soft_tail_chars
+        ));
+        # Estimate post-decision visible tokens (placeholder ≈ 8 tokens
+        # for hard, head+tail+marker ≈ before for tiny soft trims).
+        if kind == "hard_clear" {
+            running_tool_tokens -= max(0, before - 8);
+        } else {
+            cap = self.soft_head_chars + self.soft_tail_chars;
+            cur_chars = len(tr.visible_content);
+            if cur_chars > cap {
+                trimmed_tokens = (cap + 25) // 4;
+                running_tool_tokens -= max(0, before - trimmed_tokens);
+            }
+        }
+    }
+    return decisions;
 }
 
 

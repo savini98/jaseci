@@ -366,6 +366,11 @@ impl BaseLLM.invoke(mt_run: MTRuntime) -> object {
                 turn=graph.turn_count,
                 content=result
             );
+            # Stage 4 reference detection: scan the assistant text for
+            # identifiers from prior tool results and bump their
+            # ref_count + last_referenced_at. Drives ReferenceAwarePolicy's
+            # eviction order on the next call.
+            record_references_from_text(graph, result, graph.turn_count);
         }
         return result;
     } finally {
@@ -414,6 +419,22 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
     just_compacted = False;
     while True {
         iter_count += 1;
+        # Stage 4: pre-LLM-call pruning dispatch. When a MemoryPolicy is
+        # wired, ask it whether to prune and apply any returned eviction
+        # decisions before the next dispatch. Skipped on iteration 1 (no
+        # prior history to act on) so first-turn behavior matches today's.
+        _mem_policy = mt_run.memory_policy;
+        _mem_graph = mt_run.memory;
+        if (
+            _mem_policy is not None
+            and _mem_graph is not None
+            and iter_count > 1
+            and _mem_policy.should_prune(_mem_graph, mt_run)
+        ) {
+            for _decision in _mem_policy.select_eviction(_mem_graph, mt_run) {
+                apply_eviction_decision(_decision);
+            }
+        }
         if on_iteration and iter_count > 1 {
             ctx = IterationContext(
                 iteration=iter_count,
@@ -1040,6 +1061,15 @@ impl BaseLLM._stream_final_answer(mt_run: MTRuntime) -> Generator[str, None, Non
             mt_run.add_message(
                 Message(role=MessageRole.ASSISTANT, content=accumulated)
             );
+            # Reference detection (parity with non-streaming invoke()).
+            # Bumps reference_count + last_referenced_at on prior tool
+            # results whose identifiers appear in the final assistant text.
+            graph = mt_run.memory;
+            if graph is not None {
+                record_references_from_text(
+                    graph, accumulated, graph.turn_count
+                );
+            }
         }
     }
 }
@@ -1151,6 +1181,22 @@ impl BaseLLM._invoke_streaming(
         just_compacted = False;
         while True {
             iter_count += 1;
+            # Stage 4 prune dispatch (mirrors _invoke_react_loop). The
+            # streaming variant pays the same policy at the same
+            # boundary so eval results don't depend on whether the
+            # caller asked for `logging=True`.
+            _mem_policy_s = mt_run.memory_policy;
+            _mem_graph_s = mt_run.memory;
+            if (
+                _mem_policy_s is not None
+                and _mem_graph_s is not None
+                and iter_count > 1
+                and _mem_policy_s.should_prune(_mem_graph_s, mt_run)
+            ) {
+                for _decision_s in _mem_policy_s.select_eviction(_mem_graph_s, mt_run) {
+                    apply_eviction_decision(_decision_s);
+                }
+            }
 
             if on_iteration and iter_count > 1 {
                 ctx = IterationContext(
