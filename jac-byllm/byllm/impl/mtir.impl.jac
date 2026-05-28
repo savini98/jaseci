@@ -222,11 +222,11 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
     if isinstance(conv_arg, list) {
         conv_list_ref = conv_arg;
         for item in conv_arg {
-            m: Any = item;
+            m: any = item;
             if isinstance(m, Message) {
                 conv_msgs.append(m);
             } elif isinstance(m, dict) {
-                reconstructed: Any = Message.from_dict(m);
+                reconstructed: any = Message.from_dict(m);
                 conv_msgs.append(reconstructed);
             } else {
                 conv_msgs.append(m);
@@ -252,19 +252,16 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
     # Prepare return type.
     return_type = get_type_hints(caller).get("return");
     is_streaming = bool(call_params.get("stream", False));
-    # Typed+streaming flow:
-    #
-    # - Without tools: dispatch_streaming sends `response_format` straight
-    #   to the provider, the model emits structured JSON, and
-    #   StreamingFieldExtractor surfaces tokens from the designated text
-    #   field while the rest of the JSON is buffered for full parsing on
-    #   completion.
-    # - With tools: the ReAct loop runs as usual; finish_tool is still
-    #   injected so the loop has a clean termination signal. When
-    #   finish_tool fires, `_stream_final_answer` detects typed mode and
-    #   makes a streaming follow-up call with tools cleared (so the model
-    #   produces structured JSON via response_format) — that follow-up is
-    #   what gets streamed token-by-token.
+    if is_streaming
+    and return_type is not str
+    and call_params.get("stream_handler") is None {
+        raise ConfigurationError(
+            "Streaming responses are only supported for str return types. "
+            "Pass a stream_handler to receive stream events for a structured "
+            "return type (e.g. `visit [-->] by model(stream=True, "
+            "stream_handler=fn)`)."
+        );
+    }
     if len(tools) > 0 {
         finish_tool = Tool.make_finish_tool(return_type or str);
         tools.append(finish_tool);
@@ -428,7 +425,7 @@ impl MTRuntime.write_back_conversation -> None {
     }
     out: list = [];
     for msg in self.get_history_for_persist() {
-        m: Any = msg;
+        m: any = msg;
         if hasattr(m, "to_dict") {
             out.append(m.to_dict());
         } elif isinstance(m, dict) {
@@ -446,7 +443,7 @@ impl MTRuntime.write_back_conversation -> None {
 
 
 # Test against finish_tool both at object level and dict level.
-def _is_finish_tool_call(tc: Any) -> bool {
+def _is_finish_tool_call(tc: any) -> bool {
     if tc?.function and hasattr(tc.function, "name") {
         return tc.function.name == "finish_tool";
     }
@@ -547,4 +544,8 @@ impl MTRuntime.get_output_schema -> dict | None {
     # If the are tools, the final output will be sent to the finish_tool
     # thus there is no output schema.
     return None;
+}
+
+impl MTIR.runtime.getter -> MTRuntime {
+    return MTRuntime.factory(self);
 }

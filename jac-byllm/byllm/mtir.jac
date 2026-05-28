@@ -31,10 +31,7 @@ obj MTIR {
         call_params: dict[(str, object)],
         ir_info: Info;
 
-    @property
-    def runtime -> MTRuntime {
-        return MTRuntime.factory(self);
-    }
+    has runtime: MTRuntime { getter; }
 }
 
 """Runtime context for LLM interactions.
@@ -68,7 +65,12 @@ obj MTRuntime {
         # materialization. Set from `Context.policy` in the factory.
         # When non-None, byLLM dispatches to it at iteration boundaries
         # instead of running its own inline compaction logic.
-        context_policy: ContextPolicy | None = None;
+        context_policy: ContextPolicy | None = None,
+        # Structured final value captured during a streamed ReAct loop so a
+        # handler-driven invoke can return the parsed result after the event
+        # stream is fully consumed.
+        _final_output: object = None,
+        _has_final_output: bool = False;
 
     static def factory(mtir: MTIR) -> MTRuntime;
     def dispatch_params -> dict[str, object];
