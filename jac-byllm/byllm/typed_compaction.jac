@@ -21,11 +21,11 @@ typed compaction.
 """
 
 import time;
-import from byllm.memory {
-    MemoryGraph,
-    MemoryToolResult,
-    MemoryMessage,
-    MemoryCompactionSummary,
+import from byllm.context {
+    ContextGraph,
+    ContextToolResult,
+    ContextMessage,
+    ContextCompactionSummary,
     AgePolicy
 }
 
@@ -84,7 +84,7 @@ not lose entries that were in previous_slots).""";
 
 """Render a CompactionSlots into a human-readable block of text. The
 slot data is what later turns rely on for recall; the rendered text is
-what goes into MemoryCompactionSummary.summary_text. The shape is
+what goes into ContextCompactionSummary.summary_text. The shape is
 deliberately mechanical so a downstream `materialize` hook (planned)
 can re-parse it if it ever needs to."""
 def render_compaction_slots(slots: CompactionSlots) -> str {
@@ -126,7 +126,7 @@ Subclasses AgePolicy: inherits the `should_compact` fill-threshold
 trigger and the same selection (everything older than
 preserve_recent_turns), but replaces the free-form `compact` with an
 LLM-backed extraction into CompactionSlots. The rendered slots become
-the summary_text of the new MemoryCompactionSummary node. Compacted
+the summary_text of the new ContextCompactionSummary node. Compacted
 originals are hidden as in AgePolicy.
 
 Fail-soft: if the LLM extraction raises, we write a placeholder
@@ -135,24 +135,24 @@ compaction.
 """
 obj TypedSlotCompactionPolicy(AgePolicy) {
     override def compact(
-        graph: MemoryGraph, mt_run: object
-    ) -> MemoryCompactionSummary | None;
+        graph: ContextGraph, mt_run: object
+    ) -> ContextCompactionSummary | None;
 }
 
 
 impl TypedSlotCompactionPolicy.compact(
-    graph: MemoryGraph, mt_run: object
-) -> MemoryCompactionSummary | None {
+    graph: ContextGraph, mt_run: object
+) -> ContextCompactionSummary | None {
     cutoff = graph.turn_count - self.preserve_recent_turns;
     if cutoff <= 0 {
         return None;
     }
     msgs_to_compact = [
-        m for m in [graph -->][?:MemoryMessage]
+        m for m in [graph -->][?:ContextMessage]
         if m.visible and m.turn <= cutoff
     ];
     trs_to_compact = [
-        tr for tr in [graph -->][?:MemoryToolResult]
+        tr for tr in [graph -->][?:ContextToolResult]
         if tr.visible and tr.produced_at_turn <= cutoff
     ];
     if not msgs_to_compact and not trs_to_compact {
@@ -177,9 +177,9 @@ impl TypedSlotCompactionPolicy.compact(
     items.sort(key=lambda x: dict : x["turn"]);
 
     prior_visible = [
-        s for s in [graph -->][?:MemoryCompactionSummary] if s.visible
+        s for s in [graph -->][?:ContextCompactionSummary] if s.visible
     ];
-    prior_node: MemoryCompactionSummary | None = None;
+    prior_node: ContextCompactionSummary | None = None;
     if prior_visible {
         prior_node = prior_visible[-1];
     }
@@ -202,7 +202,7 @@ impl TypedSlotCompactionPolicy.compact(
     ];
     covers_start = min(turn_starts) if turn_starts else 0;
 
-    summary = MemoryCompactionSummary(
+    summary = ContextCompactionSummary(
         generated_at=time.time(),
         covers_turn_start=covers_start,
         covers_turn_end=cutoff,

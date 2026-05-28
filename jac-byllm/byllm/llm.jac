@@ -46,13 +46,13 @@ import from byllm.streaming_parser {
     StructuredStream,
     resolve_streaming_text_field
 }
-import from byllm.memory {
-    Memory,
-    MemoryGraph,
-    MemoryToolResult,
-    MemoryMessage,
-    MemoryCompactionSummary,
-    MemoryPolicy,
+import from byllm.context {
+    Context,
+    ContextGraph,
+    ContextToolResult,
+    ContextMessage,
+    ContextCompactionSummary,
+    ContextPolicy,
     AgePolicy,
     ReferenceAwarePolicy,
     EvictionDecision,

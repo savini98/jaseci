@@ -2,22 +2,22 @@
 threshold is met, and is a no-op otherwise.
 
 Validates:
-- Memory(policy=AgePolicy(...)) plumbs the policy into the loop
+- Context(policy=AgePolicy(...)) plumbs the policy into the loop
 - AgePolicy.should_compact returns True when fill ratio >= threshold
-- AgePolicy.compact creates a MemoryCompactionSummary node and hides
-  the compacted MemoryMessage / MemoryToolResult nodes
+- AgePolicy.compact creates a ContextCompactionSummary node and hides
+  the compacted ContextMessage / ContextToolResult nodes
 - preserve_recent_turns protects the most recent items
 - Without a policy: existing Stage 2 behavior is unchanged (no summary
   nodes appear)
 """
 
 import from byllm.lib { Model, MockToolCall }
-import from byllm.memory {
-    Memory,
-    MemoryGraph,
-    MemoryToolResult,
-    MemoryMessage,
-    MemoryCompactionSummary,
+import from byllm.context {
+    Context,
+    ContextGraph,
+    ContextToolResult,
+    ContextMessage,
+    ContextCompactionSummary,
     AgePolicy
 }
 
@@ -30,7 +30,7 @@ def fetch_status() -> str {
 
 
 # Aggressive policy: 200-token budget, 50% threshold, preserve_recent=1.
-glob policy_mem = Memory(
+glob policy_ctx = Context(
     persist=True,
     policy=AgePolicy(
         usable_budget_tokens=200,
@@ -38,7 +38,7 @@ glob policy_mem = Memory(
         preserve_recent_turns=1
     )
 );
-glob bare_mem = Memory(persist=True);
+glob bare_ctx = Context(persist=True);
 
 
 glob llm = Model(
@@ -64,26 +64,26 @@ glob llm = Model(
 
 
 def with_policy(query: str) -> str by llm(
-    tools=[fetch_status], memory=policy_mem
+    tools=[fetch_status], context=policy_ctx
 );
 
 def no_policy(query: str) -> str by llm(
-    tools=[fetch_status], memory=bare_mem
+    tools=[fetch_status], context=bare_ctx
 );
 
 
 with entry {
-    print("=== Stage 3: MemoryPolicy + AgePolicy ===\n");
+    print("=== Stage 3: ContextPolicy + AgePolicy ===\n");
 
     # ---- With AgePolicy: compaction should fire by turn 2 ----
     with_policy("status?");
     with_policy("status again?");
-    pg = policy_mem.graph;
-    pol_summaries = [s for s in [pg -->](?:MemoryCompactionSummary)];
-    pol_visible_msgs = [m for m in [pg -->](?:MemoryMessage) if m.visible];
-    pol_invisible_msgs = [m for m in [pg -->](?:MemoryMessage) if not m.visible];
-    pol_visible_trs = [tr for tr in [pg -->](?:MemoryToolResult) if tr.visible];
-    pol_invisible_trs = [tr for tr in [pg -->](?:MemoryToolResult) if not tr.visible];
+    pg = policy_ctx.graph;
+    pol_summaries = [s for s in [pg -->](?:ContextCompactionSummary)];
+    pol_visible_msgs = [m for m in [pg -->](?:ContextMessage) if m.visible];
+    pol_invisible_msgs = [m for m in [pg -->](?:ContextMessage) if not m.visible];
+    pol_visible_trs = [tr for tr in [pg -->](?:ContextToolResult) if tr.visible];
+    pol_invisible_trs = [tr for tr in [pg -->](?:ContextToolResult) if not tr.visible];
 
     print(f"with-policy: turn_count={pg.turn_count}");
     print(f"  CompactionSummaries:        {len(pol_summaries)}");
@@ -95,10 +95,10 @@ with entry {
     # ---- Without policy: regression — no summaries, nothing hidden ----
     no_policy("bare status?");
     no_policy("bare again?");
-    bg = bare_mem.graph;
-    bare_summaries = [s for s in [bg -->](?:MemoryCompactionSummary)];
-    bare_invisible_msgs = [m for m in [bg -->](?:MemoryMessage) if not m.visible];
-    bare_invisible_trs = [tr for tr in [bg -->](?:MemoryToolResult) if not tr.visible];
+    bg = bare_ctx.graph;
+    bare_summaries = [s for s in [bg -->](?:ContextCompactionSummary)];
+    bare_invisible_msgs = [m for m in [bg -->](?:ContextMessage) if not m.visible];
+    bare_invisible_trs = [tr for tr in [bg -->](?:ContextToolResult) if not tr.visible];
 
     print(f"\nno-policy: turn_count={bg.turn_count}");
     print(f"  CompactionSummaries:        {len(bare_summaries)}");

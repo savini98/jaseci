@@ -1,16 +1,16 @@
-"""Stage 2 smoke test: memory=Memory() populates a MemoryGraph that's
+"""Stage 2 smoke test: context=Context() populates a ContextGraph that's
 reachable from the caller after the LLM call.
 
 Validates:
-- After the call, mem.graph is a populated MemoryGraph node
-- The user message and assistant message are recorded as MemoryMessage nodes
-- Tool calls are recorded as MemoryToolResult nodes with stable tr_ids
+- After the call, ctx.graph is a populated ContextGraph node
+- The user message and assistant message are recorded as ContextMessage nodes
+- Tool calls are recorded as ContextToolResult nodes with stable tr_ids
 - persist=False produces a fresh graph on the second call
 - persist=True keeps the graph alive across calls
 """
 
 import from byllm.lib { Model, MockToolCall }
-import from byllm.memory { Memory, MemoryGraph, MemoryToolResult, MemoryMessage }
+import from byllm.context { Context, ContextGraph, ContextToolResult, ContextMessage }
 
 
 def fetch_status() -> str {
@@ -34,47 +34,47 @@ glob llm = Model(
 );
 
 
-glob persistent_mem = Memory(persist=True);
-glob fresh_mem = Memory(persist=False);
+glob persistent_ctx = Context(persist=True);
+glob fresh_ctx = Context(persist=False);
 
 
 def check_status_persistent(query: str) -> str by llm(
-    tools=[fetch_status], memory=persistent_mem
+    tools=[fetch_status], context=persistent_ctx
 );
 
 def check_status_fresh(query: str) -> str by llm(
-    memory=fresh_mem
+    context=fresh_ctx
 );
 
 
 with entry {
-    print("=== Stage 2: memory=Memory() populates MemoryGraph ===\n");
+    print("=== Stage 2: context=Context() populates ContextGraph ===\n");
 
     # ---- First persistent call: tool fires + final answer ----
     r1 = check_status_persistent("status?");
     print(f"call 1 result: {r1!r}");
-    g1 = persistent_mem.graph;
+    g1 = persistent_ctx.graph;
     print(f"call 1 graph turn_count={g1.turn_count}");
 
     # Walk the graph for tool results and messages.
-    tool_results_1 = [tr for tr in [g1 -->](?:MemoryToolResult)];
-    messages_1 = [m for m in [g1 -->](?:MemoryMessage)];
+    tool_results_1 = [tr for tr in [g1 -->](?:ContextToolResult)];
+    messages_1 = [m for m in [g1 -->](?:ContextMessage)];
     tool_ids_1 = [tr.tr_id for tr in tool_results_1];
     print(f"call 1 tool_results: {tool_ids_1}");
     print(f"call 1 message count: {len(messages_1)}");
 
     # ---- Second persistent call: no tool, but graph should be reused ----
     r2 = check_status_persistent("again");
-    g2 = persistent_mem.graph;
+    g2 = persistent_ctx.graph;
     print(f"\ncall 2 result: {r2!r}");
     print(f"call 2 graph is same object: {g2 is g1}");
     print(f"call 2 graph turn_count={g2.turn_count}");
-    messages_2 = [m for m in [g2 -->](?:MemoryMessage)];
+    messages_2 = [m for m in [g2 -->](?:ContextMessage)];
     print(f"call 2 cumulative message count: {len(messages_2)}");
 
     # ---- Fresh-mode call: separate graph, NOT same node ----
     r3 = check_status_fresh("fresh");
-    g3 = fresh_mem.graph;
+    g3 = fresh_ctx.graph;
     print(f"\ncall 3 (fresh) result: {r3!r}");
     print(f"call 3 graph is distinct from persistent: {g3 is not g1}");
 
@@ -87,7 +87,7 @@ with entry {
         print("FAIL  persist=True did not preserve graph identity");
     }
     if len(tool_results_1) >= 1 {
-        print("PASS  tool result recorded as MemoryToolResult");
+        print("PASS  tool result recorded as ContextToolResult");
     } else {
         failures += 1;
         print(f"FAIL  expected ≥1 tool result, got {len(tool_results_1)}");

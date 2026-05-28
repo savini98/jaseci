@@ -1,19 +1,19 @@
 """Stage 4 smoke test: ReferenceAwarePolicy preserves high-ref content
 while evicting low-ref content of the same age and size.
 
-Two MemoryToolResult nodes are created with identical age and size.
+Two ContextToolResult nodes are created with identical age and size.
 One gets a ref_count bump (simulating that the assistant cited its
 content). With ReferenceAwarePolicy, the unreferenced one should be
 evicted first; the referenced one should survive.
 
 Tests the policy logic directly (no LLM call needed) by constructing a
-small MemoryGraph manually and asking the policy what to evict.
+small ContextGraph manually and asking the policy what to evict.
 """
 
-import from byllm.memory {
-    Memory,
-    MemoryGraph,
-    MemoryToolResult,
+import from byllm.context {
+    Context,
+    ContextGraph,
+    ContextToolResult,
     ReferenceAwarePolicy,
     EvictionDecision,
     apply_eviction_decision
@@ -24,13 +24,13 @@ with entry {
     print("=== Stage 4: ReferenceAwarePolicy preserves cited content ===\n");
 
     # Build a graph with two tool results, same age + size.
-    g = MemoryGraph(session_id="s4", created_at=0.0, turn_count=5);
+    g = ContextGraph(session_id="s4", created_at=0.0, turn_count=5);
 
     # Roughly 1000 chars each ⇒ ~250 tokens visible. Two of these put
     # tool-result tokens at ~500, comfortably above policy.target.
     big_content = "alpha\nbeta\ngamma\n" + ("x" * 950);
 
-    high_ref = MemoryToolResult(
+    high_ref = ContextToolResult(
         tr_id="tr_1_high",
         tool_name="fetch_high",
         full_content=big_content,
@@ -39,7 +39,7 @@ with entry {
         reference_count=8,
         last_referenced_at=1.0
     );
-    low_ref = MemoryToolResult(
+    low_ref = ContextToolResult(
         tr_id="tr_1_low",
         tool_name="fetch_low",
         full_content=big_content,
@@ -76,7 +76,7 @@ with entry {
     for d in decisions {
         apply_eviction_decision(d);
     }
-    survivors = [tr.tr_id for tr in [g -->](?:MemoryToolResult) if tr.truncation_state != "hard_cleared" and len(tr.visible_content) > 100];
+    survivors = [tr.tr_id for tr in [g -->](?:ContextToolResult) if tr.truncation_state != "hard_cleared" and len(tr.visible_content) > 100];
     print(f"\nsurvivors (still visible with content): {survivors}");
 
     failures = 0;

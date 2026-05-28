@@ -5,13 +5,13 @@ summary that preserves verbatim numeric values — the failure mode that
 direction-1-results-v2.md Phase C.3 measured against the free-form
 AgePolicy.
 
-The fixture builds a MemoryGraph by hand (skipping the ReAct loop) so
+The fixture builds a ContextGraph by hand (skipping the ReAct loop) so
 the call to `policy.compact(graph, None)` is deterministic and the
 single LLM call we make is `extract_compaction_slots`. MockLLM is
 configured to return a pre-defined CompactionSlots instance that
 contains the planted numeric value verbatim — what we verify is that:
 
-- compact() returns a non-None MemoryCompactionSummary.
+- compact() returns a non-None ContextCompactionSummary.
 - The summary_text contains the planted value as a substring (so a
   later turn searching for the identifier would still find the
   number).
@@ -20,12 +20,12 @@ contains the planted numeric value verbatim — what we verify is that:
 
 import time;
 import from byllm.lib { Model }
-import from byllm.memory {
-    Memory,
-    MemoryGraph,
-    MemoryToolResult,
-    MemoryMessage,
-    MemoryCompactionSummary
+import from byllm.context {
+    Context,
+    ContextGraph,
+    ContextToolResult,
+    ContextMessage,
+    ContextCompactionSummary
 }
 import from byllm.typed_compaction {
     CompactionSlots,
@@ -59,10 +59,10 @@ glob llm = Model(
 with entry {
     print("=== Typed-slot compaction smoke test ===\n");
 
-    # Stand up a MemoryGraph manually with enough older content to
+    # Stand up a ContextGraph manually with enough older content to
     # compact. preserve_recent_turns=1 means anything at turn <=
     # turn_count - 1 is eligible.
-    graph = MemoryGraph(session_id="t1", created_at=time.time());
+    graph = ContextGraph(session_id="t1", created_at=time.time());
     root() ++> graph;
     graph.turn_count = 3;   # so turns 1 and 2 are eligible
 
@@ -88,10 +88,10 @@ with entry {
 
     # Sanity: before compaction, originals are visible.
     pre_visible_msgs = [
-        m for m in [graph -->][?:MemoryMessage] if m.visible
+        m for m in [graph -->][?:ContextMessage] if m.visible
     ];
     pre_visible_trs = [
-        tr for tr in [graph -->][?:MemoryToolResult] if tr.visible
+        tr for tr in [graph -->][?:ContextToolResult] if tr.visible
     ];
     print(
         f"pre: visible msgs={len(pre_visible_msgs)} "
@@ -115,13 +115,13 @@ with entry {
 
     # Re-check graph state.
     post_visible_msgs = [
-        m for m in [graph -->][?:MemoryMessage] if m.visible
+        m for m in [graph -->][?:ContextMessage] if m.visible
     ];
     post_visible_trs = [
-        tr for tr in [graph -->][?:MemoryToolResult] if tr.visible
+        tr for tr in [graph -->][?:ContextToolResult] if tr.visible
     ];
     summary_nodes = [
-        s for s in [graph -->][?:MemoryCompactionSummary]
+        s for s in [graph -->][?:ContextCompactionSummary]
     ];
     print(
         f"post: visible msgs={len(post_visible_msgs)} "
@@ -131,7 +131,7 @@ with entry {
     failures = 0;
 
     if summary is not None {
-        print("PASS  compact returned a MemoryCompactionSummary");
+        print("PASS  compact returned a ContextCompactionSummary");
     } else {
         failures += 1;
         print("FAIL  compact returned None");
@@ -165,7 +165,7 @@ with entry {
     }
 
     if len(post_visible_msgs) < len(pre_visible_msgs) {
-        print("PASS  some MemoryMessages were hidden by compaction");
+        print("PASS  some ContextMessages were hidden by compaction");
     } else {
         failures += 1;
         print(
@@ -175,7 +175,7 @@ with entry {
     }
 
     if len(post_visible_trs) < len(pre_visible_trs) {
-        print("PASS  some MemoryToolResults were hidden by compaction");
+        print("PASS  some ContextToolResults were hidden by compaction");
     } else {
         failures += 1;
         print(
@@ -185,7 +185,7 @@ with entry {
     }
 
     if len(summary_nodes) == 1 {
-        print("PASS  exactly one MemoryCompactionSummary node attached");
+        print("PASS  exactly one ContextCompactionSummary node attached");
     } else {
         failures += 1;
         print(

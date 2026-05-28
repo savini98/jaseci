@@ -352,14 +352,14 @@ impl BaseLLM.invoke(mt_run: MTRuntime) -> object {
     }
     try {
         result = self._invoke_react_loop(mt_run);
-        # Memory: capture the assistant's final reply into the graph.
+        # Context: capture the assistant's final reply into the graph.
         # Doing this here (rather than in MockLLM/dispatch_no_streaming)
         # avoids touching backward-compat assumptions test fixtures make
         # about MockLLM's message bookkeeping. Skipped when the caller
         # didn't opt into memory or the result isn't a plain string
         # (typed returns + streaming both populate streaming_result via
         # other paths).
-        graph = mt_run.memory;
+        graph = mt_run.context;
         if graph is not None and isinstance(result, str) {
             graph.record_message(
                 role="assistant",
@@ -419,12 +419,12 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
     just_compacted = False;
     while True {
         iter_count += 1;
-        # Stage 4: pre-LLM-call pruning dispatch. When a MemoryPolicy is
+        # Stage 4: pre-LLM-call pruning dispatch. When a ContextPolicy is
         # wired, ask it whether to prune and apply any returned eviction
         # decisions before the next dispatch. Skipped on iteration 1 (no
         # prior history to act on) so first-turn behavior matches today's.
-        _mem_policy = mt_run.memory_policy;
-        _mem_graph = mt_run.memory;
+        _mem_policy = mt_run.context_policy;
+        _mem_graph = mt_run.context;
         if (
             _mem_policy is not None
             and _mem_graph is not None
@@ -504,12 +504,12 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                 if isinstance(usage, dict)
                 else getattr(usage, "total_tokens", 0)
         );
-        # Stage 3: when a MemoryPolicy is wired through Memory, dispatch
+        # Stage 3: when a ContextPolicy is wired through Context, dispatch
         # to it for compaction decisions and bypass the framework's
         # threshold-based compaction. The policy mutates the graph
         # itself; we don't need to reach into mt_run.messages here.
-        policy = mt_run.memory_policy;
-        graph_for_policy = mt_run.memory;
+        policy = mt_run.context_policy;
+        graph_for_policy = mt_run.context;
         if policy is not None and graph_for_policy is not None {
             if policy.should_compact(graph_for_policy, mt_run) {
                 policy.compact(graph_for_policy, mt_run);
@@ -579,15 +579,20 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                         last_result = str(result_msg.content)[:500];
                         mt_run.add_message(result_msg);
                         # Auto-record into the memory graph when the
-                        # caller opted in via memory=Memory(...).
-                        graph = mt_run.memory;
+                        # caller opted in via context=Context(...).
+                        # call_id carries the tool_use_id forward so
+                        # materialize() can pair this tool result back
+                        # to the originating tool_use block when it
+                        # rebuilds the LLM message list.
+                        graph = mt_run.context;
                         if graph is not None {
                             graph.record_tool_result(
                                 tool_name=last_tool,
                                 args=btc.args,
                                 full_content=str(result_msg.content),
                                 visible_content=str(result_msg.content),
-                                turn=graph.turn_count
+                                turn=graph.turn_count,
+                                call_id=btc.call_id
                             );
                         }
                     }
@@ -1068,7 +1073,7 @@ impl BaseLLM._stream_final_answer(mt_run: MTRuntime) -> Generator[str, None, Non
             # Reference detection (parity with non-streaming invoke()).
             # Bumps reference_count + last_referenced_at on prior tool
             # results whose identifiers appear in the final assistant text.
-            graph = mt_run.memory;
+            graph = mt_run.context;
             if graph is not None {
                 record_references_from_text(
                     graph, accumulated, graph.turn_count
@@ -1189,8 +1194,8 @@ impl BaseLLM._invoke_streaming(
             # streaming variant pays the same policy at the same
             # boundary so eval results don't depend on whether the
             # caller asked for `logging=True`.
-            _mem_policy_s = mt_run.memory_policy;
-            _mem_graph_s = mt_run.memory;
+            _mem_policy_s = mt_run.context_policy;
+            _mem_graph_s = mt_run.context;
             if (
                 _mem_policy_s is not None
                 and _mem_graph_s is not None
@@ -1297,10 +1302,10 @@ impl BaseLLM._invoke_streaming(
                     else getattr(usage, "total_tokens", 0)
             );
             # Stage 3 policy dispatch (mirrors invoke()): when a
-            # MemoryPolicy is wired, route compaction through it; the
+            # ContextPolicy is wired, route compaction through it; the
             # framework's threshold-based path is bypassed for this turn.
-            policy = mt_run.memory_policy;
-            graph_for_policy = mt_run.memory;
+            policy = mt_run.context_policy;
+            graph_for_policy = mt_run.context;
             if policy is not None and graph_for_policy is not None {
                 if policy.should_compact(graph_for_policy, mt_run) {
                     policy.compact(graph_for_policy, mt_run);
@@ -1426,14 +1431,15 @@ impl BaseLLM._invoke_streaming(
                         for i in range(len(batch)) {
                             (btc_m, result_msg_m, _) = ordered[i];
                             mt_run.add_message(result_msg_m);
-                            graph = mt_run.memory;
+                            graph = mt_run.context;
                             if graph is not None {
                                 graph.record_tool_result(
                                     tool_name=btc_m.tool.get_name(),
                                     args=btc_m.args,
                                     full_content=str(result_msg_m.content),
                                     visible_content=str(result_msg_m.content),
-                                    turn=graph.turn_count
+                                    turn=graph.turn_count,
+                                    call_id=btc_m.call_id
                                 );
                             }
                         }

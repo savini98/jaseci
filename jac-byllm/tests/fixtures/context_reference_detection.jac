@@ -5,8 +5,8 @@ Validates the post-Stage-3 fixes:
 - After an assistant turn, `record_references_from_text` bumps
   `reference_count` and `last_referenced_at` on prior tool results whose
   identifiers appear in the assistant text.
-- A `ReferencedBy` edge is created from the assistant MemoryMessage to
-  each matched MemoryToolResult (citation topology, not just counters).
+- A `ReferencedBy` edge is created from the assistant ContextMessage to
+  each matched ContextToolResult (citation topology, not just counters).
 - A second turn that does NOT mention prior identifiers leaves the
   reference signal untouched.
 
@@ -22,10 +22,10 @@ Direction 1 result on upstreamed code.
 """
 
 import from byllm.lib { Model, MockToolCall }
-import from byllm.memory {
-    Memory,
-    MemoryToolResult,
-    MemoryMessage,
+import from byllm.context {
+    Context,
+    ContextToolResult,
+    ContextMessage,
     ReferencedBy
 }
 
@@ -41,7 +41,7 @@ def fetch_settings() -> str {
 }
 
 
-glob mem = Memory(persist=True);
+glob ctx = Context(persist=True);
 
 
 glob llm = Model(
@@ -68,11 +68,11 @@ glob llm = Model(
 
 
 def investigate(query: str) -> str by llm(
-    tools=[fetch_settings], memory=mem
+    tools=[fetch_settings], context=ctx
 );
 
 
-def follow_up(query: str) -> str by llm(memory=mem);
+def follow_up(query: str) -> str by llm(context=ctx);
 
 
 with entry {
@@ -80,19 +80,19 @@ with entry {
 
     # ---- Turn 1: tool fires, assistant text has no identifiers ----
     investigate("what's in settings?");
-    g = mem.graph;
+    g = ctx.graph;
     if g is None {
-        raise AssertionError("Memory graph was not initialised");
+        raise AssertionError("Context graph was not initialised");
     }
 
-    settings_tr: MemoryToolResult | None = None;
-    for tr in [g -->][?:MemoryToolResult] {
+    settings_tr: ContextToolResult | None = None;
+    for tr in [g -->][?:ContextToolResult] {
         if tr.tool_name == "fetch_settings" {
             settings_tr = tr;
         }
     }
     if settings_tr is None {
-        raise AssertionError("expected a fetch_settings MemoryToolResult");
+        raise AssertionError("expected a fetch_settings ContextToolResult");
     }
 
     print(
@@ -108,15 +108,15 @@ with entry {
     );
 
     # Locate the assistant message that did the citing (turn == 2).
-    turn2_asst: MemoryMessage | None = None;
-    for m in [g -->][?:MemoryMessage] {
+    turn2_asst: ContextMessage | None = None;
+    for m in [g -->][?:ContextMessage] {
         if m.role == "assistant" and m.turn == 2 {
             turn2_asst = m;
         }
     }
-    edge_targets_t2: list[MemoryToolResult] = [];
+    edge_targets_t2: list[ContextToolResult] = [];
     if turn2_asst is not None {
-        for tr in [turn2_asst ->:ReferencedBy:->][?:MemoryToolResult] {
+        for tr in [turn2_asst ->:ReferencedBy:->][?:ContextToolResult] {
             edge_targets_t2.append(tr);
         }
     }
