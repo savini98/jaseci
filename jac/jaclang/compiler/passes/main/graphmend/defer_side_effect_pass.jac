@@ -27,7 +27,8 @@ import from jaclang.jac0core.constant { Tokens as Tok }
 
 """Defer print/logger side effects to a post-graph buffer flush."""
 obj DeferSideEffectPass(UniPass) {
-    has _enabled: bool = False;
+    has _enabled: bool = False,
+        _counter: int = 0;
 
     """Gate the pass on the --graphmend flag."""
     def before_pass {
@@ -59,7 +60,13 @@ obj DeferSideEffectPass(UniPass) {
         ability._gm_needs_se = True;
     }
 
-    """Flush the buffer before any return inside a buffering function."""
+    """Flush the buffer before any return inside a buffering function.
+
+    A `return <expr>` is rewritten to `__gm_ret = <expr>; flush(); return __gm_ret`
+    so the return value's computation runs BEFORE the flush. This keeps the
+    flush (a trailing eager epilogue) after all tensor compute, so the compiled
+    graph stays contiguous instead of splitting before the return expression.
+    """
     def exit_return_stmt(nd: uni.ReturnStmt) -> None {
         if not self._enabled {
             return;
@@ -68,6 +75,20 @@ obj DeferSideEffectPass(UniPass) {
         if (ability is None) or (not getattr(ability, '_gm_needs_se', False)) {
             return;
         }
+        if nd.expr is None {
+            self._insert_before(nd, self._flush_stmt(nd));
+            return;
+        }
+        n = self._counter;
+        self._counter += 1;
+        tmp = self._gen_name(nd, f"__gm_ret_{n}", True);
+        ret_assign = uni.Assignment(
+            target=[tmp], value=nd.expr, type_tag=None, mutable=True, kid=[tmp, nd.expr]
+        );
+        ref = self._gen_name(nd, f"__gm_ret_{n}", False);
+        nd.expr = ref;
+        nd.set_kids([ref]);
+        self._insert_before(nd, ret_assign);
         self._insert_before(nd, self._flush_stmt(nd));
     }
 

@@ -1,11 +1,12 @@
-"""Validation guard on a tensor-bool op (.all()): asserted directly via
-torch._assert_async (no Python-bool conversion needed)."""
+"""Validation guard between tensor ops: a tensor-bool guard (.all()) lowers to
+torch._assert_async, keeping the forward pass a single contiguous FX graph."""
 import torch;
 
 @torch.compile()
-def f(mask: any) -> any {
+def f(x: any, mask: any) -> any {
+    x = torch.relu(x);
     if not mask.all() {
         raise ValueError("mask must be all true");
     }
-    return mask;
+    return torch.sin(x) * 2.0;
 }

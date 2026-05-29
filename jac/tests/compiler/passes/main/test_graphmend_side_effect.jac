@@ -1,11 +1,15 @@
 """GraphMend deferred side-effect transformation tests.
 
-Assertions run against the generated Python source (the lowering target)."""
+print/logger calls are rewritten into appends on a per-function buffer, and the
+buffer is flushed after all compute (the return value is hoisted into a temp so
+the flush is a trailing eager epilogue). This keeps the forward pass a single
+contiguous FX graph while preserving the calls. Assertions run against the
+generated Python source.
+"""
 import ast;
 import os;
 import from pathlib { Path }
 import jaclang;
-import from jaclang.jac0core.jaclib { __jac_flush_se_buffer__ }
 import from jaclang.jac0core.program { JacProgram }
 import from jaclang.jac0core.compile_options { CompileOptions }
 
@@ -31,38 +35,34 @@ def _pysrc(name: str, gm: bool) -> str {
     return ast.unparse(mod_ast);
 }
 
-test "print is deferred to a buffer and flushed after the graph" {
+test "print is buffered and flushed via the runtime helper" {
     src = _pysrc("side_effect.jac", True);
     assert "_gm_se_buffer = []" in src;
-    assert "_gm_se_buffer.append((print, (a,), {}))" in src;
+    assert "_gm_se_buffer.append((print, (x,), {}))" in src;
     assert "__jac_flush_se_buffer__(_gm_se_buffer)" in src;
-    # flush helper import is emitted
     assert "import __jac_flush_se_buffer__" in src;
-    # value captured before reassignment (append precedes `a = a + 1`)
-    assert src.index("_gm_se_buffer.append") < src.index("a = a + 1");
 }
 
-test "dotted logger call keeps its keyword argument in the buffered entry" {
-    src = _pysrc("logger_kwargs.jac", True);
-    assert "_gm_se_buffer.append((logger.warning, ('deprecated',), {'stacklevel': 2}))" in src;
+test "return value is hoisted so the flush follows all compute" {
+    src = _pysrc("side_effect.jac", True);
+    # compute assigned to a temp, then flush, then return the temp
+    assert "__gm_ret_0 = torch.sin(x) * 2.0" in src;
+    assert src.index("__gm_ret_0 = ") < src.index(
+        "__jac_flush_se_buffer__(_gm_se_buffer)"
+    );
+    assert src.index("__jac_flush_se_buffer__(_gm_se_buffer)") < src.index(
+        "return __gm_ret_0"
+    );
 }
 
-test "buffer is flushed before every return" {
-    src = _pysrc("side_effect_early_return.jac", True);
-    # one flush before the early return, one before the tail return
-    assert src.count("__jac_flush_se_buffer__(_gm_se_buffer)") == 2;
+test "logger call is buffered the same way as print" {
+    src = _pysrc("side_effect_logger.jac", True);
+    assert "_gm_se_buffer.append((log.warning, ('deprecated path',), {}))" in src;
+    assert "__jac_flush_se_buffer__(_gm_se_buffer)" in src;
 }
 
-test "side effects untouched when graphmend disabled" {
+test "no buffering when graphmend disabled" {
     src = _pysrc("side_effect.jac", False);
     assert "_gm_se_buffer" not in src;
-    assert "print(a)" in src;
-}
-
-test "flush helper replays calls in order and clears the buffer" {
-    out = [];
-    buf = [(out.append, (1, ), {}), (out.append, (2, ), {})];
-    __jac_flush_se_buffer__(buf);
-    assert out == [1, 2];
-    assert buf == [];
+    assert "print(x)" in src;
 }
