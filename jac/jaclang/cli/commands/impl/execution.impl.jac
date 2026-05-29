@@ -87,6 +87,7 @@ impl run(
     cache: bool = True,
     autonative: bool = False,
     graphmend: bool = False,
+    graphmend_scope: str = "",
     diagnostics: str = "",
     args: list = []
 ) -> int {
@@ -117,7 +118,15 @@ impl run(
     (base, mod, mach) = _proc_file(filename);
     lng = filename.split('.')[-1];
     # GraphMend: flag the program so the gated codegen passes know to run.
-    Jac.get_program()._graphmend_enabled = graphmend;
+    # A non-empty --graphmend-scope implies --graphmend and lists module
+    # prefixes whose imported .py code is also routed through GraphMend.
+    _gm_scope = [
+        s.strip()
+        for s in graphmend_scope.split(',')
+        if s.strip()
+    ];
+    Jac.get_program()._graphmend_enabled = graphmend or bool(_gm_scope);
+    Jac.get_program()._graphmend_scope = _gm_scope;
     try {
         if filename.endswith('.na.jac') {
             # Native files: compile directly and call jac_entry.

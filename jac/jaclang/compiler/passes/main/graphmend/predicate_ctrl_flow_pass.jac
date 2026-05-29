@@ -14,12 +14,27 @@ produce the *same* output, so the rewrite is provably semantics-preserving:
 
   if c { return A; } else { return B; } ->  ... ; return torch.where(...);
 
+When a branch value contains a function call, `torch.where` is the wrong tool:
+it evaluates BOTH branches, so an asymmetric pair like `x = f(a)` / `x = g(b)`
+would run f AND g (wasteful, and unsafe if a branch is only valid when taken).
+For that case we emit `torch.cond`, a graph-native conditional that executes only
+the selected branch:
+
+  if c { x = f(a); } else { x = g(b); } ->  __gm_cond = c;
+                                            x = torch.cond(__gm_cond,
+                                                           lambda : f(a), lambda : g(b), ());
+
+`torch.cond` requires a scalar predicate (true for genuine data-dependent breaks)
+and both branches to return matching tensor structures. If a branch yields a
+non-tensor (e.g. `None`), no transform applies and the break is left intact.
+
 Anything more complex (differing targets, multi-statement branches, elif chains)
 is left untouched. Gated by --graphmend.
 """
 import ast as ast3;
 import jaclang.jac0core.unitree as uni;
 import from jaclang.jac0core.passes { UniPass }
+import from jaclang.jac0core.constant { Tokens as Tok }
 
 """Rewrite data-dependent if/else into torch.where."""
 obj PredicateCtrlFlowPass(UniPass) {
@@ -60,11 +75,14 @@ obj PredicateCtrlFlowPass(UniPass) {
                 lhs = self._same_lhs(a0, b0);
                 if (lhs is not None)
                 and (a0.value is not None)
-                and (b0.value is not None) {
+                and (b0.value is not None)
+                and (not self._has_none(a0.value, b0.value)) {
                     self._rewrite_assignment(nd, lhs, a0.value, b0.value);
                 }
             } elif isinstance(a0, uni.ReturnStmt) and isinstance(b0, uni.ReturnStmt) {
-                if (a0.expr is not None) and (b0.expr is not None) {
+                if (a0.expr is not None)
+                and (b0.expr is not None)
+                and (not self._has_none(a0.expr, b0.expr)) {
                     self._rewrite_return(nd, a0.expr, b0.expr);
                 }
             } elif isinstance(a0, uni.ExprStmt) and isinstance(b0, uni.ExprStmt) {
@@ -184,22 +202,94 @@ obj PredicateCtrlFlowPass(UniPass) {
         return (stmts, cond_ref, true_ref, false_ref);
     }
 
-    """Rewrite same-target assignment branches into torch.where."""
+    """Rewrite same-target assignment branches into torch.where / torch.cond."""
     def _rewrite_assignment(
         nd: uni.IfStmt, lhs: uni.Name, true_e: uni.Expr, false_e: uni.Expr
     ) {
+        if self._use_cond(true_e, false_e) {
+            (stmts, c_ref) = self._hoist_cond(nd, nd.condition);
+            cond_call = self._make_cond(nd, c_ref, true_e, false_e);
+            self._replace(nd, stmts + [self._assign(lhs, cond_call)]);
+            return;
+        }
         (stmts, c_ref, t_ref, f_ref) = self._hoist(nd, nd.condition, true_e, false_e);
         where_call = self._make_where(nd, c_ref, t_ref, f_ref);
         final = self._assign(lhs, where_call);
         self._replace(nd, stmts + [final]);
     }
 
-    """Rewrite same-shape return branches into a torch.where return."""
+    """Rewrite same-shape return branches into a torch.where / torch.cond return."""
     def _rewrite_return(nd: uni.IfStmt, true_e: uni.Expr, false_e: uni.Expr) {
+        if self._use_cond(true_e, false_e) {
+            (stmts, c_ref) = self._hoist_cond(nd, nd.condition);
+            cond_call = self._make_cond(nd, c_ref, true_e, false_e);
+            ret = uni.ReturnStmt(expr=cond_call, kid=[cond_call]);
+            self._replace(nd, stmts + [ret]);
+            return;
+        }
         (stmts, c_ref, t_ref, f_ref) = self._hoist(nd, nd.condition, true_e, false_e);
         where_call = self._make_where(nd, c_ref, t_ref, f_ref);
         ret = uni.ReturnStmt(expr=where_call, kid=[where_call]);
         self._replace(nd, stmts + [ret]);
+    }
+
+    """Prefer torch.cond over torch.where when a branch value contains a call.
+
+    torch.where evaluates both branches; for a call that would run it on the
+    untaken path too (wasteful, and unsafe if only valid under the condition).
+    torch.cond runs just the selected branch. A bare-name / pure-arithmetic
+    branch stays on torch.where (cheap, and avoids cond's stricter constraints)."""
+    def _use_cond(true_e: uni.Expr, false_e: uni.Expr) -> bool {
+        if isinstance(true_e, uni.Literal) or isinstance(false_e, uni.Literal) {
+            return False;
+        }
+        return self._has_call(true_e) or self._has_call(false_e);
+    }
+
+    """True if `e` is or contains a function call."""
+    def _has_call(e: uni.Expr) -> bool {
+        return isinstance(e, uni.FuncCall) or bool(e.get_all_sub_nodes(uni.FuncCall));
+    }
+
+    """True if either branch value is a `None` literal -- no tensor select is
+    possible (torch.where can't broadcast None, torch.cond can't return it), so
+    such branches are left untransformed (e.g. Qwen's `audios = None` else)."""
+    def _has_none(a: uni.Expr, b: uni.Expr) -> bool {
+        return isinstance(a, uni.Null) or isinstance(b, uni.Null);
+    }
+
+    """Hoist only the predicate to a temp; return ([assign], cond_ref)."""
+    def _hoist_cond(at: uni.UniNode, cond: uni.Expr) -> tuple {
+        n = self._counter;
+        self._counter += 1;
+        cond_tmp = self._gen_name(at, f"__gm_cond_{n}", True);
+        cond_ref = self._gen_name(at, f"__gm_cond_{n}", False);
+        return ([self._assign(cond_tmp, cond)], cond_ref);
+    }
+
+    """Build `torch.cond(pred, lambda : t, lambda : f, ())` anchored at `at`."""
+    def _make_cond(
+        at: uni.UniNode, pred: uni.Expr, t: uni.Expr, f: uni.Expr
+    ) -> uni.FuncCall {
+        torch_nm = self._gen_name(at, 'torch', False);
+        cond_nm = self._gen_name(at, 'cond', False);
+        target = uni.AtomTrailer(
+            target=torch_nm,
+            right=cond_nm,
+            is_attr=True,
+            is_null_ok=False,
+            kid=[torch_nm, cond_nm]
+        );
+        true_fn = uni.LambdaExpr(body=t, signature=None, kid=[t]);
+        false_fn = uni.LambdaExpr(body=f, signature=None, kid=[f]);
+        operands = uni.TupleVal(
+            values=[],
+            kid=[at.gen_token(Tok.LPAREN, '('), at.gen_token(Tok.RPAREN, ')')]
+        );
+        params = [pred, true_fn, false_fn, operands];
+        return uni.FuncCall(
+            target=target, params=params, genai_call=None, kid=[target] + params
+        );
     }
 
     """Split call params into positional args and a kwarg-name -> KWPair map."""

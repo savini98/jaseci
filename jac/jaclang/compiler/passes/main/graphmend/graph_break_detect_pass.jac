@@ -25,7 +25,9 @@ import from jaclang.compiler.passes.main.graphmend.torch_attr_table {
 
 """Tag graph-break locations under torch.compile entry points."""
 obj GraphBreakDetectPass(UniPass) {
-    has _enabled: bool = False;
+    has _enabled: bool = False,
+        _whole_module: bool = False,
+        _entry_ids: set[int] = set();
 
     """Gate the pass on the --graphmend flag and presence of an entry point."""
     def before_pass -> None {
@@ -34,49 +36,161 @@ obj GraphBreakDetectPass(UniPass) {
             self.prune_signal = True;
             return;
         }
-        if not self._module_has_torch_compile() {
+        # A module imported under --graphmend-scope is user-declared model code:
+        # treat its entire body as a compiled region (no local entry needed).
+        self._whole_module = getattr(self.prog, '_graphmend_scoped_compile', False);
+        if self._whole_module {
+            return;
+        }
+        self._entry_ids = self._collect_entry_points();
+        if not self._entry_ids {
             self._enabled = False;
             self.prune_signal = True;
         }
     }
 
-    """Dynamo Entry Point Analysis: does any def/class carry @torch.compile?"""
-    def _module_has_torch_compile -> bool {
+    """Dynamo Entry Point Analysis (paper 4.2.1): collect functions/classes that
+    are torch.compile entry points -- either decorated with @torch.compile, or
+    wrapped at a call site: torch.compile(fn) / torch.compile(Model()) /
+    `m = Model(); torch.compile(m)`. Methods of a wrapped class become in-scope.
+    """
+    def _collect_entry_points -> set[int] {
+        ids: set[int] = set();
         for ab in UniPass.get_all_sub_nodes(self.ir_in, uni.Ability, True) {
             if self._has_torch_compile_decorator(ab) {
-                return True;
+                ids.add(id(ab));
             }
         }
         for arch in UniPass.get_all_sub_nodes(self.ir_in, uni.Archetype, True) {
             if self._has_torch_compile_decorator(arch) {
-                return True;
+                ids.add(id(arch));
             }
         }
-        return False;
+        for call in UniPass.get_all_sub_nodes(self.ir_in, uni.FuncCall, True) {
+            if self._call_is_torch_compile(call) {
+                entry = self._resolve_wrapped_entry(call);
+                if entry is not None {
+                    ids.add(id(entry));
+                }
+            }
+        }
+        return ids;
     }
 
-    """True if `nd` is decorated with torch.compile (with or without args)."""
+    """True if `call` is a torch.compile(...) invocation (structural)."""
+    def _call_is_torch_compile(call: uni.FuncCall) -> bool {
+        t = call.target;
+        return (
+            isinstance(t, uni.AtomTrailer)
+            and isinstance(t.right, uni.Name)
+            and (t.right.value == 'compile')
+            and isinstance(t.target, uni.Name)
+            and (t.target.value == 'torch')
+        );
+    }
+
+    """Resolve the function/class wrapped by torch.compile(...) to its defining
+    Ability/Archetype in this module, else None."""
+    def _resolve_wrapped_entry(call: uni.FuncCall) -> (uni.UniNode | None) {
+        arg = None;
+        for p in (call.params or []) {
+            if not isinstance(p, uni.KWPair) {
+                arg = p;
+                break;
+            }
+        }
+        if arg is None {
+            return None;
+        }
+        # torch.compile(Model()) / torch.compile(make()) -> unwrap the call target
+        inner = arg.target if isinstance(arg, uni.FuncCall) else arg;
+        if not isinstance(inner, uni.Name) {
+            return None;
+        }
+        # direct: torch.compile(fn) / torch.compile(Class) / torch.compile(Class())
+        resolved = self._def_node(inner.value, call);
+        if resolved is not None {
+            return resolved;
+        }
+        # variable: torch.compile(m) where `m = Model(...)`
+        assign = self._var_assignment(inner.value, call);
+        if (assign is not None) and (assign.value is not None) {
+            v = assign.value;
+            cls = v.target if isinstance(v, uni.FuncCall) else v;
+            if isinstance(cls, uni.Name) {
+                return self._def_node(cls.value, call);
+            }
+        }
+        return None;
+    }
+
+    """Return the Ability/Archetype declared as `name` in scope, else None."""
+    def _def_node(name: str, ctx: uni.UniNode) -> (uni.UniNode | None) {
+        st = ctx.sym_tab;
+        if not st {
+            return None;
+        }
+        sym = st.lookup(name, deep=True);
+        if (not sym) or (not sym.defn) {
+            return None;
+        }
+        cur = sym.defn[0];
+        while cur {
+            if isinstance(cur, (uni.Ability, uni.Archetype)) {
+                return cur;
+            }
+            cur = cur.parent;
+        }
+        return None;
+    }
+
+    """Return the Assignment defining variable `name` in scope, else None."""
+    def _var_assignment(name: str, ctx: uni.UniNode) -> (uni.Assignment | None) {
+        st = ctx.sym_tab;
+        if not st {
+            return None;
+        }
+        sym = st.lookup(name, deep=True);
+        if not sym {
+            return None;
+        }
+        return self._defining_assignment(sym);
+    }
+
+    """True if `nd` is decorated with torch.compile (with or without args).
+
+    Matched structurally (torch . compile attribute access, optionally called)
+    rather than via unparse() text -- unparse renders Python-origin (.py) and
+    Jac-origin (.jac) ASTs differently (e.g. "torch compile" vs "torch.compile()"),
+    so a text match silently fails on .py models.
+    """
     def _has_torch_compile_decorator(nd: uni.UniNode) -> bool {
         decs = nd?.decorators;
         for dec in (decs or []) {
-            # unparse() pads tokens with spaces (e.g. "torch.compile ( )"),
-            # so normalize before matching.
-            txt = dec.unparse().replace(' ', '');
-            if (txt == 'torch.compile') or txt.startswith('torch.compile(') {
+            target = dec.target if isinstance(dec, uni.FuncCall) else dec;
+            if (
+                isinstance(target, uni.AtomTrailer)
+                and isinstance(target.right, uni.Name)
+                and (target.right.value == 'compile')
+                and isinstance(target.target, uni.Name)
+                and (target.target.value == 'torch')
+            ) {
                 return True;
             }
         }
         return False;
     }
 
-    """True if `nd` lives inside a torch.compile-decorated def or class."""
+    """True if `nd` lives inside a torch.compile entry point (decorated or
+    wrapped at a call site), or anywhere in a --graphmend-scope'd module."""
     def _in_torch_compiled_scope(nd: uni.UniNode) -> bool {
+        if self._whole_module {
+            return True;
+        }
         cur = nd.parent;
         while cur {
-            if isinstance(cur, (uni.Ability, uni.Archetype)) {
-                if self._has_torch_compile_decorator(cur) {
-                    return True;
-                }
+            if id(cur) in self._entry_ids {
+                return True;
             }
             cur = cur.parent;
         }

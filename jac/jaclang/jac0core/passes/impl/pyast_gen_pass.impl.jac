@@ -864,6 +864,17 @@ impl PyastGenPass.exit_module(nd: uni.Module) -> None {
     if getattr(nd, '_gm_needs_eq_assert', False) {
         self.jaclib_obj('__jac_tensor_eq_assert__');
     }
+    # GraphMend's DeferSideEffectPass logger deferral: slot registration + emit
+    # (in the model module) and the flush forward hook (at the torch.compile site).
+    if getattr(nd, '_gm_needs_log_register', False) {
+        self.jaclib_obj('__jac_log_register__');
+    }
+    if getattr(nd, '_gm_needs_log_emit', False) {
+        self.jaclib_obj('__jac_log_emit__');
+    }
+    if getattr(nd, '_gm_needs_log_flush', False) {
+        self.jaclib_obj('__jac_log_flush_hook__');
+    }
     is_builtin_module = (
         nd.loc.mod_path.endswith(('builtin.jac', 'builtin.py'))
         and ('runtimelib' in nd.loc.mod_path)

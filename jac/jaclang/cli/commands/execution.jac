@@ -37,6 +37,12 @@ glob registry = get_registry();
             short="g"
         ),
         Arg.create(
+            "graphmend_scope",
+            default="",
+            short="",
+            help="Comma-separated module prefixes whose imported .py code GraphMend should also transform (e.g. 'transformers.models.phi3'). Implies --graphmend."
+        ),
+        Arg.create(
             "profile",
             default="",
             short="",
@@ -71,6 +77,7 @@ def run(
     cache: bool = True,
     autonative: bool = False,
     graphmend: bool = False,
+    graphmend_scope: str = "",
     diagnostics: str = "",
     args: list = []
 ) -> int;

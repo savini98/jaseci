@@ -304,8 +304,59 @@ class JacMetaImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
                 return importlib.util.spec_from_file_location(
                     fullname, na_jac_file, loader=self
                 )
+            # GraphMend (--graphmend + --graphmend-scope): claim plain .py modules
+            # under an explicitly allow-listed package so imported model code is
+            # routed through GraphMend. Strictly opt-in and package-scoped, with a
+            # hard denylist for torch/jaclang, so torch/stdlib are never touched.
+            py_file = candidate_path + ".py"
+            if self._graphmend_scoped_py(fullname, py_file):
+                return importlib.util.spec_from_file_location(
+                    fullname, py_file, loader=self
+                )
 
         return None
+
+    def _graphmend_scoped_py(self, fullname: str, py_file: str) -> bool:
+        """True if GraphMend should claim this .py import.
+
+        Requires --graphmend active and the module's dotted name to fall under a
+        user-supplied --graphmend-scope prefix. `torch` and `jaclang` are always
+        excluded so the interception can never break the compiler or PyTorch
+        itself. The flag check short-circuits, so non-GraphMend runs are unaffected.
+        """
+        try:
+            from jaclang.jac0core.runtime import JacRuntime as Jac
+
+            program = Jac.get_program()
+            if not getattr(program, "_graphmend_enabled", False):
+                return False
+            scope = getattr(program, "_graphmend_scope", None) or []
+        except Exception:
+            return False
+        if not scope:
+            return False
+        top = fullname.split(".")[0]
+        if top in ("torch", "jaclang"):
+            return False
+        in_scope = any(
+            fullname == prefix or fullname.startswith(prefix + ".") for prefix in scope
+        )
+        return in_scope and os.path.isfile(py_file)
+
+    def _exec_py_source_fallback(self, module: ModuleType, file_path: str) -> bool:
+        """Run a .py module from its original source via CPython's compiler.
+
+        Used when GraphMend-scoped interception claimed a .py file but the Jac
+        compiler could not produce bytecode for it. Keeps the import working
+        (untransformed) instead of failing. Returns True on success.
+        """
+        try:
+            with open(file_path, encoding="utf-8") as fh:
+                code = compile(fh.read(), file_path, "exec")
+            exec(code, module.__dict__)  # noqa: S102
+            return True
+        except Exception:
+            return False
 
     def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType | None:
         """Create the module."""
@@ -359,13 +410,33 @@ class JacMetaImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
         # Get and execute bytecode using the compiler singleton
         compiler = Jac.get_compiler()
         program = Jac.get_program()
-        codeobj = compiler.get_bytecode(
-            full_target=file_path,
-            target_program=program,
-        )
+        is_py = file_path.endswith(".py")
+        # Signal the GraphMend detect pass that this module was claimed by
+        # --graphmend-scope, so it treats the whole module as a compiled region
+        # (the torch.compile entry is in the user's script, not here).
+        scoped = is_py and self._graphmend_scoped_py(module.__name__, file_path)
+        if scoped:
+            program._graphmend_scoped_compile = True
+        try:
+            codeobj = compiler.get_bytecode(
+                full_target=file_path,
+                target_program=program,
+            )
+        except Exception:
+            # GraphMend-scoped .py that jac can't compile: never break the
+            # import -- fall back to running the original Python source. Worst
+            # case is "not transformed", not a crash.
+            if is_py and self._exec_py_source_fallback(module, file_path):
+                return
+            raise
+        finally:
+            if scoped:
+                program._graphmend_scoped_compile = False
         if not codeobj:
             if is_pkg:
                 # Empty package is OK - just register it
+                return
+            if is_py and self._exec_py_source_fallback(module, file_path):
                 return
             raise ImportError(f"No bytecode found for {file_path}")
 

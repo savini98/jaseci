@@ -254,6 +254,17 @@ obj OspHost {
 native/client build swaps in a subclass with no-op persistence."""
 glob _osp_host = OspHost();
 
+"""GraphMend logger-deferral state (process-global, shared across modules).
+
+`_gm_log_registry` maps an integer slot -> a bound logger callable captured at
+module load (OUTSIDE any traced region). `_gm_log_buffer` collects
+`(slot, args, kwargs)` tuples appended DURING a compiled forward -- only ints
+and the original (constant) arguments enter the graph, never a Logger object,
+so TorchDynamo replays the appends without a graph break. A forward hook flushes
+the buffer after the graph runs. See JacBasics.log_register/log_emit/log_flush_hook."""
+glob _gm_log_registry: list = [];
+glob _gm_log_buffer: list = [];
+
 """Jac Edge Operations."""
 class JacWalker {
     """Jac's visit stmt feature."""
@@ -538,6 +549,29 @@ system,
     would report as False), then asserts via the graph-native torch._assert_async.
     """
     static def tensor_eq_assert(a: any, b: any, msg: str) -> None;
+
+    """GraphMend: register a logger callable (captured outside the graph) -> slot.
+
+    Called once at module load. The returned integer slot is the only token that
+    enters the compiled region, keeping the Logger object out of the trace."""
+    static def log_register(fn: any) -> int;
+
+    """GraphMend: buffer a deferred logger call by slot.
+
+    Replaces `logger.X(...)` inside a compiled forward. Only the int slot and the
+    original arguments (as an explicit tuple/dict) are stored, so TorchDynamo
+    treats this as a replayable list append, never an untraceable Logger method.
+    (args/kwargs are passed explicitly, not via *args/**kwargs, because runtime
+    interface methods dispatch through the plugin proxy, which does not forward
+    variadic parameters.)"""
+    static def log_emit(slot: int, args: tuple, kwargs: dict) -> None;
+
+    """GraphMend: forward hook that flushes the deferred logger buffer.
+
+    Registered on the torch.compile'd module; runs in eager AFTER the compiled
+    graph executes, replaying each buffered logger call in program order. Returns
+    `output` unchanged so it is a transparent forward hook."""
+    static def log_flush_hook(module: any, inputs: any, output: any) -> any;
 
     """Jac's apply_dir stmt feature.
 

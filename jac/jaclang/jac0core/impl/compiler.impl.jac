@@ -132,6 +132,12 @@ impl JacCompiler.get_bytecode(
     full_target: str, target_program: JacProgram
 ) -> (types.CodeType | None) {
     actual_program = self._resolve_program(full_target, target_program);
+    # GraphMend produces different bytecode than a normal compile, but the
+    # disk/precompiled cache key does not encode the GraphMend state. To avoid
+    # serving graphmend bytecode to a normal run (or vice versa), graphmend runs
+    # bypass the persistent caches entirely (read AND write). The in-memory hub
+    # is safe: the flag is constant for the lifetime of a single run.
+    gm_active = getattr(target_program, '_graphmend_enabled', False);
 
     # Tier 1: in-memory hub
     if (
@@ -142,9 +148,9 @@ impl JacCompiler.get_bytecode(
         return marshal.loads(codeobj) if isinstance(codeobj, `bytes) else None;
     }
 
-    # Tier 2: JIR cache fast path
+    # Tier 2: JIR cache fast path (skipped under GraphMend)
     cache_path = get_module_cache_path(full_target);
-    if is_module_cache_valid(full_target, cache_path) {
+    if (not gm_active) and is_module_cache_valid(full_target, cache_path) {
         try {
             jir_data = cache_path.read_bytes();
             bc = read_bytecode_only(jir_data);
@@ -162,8 +168,10 @@ impl JacCompiler.get_bytecode(
         }
     }
 
-    # Tier 2.5: precompiled JIR bundle shipped with the package
-    precompiled_bc = self._get_precompiled_jir_bytecode(full_target);
+    # Tier 2.5: precompiled JIR bundle shipped with the package (skip under GraphMend)
+    precompiled_bc = None
+        if gm_active
+        else self._get_precompiled_jir_bytecode(full_target);
     if precompiled_bc is not None {
         try {
             import from jaclang.jac0core.jir { write_precompiled_jir, FLAG_PRECOMPILED }
@@ -207,6 +215,11 @@ impl JacCompiler.get_bytecode(
         file_path=full_target, target_program=actual_program, options=options
     );
     if result.gen.py_bytecode {
+        # Under GraphMend, do not persist to the shared disk cache (its key does
+        # not encode the GraphMend state); just return the freshly compiled code.
+        if gm_active {
+            return marshal.loads(result.gen.py_bytecode);
+        }
         try {
             import from jaclang.jac0core.jir_passes { JirWriter }
             import pickle;

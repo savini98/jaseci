@@ -71,6 +71,16 @@ test "item() dynamic signal in return branch becomes torch.where" {
     assert "if " not in src;
 }
 
+test "asymmetric call branches become torch.cond (runs one branch)" {
+    src = _pysrc("cond_assign.jac", True);
+    assert "z = torch.cond(__gm_cond_0," in src;
+    assert "lambda: torch.relu(x) + y" in src;
+    assert "lambda: torch.sigmoid(y) - x" in src;
+    # not torch.where -- that would evaluate both calls
+    assert "torch.where(" not in src;
+    assert "if x.sum() > 0:" not in src;
+}
+
 test "different callees in branches are left untouched" {
     src = _pysrc("different_callees.jac", True);
     assert "torch.where(" not in src;

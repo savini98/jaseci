@@ -1505,6 +1505,24 @@ impl JacBasics.tensor_eq_assert(a: any, b: any, msg: str) -> None {
     torch._assert_async(cond, msg);
 }
 
+impl JacBasics.log_register(fn: any) -> int {
+    _gm_log_registry.append(fn);
+    return len(_gm_log_registry) - 1;
+}
+
+impl JacBasics.log_emit(slot: int, args: tuple, kwargs: dict) -> None {
+    _gm_log_buffer.append((slot, args, kwargs));
+}
+
+impl JacBasics.log_flush_hook(module: any, inputs: any, output: any) -> any {
+    for entry in _gm_log_buffer {
+        (slot, args, kwargs) = entry;
+        _gm_log_registry[slot](*args, **kwargs);
+    }
+    _gm_log_buffer.clear();
+    return output;
+}
+
 """Jac's apply_dir stmt feature."""
 impl JacBasics.refs(
     path: ObjectSpatialPath | NodeArchetype | list[NodeArchetype],

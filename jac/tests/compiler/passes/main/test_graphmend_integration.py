@@ -16,7 +16,10 @@ Skipped automatically when PyTorch is not installed.
 """
 
 import ast
+import logging
 import os
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -90,6 +93,13 @@ def test_data_dependent_assignment_defragmented():
     _assert_defragmented("where_assign.jac", "f", x, y)
 
 
+def test_torch_cond_asymmetric_branches_defragmented():
+    """Asymmetric branches that call different functions -> torch.cond (one graph)."""
+    x = torch.randn(4)
+    y = torch.randn(4)
+    _assert_defragmented("cond_assign.jac", "f", x, y)
+
+
 def test_validation_guard_defragmented():
     x = torch.tensor([1.0, 2.0, 3.0])
     mask = torch.tensor([True, True, True])
@@ -104,3 +114,105 @@ def test_print_side_effect_defragmented():
 def test_logger_side_effect_defragmented():
     x = torch.tensor([1.0, 2.0, 3.0])
     _assert_defragmented("side_effect_logger.jac", "f", x)
+
+
+def _run_model_fixture(graphmend: bool) -> tuple[int, list]:
+    """Compile the forward-hook fixture, build the model, and drive it through a
+    counting backend. Returns (graph_count, captured_log_messages).
+
+    ``torch.compile`` is neutralized so the module-level ``model = torch.compile(
+    Net())`` yields the raw ``Net`` (with the GraphMend-injected forward hook
+    still attached); we then drive that model object ourselves.
+    """
+    src = _compile_src("logger_forward_hook.py", graphmend)
+    ns: dict = {}
+    orig_compile = torch.compile
+    torch.compile = lambda *a, **k: a[0] if a else (lambda f: f)
+    try:
+        exec(compile(src, "logger_forward_hook.py", "exec"), ns)
+    finally:
+        torch.compile = orig_compile
+
+    messages: list = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: object) -> None:
+            messages.append(record.getMessage())  # type: ignore[attr-defined]
+
+    handler = _Capture()
+    logging.getLogger("gm_forward_hook").addHandler(handler)
+    graphs: list = []
+
+    def backend(gm: object, inputs: object) -> object:
+        graphs.append(gm)
+        return gm.forward  # type: ignore[attr-defined]
+
+    try:
+        torch._dynamo.reset()
+        torch.compile(ns["model"], backend=backend)(torch.tensor([1.0, 2.0, 3.0]))
+    finally:
+        logging.getLogger("gm_forward_hook").removeHandler(handler)
+    return len(graphs), messages
+
+
+def test_logger_forward_hook_defragments_and_preserves_log() -> None:
+    """The forward-hook mechanism eliminates the logger break AND emits the log."""
+    orig_graphs, orig_msgs = _run_model_fixture(False)
+    fixed_graphs, fixed_msgs = _run_model_fixture(True)
+
+    assert orig_graphs >= 2, f"expected a break without GraphMend, got {orig_graphs}"
+    assert fixed_graphs == 1, f"expected one graph with GraphMend, got {fixed_graphs}"
+    # The log is preserved -- replayed by the injected forward hook after the graph.
+    assert "GM-FORWARD-HOOK-LOG" in fixed_msgs, "logger output was lost"
+    assert "GM-FORWARD-HOOK-LOG" in orig_msgs
+
+
+def test_scoped_import_transforms_imported_model(tmp_path: Path) -> None:
+    """--graphmend-scope routes an imported model package's .py through GraphMend.
+
+    The model class lives in an imported module with no local torch.compile (the
+    wrap is in the entry script) -- it is reached only because its package is in
+    the graphmend scope. torch (not in scope) must stay untouched.
+    """
+    import dis
+    import importlib
+
+    from jaclang.jac0core.runtime import JacRuntime as Jac
+
+    pkg = tmp_path / "scopedmodel"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "net.py").write_text(
+        "import torch\n"
+        "class Net(torch.nn.Module):\n"
+        "    def forward(self, x):\n"
+        "        x = torch.relu(x)\n"
+        "        if x.sum() > 0:\n"
+        "            return x * 2.0\n"
+        "        else:\n"
+        "            return x * 3.0\n"
+    )
+    prog = Jac.get_program()
+    saved_en = getattr(prog, "_graphmend_enabled", False)
+    saved_scope = getattr(prog, "_graphmend_scope", None)
+    sys.path.insert(0, str(tmp_path))
+    try:
+        prog._graphmend_enabled = True
+        prog._graphmend_scope = ["scopedmodel"]
+        sys.modules.pop("scopedmodel", None)
+        sys.modules.pop("scopedmodel.net", None)
+        net = importlib.import_module("scopedmodel.net")
+        names = [
+            i.argval
+            for i in dis.get_instructions(net.Net.forward.__code__)
+            if isinstance(i.argval, str)
+        ]
+        assert "where" in names, "imported scoped model was not transformed"
+        # torch itself (not in scope) must be unaffected
+        assert hasattr(torch, "_dynamo")
+    finally:
+        prog._graphmend_enabled = saved_en
+        prog._graphmend_scope = saved_scope
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("scopedmodel", None)
+        sys.modules.pop("scopedmodel.net", None)
