@@ -57,7 +57,8 @@ glob __all__ = [
          'on_exit',
          'set_trigger',
          'thread_run',
-         'thread_wait'
+         'thread_wait',
+         '__jac_flush_se_buffer__'
      ],
      connect = JacRuntimeInterface.connect,
      create_j_context = JacRuntimeInterface.create_j_context,
@@ -88,4 +89,5 @@ glob __all__ = [
      on_exit = JacRuntimeInterface.on_exit,
      set_trigger = JacRuntimeInterface.set_trigger,
      thread_run = JacRuntimeInterface.thread_run,
-     thread_wait = JacRuntimeInterface.thread_wait;
+     thread_wait = JacRuntimeInterface.thread_wait,
+     __jac_flush_se_buffer__ = JacRuntimeInterface.flush_se_buffer;

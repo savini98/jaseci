@@ -855,6 +855,11 @@ impl PyastGenPass.exit_module(nd: uni.Module) -> None {
         self.builtin_imports.update(child_pass.builtin_imports);
         self.typing_imports.update(child_pass.typing_imports);
     }
+    # GraphMend's DeferSideEffectPass injects calls to __jac_flush_se_buffer__;
+    # register the jaclib import so the preamble pulls the runtime helper in.
+    if getattr(nd, '_gm_needs_se_flush', False) {
+        self.jaclib_obj('__jac_flush_se_buffer__');
+    }
     is_builtin_module = (
         nd.loc.mod_path.endswith(('builtin.jac', 'builtin.py'))
         and ('runtimelib' in nd.loc.mod_path)

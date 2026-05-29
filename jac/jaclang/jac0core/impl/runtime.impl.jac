@@ -1490,6 +1490,14 @@ impl JacBasics.log_report(expr: any, custom: bool = False) -> None {
     }
 }
 
+impl JacBasics.flush_se_buffer(buf: list) -> None {
+    for entry in buf {
+        (fn, args, kwargs) = entry;
+        fn(*args, **kwargs);
+    }
+    buf.clear();
+}
+
 """Jac's apply_dir stmt feature."""
 impl JacBasics.refs(
     path: ObjectSpatialPath | NodeArchetype | list[NodeArchetype],

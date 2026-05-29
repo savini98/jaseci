@@ -522,6 +522,14 @@ system,
     """Jac's report stmt feature."""
     static def log_report(expr: any, custom: bool = False) -> None;
 
+    """GraphMend: flush a deferred side-effect buffer.
+
+    Each entry is a (callee, args, kwargs) triple captured at the original call
+    site; replaying them here runs the print/logger calls in program order
+    after the compiled graph has executed.
+    """
+    static def flush_se_buffer(buf: list) -> None;
+
     """Jac's apply_dir stmt feature.
 
     `slc`, when given, requests storage-layer pagination: for single-hop
