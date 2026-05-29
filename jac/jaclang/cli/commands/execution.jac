@@ -30,6 +30,13 @@ glob registry = get_registry();
             short="N"
         ),
         Arg.create(
+            "graphmend",
+            typ=bool,
+            default=False,
+            help="Apply GraphMend passes to eliminate PyTorch 2 FX graph breaks (experimental)",
+            short="g"
+        ),
+        Arg.create(
             "profile",
             default="",
             short="",
@@ -63,6 +70,7 @@ def run(
     main: bool = True,
     cache: bool = True,
     autonative: bool = False,
+    graphmend: bool = False,
     diagnostics: str = "",
     args: list = []
 ) -> int;

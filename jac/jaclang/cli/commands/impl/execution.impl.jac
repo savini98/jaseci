@@ -86,6 +86,7 @@ impl run(
     main: bool = True,
     cache: bool = True,
     autonative: bool = False,
+    graphmend: bool = False,
     diagnostics: str = "",
     args: list = []
 ) -> int {
@@ -115,6 +116,8 @@ impl run(
     sys.argv = [filename] + list(args);
     (base, mod, mach) = _proc_file(filename);
     lng = filename.split('.')[-1];
+    # GraphMend: flag the program so the gated codegen passes know to run.
+    Jac.get_program()._graphmend_enabled = graphmend;
     try {
         if filename.endswith('.na.jac') {
             # Native files: compile directly and call jac_entry.

@@ -199,7 +199,10 @@ impl JacCompiler.get_bytecode(
             sys.modules['jaclang.compiler.type_system.type_evaluator'], 'TypeEvaluator'
         )
     );
-    options = CompileOptions(type_check=can_typecheck);
+    options = CompileOptions(
+        type_check=can_typecheck,
+        graphmend=getattr(target_program, '_graphmend_enabled', False)
+    );
     result = self.compile(
         file_path=full_target, target_program=actual_program, options=options
     );
