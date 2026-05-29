@@ -860,6 +860,10 @@ impl PyastGenPass.exit_module(nd: uni.Module) -> None {
     if getattr(nd, '_gm_needs_se_flush', False) {
         self.jaclib_obj('__jac_flush_se_buffer__');
     }
+    # GraphMend's TrapLoweringPass may inject __jac_tensor_eq_assert__.
+    if getattr(nd, '_gm_needs_eq_assert', False) {
+        self.jaclib_obj('__jac_tensor_eq_assert__');
+    }
     is_builtin_module = (
         nd.loc.mod_path.endswith(('builtin.jac', 'builtin.py'))
         and ('runtimelib' in nd.loc.mod_path)

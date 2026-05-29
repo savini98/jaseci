@@ -530,6 +530,15 @@ system,
     """
     static def flush_se_buffer(buf: list) -> None;
 
+    """GraphMend: graph-native equivalent of `assert torch.equal(a, b), msg`.
+
+    torch.equal returns a Python bool (a graph break); this replays it as a
+    tensor op. A static shape/dtype precheck guards the elementwise `(a==b).all()`
+    against silently broadcasting mismatched shapes to True (which torch.equal
+    would report as False), then asserts via the graph-native torch._assert_async.
+    """
+    static def tensor_eq_assert(a: any, b: any, msg: str) -> None;
+
     """Jac's apply_dir stmt feature.
 
     `slc`, when given, requests storage-layer pagination: for single-hop

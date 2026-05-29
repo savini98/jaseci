@@ -1498,6 +1498,13 @@ impl JacBasics.flush_se_buffer(buf: list) -> None {
     buf.clear();
 }
 
+impl JacBasics.tensor_eq_assert(a: any, b: any, msg: str) -> None {
+    import torch;
+    meta_ok = (a.shape == b.shape) and (a.dtype == b.dtype);
+    cond = (a == b).all() if meta_ok else torch.tensor(False, device=a.device);
+    torch._assert_async(cond, msg);
+}
+
 """Jac's apply_dir stmt feature."""
 impl JacBasics.refs(
     path: ObjectSpatialPath | NodeArchetype | list[NodeArchetype],

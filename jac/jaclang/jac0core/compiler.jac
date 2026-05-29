@@ -217,6 +217,9 @@ def get_py_code_gen -> list[type[Transform[uni.Module, uni.Module]]] {
         import from jaclang.compiler.passes.main.graphmend.defer_side_effect_pass {
             DeferSideEffectPass
         }
+        import from jaclang.compiler.passes.main.graphmend.trap_lowering_pass {
+            TrapLoweringPass
+        }
         # InteropAnalysis + WalkerEffects were merged into BoundaryAnalysisPass,
         # which now runs once in the shared front-end (get_boundary_analysis_sched)
         # rather than here in codegen.
@@ -228,6 +231,7 @@ def get_py_code_gen -> list[type[Transform[uni.Module, uni.Module]]] {
                 GraphBreakDetectPass,
                 PredicateCtrlFlowPass,
                 DeferSideEffectPass,
+                TrapLoweringPass,
                 PyastGenPass,
                 PyJacAstLinkPass,
                 PyBytecodeGenPass

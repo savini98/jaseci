@@ -1,4 +1,4 @@
-"""Validation guard inside a compiled region: raise -> torch._assert_async."""
+"""Validation guard inside a compiled region (torch.equal check then raise)."""
 import torch;
 
 @torch.compile()

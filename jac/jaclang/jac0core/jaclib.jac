@@ -58,7 +58,8 @@ glob __all__ = [
          'set_trigger',
          'thread_run',
          'thread_wait',
-         '__jac_flush_se_buffer__'
+         '__jac_flush_se_buffer__',
+         '__jac_tensor_eq_assert__'
      ],
      connect = JacRuntimeInterface.connect,
      create_j_context = JacRuntimeInterface.create_j_context,
@@ -90,4 +91,5 @@ glob __all__ = [
      set_trigger = JacRuntimeInterface.set_trigger,
      thread_run = JacRuntimeInterface.thread_run,
      thread_wait = JacRuntimeInterface.thread_wait,
-     __jac_flush_se_buffer__ = JacRuntimeInterface.flush_se_buffer;
+     __jac_flush_se_buffer__ = JacRuntimeInterface.flush_se_buffer,
+     __jac_tensor_eq_assert__ = JacRuntimeInterface.tensor_eq_assert;
