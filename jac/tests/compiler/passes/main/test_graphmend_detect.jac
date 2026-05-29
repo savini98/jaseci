@@ -61,3 +61,9 @@ test "no detection when graphmend disabled" {
     mod = _compile("where_return.jac", False);
     assert _if_kinds(mod) == [None];
 }
+
+test "static hasattr control flow is not tagged" {
+    mod = _compile("hasattr_static.jac", True);
+    assert "dyn_ctrl_fl" not in _if_kinds(mod);
+    assert "val_guard" not in _if_kinds(mod);
+}

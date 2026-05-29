@@ -185,15 +185,20 @@ obj GraphBreakDetectPass(UniPass) {
         return False;
     }
 
-    """Trace a symbol's definition chain for tensor/parameter dependence."""
+    """Trace a symbol's definition chain for a dynamic torch dependence.
+
+    A symbol is dynamic if its defining expression uses a dynamic torch attribute
+    (e.g. `seq_len = torch.max(position_ids) + 1`), directly or transitively. We
+    deliberately do NOT treat every function parameter as dynamic: that would
+    misfire on object params (e.g. tag `if hasattr(self, ...)` as data-dependent
+    and wrongly rewrite static control flow). Keying on torch dynamic attributes
+    keeps detection precise and semantics-preserving.
+    """
     def _trace_symbol(sym: uni.Symbol, visited: set[str], depth: int) -> bool {
         if (depth > 10) or (sym.sym_name in visited) {
             return False;
         }
         visited.add(sym.sym_name);
-        if self._symbol_is_parameter(sym) {
-            return True;
-        }
         assign = self._defining_assignment(sym);
         if (assign is None) or (assign.value is None) {
             return False;
@@ -212,24 +217,6 @@ obj GraphBreakDetectPass(UniPass) {
                     return True;
                 }
             }
-        }
-        return False;
-    }
-
-    """True if the symbol is a function parameter (a model input)."""
-    def _symbol_is_parameter(sym: uni.Symbol) -> bool {
-        if not sym.defn {
-            return False;
-        }
-        cur = sym.defn[0].parent;
-        while cur {
-            if isinstance(cur, uni.ParamVar) {
-                return True;
-            }
-            if isinstance(cur, uni.Ability) {
-                return False;
-            }
-            cur = cur.parent;
         }
         return False;
     }

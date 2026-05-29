@@ -211,6 +211,9 @@ def get_py_code_gen -> list[type[Transform[uni.Module, uni.Module]]] {
         import from jaclang.compiler.passes.main.graphmend.graph_break_detect_pass {
             GraphBreakDetectPass
         }
+        import from jaclang.compiler.passes.main.graphmend.predicate_ctrl_flow_pass {
+            PredicateCtrlFlowPass
+        }
         # InteropAnalysis + WalkerEffects were merged into BoundaryAnalysisPass,
         # which now runs once in the shared front-end (get_boundary_analysis_sched)
         # rather than here in codegen.
@@ -218,7 +221,13 @@ def get_py_code_gen -> list[type[Transform[uni.Module, uni.Module]]] {
         import from jaclang.compiler.passes.native { NaIRGenPass, NativeCompilePass }
         passes.extend([NaIRGenPass, NativeCompilePass]);
         passes.extend(
-            [GraphBreakDetectPass, PyastGenPass, PyJacAstLinkPass, PyBytecodeGenPass]
+            [
+                GraphBreakDetectPass,
+                PredicateCtrlFlowPass,
+                PyastGenPass,
+                PyJacAstLinkPass,
+                PyBytecodeGenPass
+            ]
         );
         return passes;
     } except ImportError {
