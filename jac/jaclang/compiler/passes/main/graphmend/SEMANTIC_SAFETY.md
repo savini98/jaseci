@@ -51,7 +51,7 @@ soundness property, not a weakness.
 
 ### Mapping to classical theory
 
-- Control-dependence → data-dependence conversion (Allen–Kennedy if-conversion).
+- Control-dependence → data-dependence conversion (Allen-Kennedy if-conversion).
 - INV2 = classical **speculation legality**: control-speculating an op is legal
   only if it is *safe* (non-faulting, effect-free); otherwise **predication** or
   **recovery code** is required. GraphMend's re-gating of a hoisted assert is
@@ -319,7 +319,7 @@ Input : Module U with ≥1 torch.compile entry point
  4  foreach n tagged side_effect in post-order do  Alg.3(n)   //    values when Alg.2 hoists
 ```
 
-The order in lines 2–3 is the formal statement of the **compound-break** answer:
+The order in lines 2-3 is the formal statement of the **compound-break** answer:
 Alg. 4 turns an inner guard into a value-level `_assert_async` *before* Alg. 2
 reaches the enclosing branch, so Alg. 2 line 12 (`Regate`) can lift it
 predicate-safely. Post-order resolves inner regions before their enclosers.
@@ -328,7 +328,7 @@ predicate-safely. Post-order resolves inner regions before their enclosers.
 
 ## 6. Soundness
 
-> **Claim.** For every region transformed by Algorithms 2–4, the rewritten program
+> **Claim.** For every region transformed by Algorithms 2-4, the rewritten program
 > `P'` is observationally equivalent to `P` on the input domain: identical tensor
 > outputs, identical observable effects in original program order, and an
 > assertion fires in `P'` iff the original guard would fire in `P`.
