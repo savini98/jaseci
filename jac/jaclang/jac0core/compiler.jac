@@ -208,6 +208,11 @@ def get_py_code_gen -> list[type[Transform[uni.Module, uni.Module]]] {
         # (EsastGenPass) and native (NaIRGenPass) backends see the original tree.
         # Every GraphMend pass self-gates on --graphmend, so it is inert
         # otherwise.
+        # Pass order matters: TrapLoweringPass runs BEFORE PredicateCtrlFlowPass
+        # so a validation guard nested in a data-dependent branch is lowered to a
+        # graph-native assert first; predication can then hoist the branch (the
+        # raise is gone) and re-gate the assert on the branch predicate. See the
+        # nested-compound case in test_graphmend_ctrl_flow.
         import from jaclang.compiler.passes.main.graphmend.graph_break_detect_pass {
             GraphBreakDetectPass
         }
@@ -229,9 +234,9 @@ def get_py_code_gen -> list[type[Transform[uni.Module, uni.Module]]] {
         passes.extend(
             [
                 GraphBreakDetectPass,
+                TrapLoweringPass,
                 PredicateCtrlFlowPass,
                 DeferSideEffectPass,
-                TrapLoweringPass,
                 PyastGenPass,
                 PyJacAstLinkPass,
                 PyBytecodeGenPass

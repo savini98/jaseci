@@ -102,6 +102,29 @@ test "multi-statement branches with shared call hoist and merge (Fig. 4)" {
     assert "if not hasattr(self_obj, 'long_inv_freq')" in src;
 }
 
+test "nested guard in a data-dependent branch composes trap + predication" {
+    src = _pysrc("nested_guard_in_branch.jac", True);
+    # the data-dependent outer branch is predicated...
+    assert "__gm_cond_0 = x.sum() > 0" in src;
+    assert "out.copy_(torch.where(__gm_cond_0," in src;
+    # ...and the inner validation guard is lowered to a graph-native assert,
+    # re-gated on the branch predicate so it only fires when the branch is taken.
+    assert "torch._assert_async(" in src;
+    assert "torch.logical_or(torch.logical_not(__gm_cond_0), (x == y).all())" in src;
+    # no raw control flow / raise survives -- one contiguous graph.
+    assert "raise ValueError" not in src;
+    assert "if x.sum()" not in src;
+    assert "if not (x == y)" not in src;
+}
+
+test "nested-compound break preserved when graphmend disabled" {
+    src = _pysrc("nested_guard_in_branch.jac", False);
+    assert "torch.where(" not in src;
+    assert "torch._assert_async(" not in src;
+    assert "raise ValueError('x and y must match')" in src;
+    assert "if not (x == y).all():" in src;
+}
+
 test "control flow preserved when graphmend disabled" {
     src = _pysrc("where_return.jac", False);
     assert "torch.where(" not in src;

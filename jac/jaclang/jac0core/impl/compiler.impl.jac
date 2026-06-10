@@ -828,7 +828,13 @@ impl JacCompiler.run_schedule(
         if (cancel_token and cancel_token.is_set()) {
             break;
         }
-        current_pass(ir_in=mod, prog=target_program, cancel_token=cancel_token);
+        inst = current_pass(ir_in=mod, prog=target_program, cancel_token=cancel_token);
+        # Opt-in pass profiling: a caller that sets `_pass_times = []` on the
+        # program before compiling gets (pass_name, seconds) appended for every
+        # pass run. Off by default (attribute absent), so no overhead.
+        if hasattr(target_program, '_pass_times') {
+            target_program._pass_times.append((current_pass.__name__, inst.time_taken));
+        }
     }
 }
 

@@ -167,20 +167,22 @@ obj PredicateCtrlFlowPass(UniPass) {
     def _make_where(
         at: uni.UniNode, cond: uni.Expr, t: uni.Expr, f: uni.Expr
     ) -> uni.FuncCall {
+        return self._torch_call(at, 'where', [cond, t, f]);
+    }
+
+    """Build a `torch.<fname>(*args)` call anchored at `at`."""
+    def _torch_call(at: uni.UniNode, fname: str, args: list) -> uni.FuncCall {
         torch_nm = self._gen_name(at, 'torch', False);
-        where_nm = self._gen_name(at, 'where', False);
+        fn_nm = self._gen_name(at, fname, False);
         target = uni.AtomTrailer(
             target=torch_nm,
-            right=where_nm,
+            right=fn_nm,
             is_attr=True,
             is_null_ok=False,
-            kid=[torch_nm, where_nm]
+            kid=[torch_nm, fn_nm]
         );
         return uni.FuncCall(
-            target=target,
-            params=[cond, t, f],
-            genai_call=None,
-            kid=[target, cond, t, f]
+            target=target, params=args, genai_call=None, kid=[target] + args
         );
     }
 
@@ -360,6 +362,14 @@ obj PredicateCtrlFlowPass(UniPass) {
         if not diff {
             return;
         }
+        # A torch.equal guard (`__jac_tensor_eq_assert__`) hoisted out of a branch
+        # cannot be re-gated on the predicate (its check is computed inside the
+        # helper), so we decline rather than assert it unconditionally.
+        for s in (list(true_setups) + list(false_setups)) {
+            if self._is_eq_assert(s) {
+                return;
+            }
+        }
         n = self._counter;
         self._counter += 1;
         cond_tmp = self._gen_name(nd, f"__gm_cond_{n}", True);
@@ -384,10 +394,95 @@ obj PredicateCtrlFlowPass(UniPass) {
             kid=[ca.target] + new_params
         );
         call_stmt = uni.ExprStmt(expr=new_call, in_fstring=False, kid=[new_call]);
-        new_nodes = [cond_assign] + list(true_setups) + list(false_setups) + [
-            call_stmt
-        ];
+        gated_true = self._gate_asserts(list(true_setups), n, True);
+        gated_false = self._gate_asserts(list(false_setups), n, False);
+        new_nodes = [cond_assign] + gated_true + gated_false + [call_stmt];
         self._replace(nd, new_nodes);
+    }
+
+    """True if `stmt` is a graph-native `torch._assert_async(...)` produced by
+    the trap-lowering pass (a lowered tensor-bool validation guard)."""
+    def _is_assert_async(stmt: uni.UniNode) -> bool {
+        if not isinstance(stmt, uni.ExprStmt) {
+            return False;
+        }
+        call = stmt.expr;
+        if not isinstance(call, uni.FuncCall) {
+            return False;
+        }
+        t = call.target;
+        return (
+            isinstance(t, uni.AtomTrailer)
+            and isinstance(t.right, uni.Name)
+            and (t.right.value == '_assert_async')
+            and isinstance(t.target, uni.Name)
+            and (t.target.value == 'torch')
+        );
+    }
+
+    """True if `stmt` wraps a `__jac_tensor_eq_assert__(...)` call (the torch.equal
+    guard form), whose check is computed inside the helper and so cannot be
+    re-gated on a branch predicate."""
+    def _is_eq_assert(stmt: uni.UniNode) -> bool {
+        if not isinstance(stmt, uni.ExprStmt) {
+            return False;
+        }
+        call = stmt.expr;
+        return (
+            isinstance(call, uni.FuncCall)
+            and isinstance(call.target, uni.Name)
+            and (call.target.value == '__jac_tensor_eq_assert__')
+        );
+    }
+
+    """Re-gate hoisted `torch._assert_async` calls onto the branch predicate.
+
+    A guard lowered to `torch._assert_async(check, msg)` and lifted out of a
+    predicated branch would otherwise assert unconditionally, changing semantics
+    (the check only applied when the branch was taken). We rewrite its condition
+    so the assertion is vacuously satisfied on the untaken path:
+
+      true branch  (taken when cond):  check -> torch.logical_or(torch.logical_not(cond), check)
+      false branch (taken when ~cond): check -> torch.logical_or(cond, check)
+
+    `taken_when_true` selects which gate to apply. Non-assert setups pass through
+    unchanged. `n` indexes the hoisted `__gm_cond_{n}` predicate temp.
+    """
+    def _gate_asserts(setups: list, n: int, taken_when_true: bool) -> list {
+        out = [];
+        for s in setups {
+            if not self._is_assert_async(s) {
+                out.append(s);
+                continue;
+            }
+            call = s.expr;
+            pos = [
+                p
+                for p in (call.params or [])
+                if not isinstance(p, uni.KWPair)
+            ];
+            if not pos {
+                out.append(s);
+                continue;
+            }
+            check = pos[0];
+            cref = self._gen_name(s, f"__gm_cond_{n}", False);
+            if taken_when_true {
+                gate = self._torch_call(s, 'logical_not', [cref]);
+            } else {
+                gate = cref;
+            }
+            new_check = self._torch_call(s, 'logical_or', [gate, check]);
+            new_params = [new_check] + list(call.params[1:]);
+            new_call = uni.FuncCall(
+                target=call.target,
+                params=new_params,
+                genai_call=None,
+                kid=[call.target] + new_params
+            );
+            out.append(uni.ExprStmt(expr=new_call, in_fstring=False, kid=[new_call]));
+        }
+        return out;
     }
 
     """Replace `old` with `new_nodes` in its parent's typed body and kid list."""

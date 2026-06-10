@@ -106,6 +106,38 @@ def test_validation_guard_defragmented():
     _assert_defragmented("val_guard_all.jac", "f", x, mask)
 
 
+def test_nested_guard_in_branch_defragmented():
+    """A data-dependent branch containing a validation guard collapses to one
+    graph: trap-lowering (assert) composes with predication (torch.where).
+    """
+    x = torch.tensor([1.0, 2.0, 3.0])
+    y = torch.tensor([1.0, 2.0, 3.0])  # equal -> the re-gated assert holds
+    _assert_defragmented("nested_guard_in_branch.jac", "f", x, y)
+
+
+def test_nested_guard_preserves_conditional_assert_semantics():
+    """The hoisted assert is re-gated on the branch predicate: it must NOT fire
+    when the branch that held it is not taken, even if its check would fail.
+
+    Here x.sum() <= 0 selects the else branch, so the guard (x == y).all() --
+    which is False -- must be vacuously satisfied rather than raising.
+    """
+    src = _compile_src("nested_guard_in_branch.jac", True)
+    ns: dict = {}
+    orig_compile = torch.compile
+    torch.compile = lambda *a, **k: a[0] if a else (lambda f: f)
+    try:
+        exec(compile(src, "nested_guard_in_branch.jac", "exec"), ns)
+    finally:
+        torch.compile = orig_compile
+
+    x = torch.tensor([-1.0, -2.0, -3.0])  # sum < 0 -> else branch taken
+    y = torch.tensor([9.0, 9.0, 9.0])  # x != y, but guard must stay dormant
+    out = ns["f"](x, y)
+    # else branch: out = x * 3
+    assert torch.allclose(out, x * 3.0), "untaken-branch guard changed result"
+
+
 def test_print_side_effect_defragmented():
     x = torch.tensor([1.0, 2.0, 3.0])
     _assert_defragmented("side_effect.jac", "f", x)
