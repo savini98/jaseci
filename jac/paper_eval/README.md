@@ -1,0 +1,75 @@
+# GraphMend Paper Reproduction Harness
+
+Reproduces the **break-elimination** and **output-correctness** claims of the
+GraphMend paper (Table 2's fix-rate column + the "bit-identical FP32" result) on
+real Hugging Face models. **CPU-reproducible** — no GPU required.
+
+For each model it runs the forward pass through a counting backend in two
+isolated subprocesses (GraphMend off, then on) and reports breaks before/after
+and whether the output fingerprint is unchanged.
+
+## What this does and does not reproduce
+
+| Paper claim | Here? |
+|---|---|
+| Graph breaks eliminated / fix rate (Table 2) | ✅ yes (CPU) |
+| Output bit-identical (FP32) | ✅ yes (CPU) |
+| Cold-start speedup (up to 26×) | ❌ needs NVIDIA GPU |
+| Steady-state forward speedup (1.05–1.39×) | ❌ needs NVIDIA GPU |
+| Throughput (up to 15%) | ❌ needs NVIDIA GPU |
+
+The speedup rows are hardware-bound (paper used RTX 3090 / A40 / H100) and are
+out of scope for this CPU harness.
+
+## Requirements
+
+- The **repo** `jaclang` must be the one imported (this branch's source, *not*
+  any pip-installed `jaclang`, which predates GraphMend). Run with
+  `PYTHONPATH=<repo>/jac`.
+- `torch==2.12`, `transformers==4.52.4` (the paper's pinned versions).
+
+## Run
+
+```bash
+cd jac
+PYTHONPATH=$PWD python -m paper_eval.run_eval                 # all registered models
+PYTHONPATH=$PWD python -m paper_eval.run_eval t5-small biogpt # a subset
+```
+
+Example output:
+
+```
+model                        breaks_before breaks_after  fixed output_ok
+------------------------------------------------------------------------
+t5-small                                 3            0   100%       yes
+biogpt                                   2            0   100%       yes
+blenderbot-400M-distill                  3            0   100%       yes
+opus-mt-fr-en                            3            0   100%       yes
+PegasusForCausalLM                       2            0   100%       yes
+```
+
+## How GraphMend is applied
+
+The runner sets `program._graphmend_enabled = True` and
+`program._graphmend_scope = [<model's transformers submodule>]` **before**
+importing the model, so the Jac meta-importer routes the model's `.py` modeling
+code through the GraphMend pipeline (same mechanism as
+`jac run model.py --graphmend --graphmend-scope transformers.models.<x>`).
+
+## Notes / faithful-but-scoped caveats
+
+- **Small configs vs full models.** To keep the harness fast and download-free,
+  `registry.py` builds each model from a *small* config (a few layers, random
+  weights). Graph breaks are structural (code paths), so the fix-rate and
+  correctness results are valid, but the *absolute* break count can be lower
+  than the paper's (which uses the full pretrained models). To match the paper's
+  exact per-model counts, swap a builder to `AutoModel.from_pretrained(<id>)`
+  with the paper's inputs (needs network + disk).
+- **Correctness comparison.** The runner fixes `torch.manual_seed(0)` so the
+  off/on runs get identical weights; the output tensor (`logits` /
+  `last_hidden_state`) is SHA-256 fingerprinted and compared.
+- **Adding models.** Add a `_build()` returning `(model, inputs)` and a registry
+  entry with the model's `transformers.models.<x>` scope. The remaining paper
+  models (whisper, bart, Florence-2, grounding-dino, Phi-4-mini, etc.) follow
+  the same pattern; some need model-specific inputs (e.g. whisper takes
+  `input_features`).

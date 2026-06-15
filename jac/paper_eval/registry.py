@@ -1,0 +1,72 @@
+"""Registry of paper-evaluated models: how to build a small instance + inputs,
+and which transformers submodule GraphMend should scope-transform.
+
+Small configs (no weight download) are used so break-counting is fast; graph
+breaks are structural (code paths), not weight-dependent. torch.manual_seed is
+fixed by the runner so the two modes (graphmend on/off) get identical weights,
+making the output fingerprints directly comparable for correctness.
+"""
+import torch
+
+
+def _t5():
+    from transformers import T5Config, T5ForConditionalGeneration
+    cfg = T5Config(vocab_size=128, d_model=64, d_ff=128, num_layers=2,
+                   num_heads=2, d_kv=32)
+    m = T5ForConditionalGeneration(cfg)
+    ids = torch.randint(0, 128, (1, 8))
+    dec = torch.randint(0, 128, (1, 8))
+    return m, {"input_ids": ids, "decoder_input_ids": dec}
+
+
+def _biogpt():
+    from transformers import BioGptConfig, BioGptForCausalLM
+    cfg = BioGptConfig(vocab_size=128, hidden_size=64, num_hidden_layers=2,
+                       num_attention_heads=2, intermediate_size=128,
+                       max_position_embeddings=64)
+    m = BioGptForCausalLM(cfg)
+    return m, {"input_ids": torch.randint(0, 128, (1, 8))}
+
+
+def _blenderbot():
+    from transformers import BlenderbotConfig, BlenderbotForConditionalGeneration
+    cfg = BlenderbotConfig(vocab_size=128, d_model=64, encoder_layers=2,
+                           decoder_layers=2, encoder_attention_heads=2,
+                           decoder_attention_heads=2, encoder_ffn_dim=128,
+                           decoder_ffn_dim=128, max_position_embeddings=64)
+    m = BlenderbotForConditionalGeneration(cfg)
+    ids = torch.randint(0, 128, (1, 8))
+    dec = torch.randint(0, 128, (1, 8))
+    return m, {"input_ids": ids, "decoder_input_ids": dec}
+
+
+
+def _marian():
+    from transformers import MarianConfig, MarianMTModel
+    cfg = MarianConfig(vocab_size=128, d_model=64, encoder_layers=2,
+                       decoder_layers=2, encoder_attention_heads=2,
+                       decoder_attention_heads=2, encoder_ffn_dim=128,
+                       decoder_ffn_dim=128, max_position_embeddings=64,
+                       decoder_start_token_id=2, pad_token_id=1)
+    m = MarianMTModel(cfg)
+    ids = torch.randint(3, 128, (1, 8))
+    dec = torch.randint(3, 128, (1, 8))
+    return m, {"input_ids": ids, "decoder_input_ids": dec}
+
+
+def _pegasus_causal():
+    from transformers import PegasusConfig, PegasusForCausalLM
+    cfg = PegasusConfig(vocab_size=128, d_model=64, decoder_layers=2,
+                        decoder_attention_heads=2, decoder_ffn_dim=128,
+                        max_position_embeddings=64)
+    m = PegasusForCausalLM(cfg)
+    return m, {"input_ids": torch.randint(0, 128, (1, 8))}
+
+
+MODELS = {
+    "t5-small":       {"build": _t5,         "scope": ["transformers.models.t5"]},
+    "biogpt":         {"build": _biogpt,     "scope": ["transformers.models.biogpt"]},
+    "blenderbot-400M-distill": {"build": _blenderbot, "scope": ["transformers.models.blenderbot"]},
+    "opus-mt-fr-en":  {"build": _marian,        "scope": ["transformers.models.marian"]},
+    "PegasusForCausalLM": {"build": _pegasus_causal, "scope": ["transformers.models.pegasus"]},
+}

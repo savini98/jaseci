@@ -1,0 +1,58 @@
+"""GraphMend paper reproduction harness (break-elimination + output correctness).
+
+For each registered model, runs the forward pass through a counting backend in
+two isolated subprocesses (GraphMend off, then on), and reports:
+  - breaks before / after  (reproduces Table 2 break counts + fix rate)
+  - output fingerprint match (reproduces the bit-identical FP32 claim)
+
+CPU-reproducible; GPU is only needed for the latency/throughput numbers, which
+are out of scope here. Run with the repo jaclang on PYTHONPATH:
+
+    PYTHONPATH=$PWD python -m paper_eval.run_eval [model_key ...]
+"""
+import sys, os, json, subprocess
+
+from paper_eval.registry import MODELS
+
+
+def _run(key: str, mode: str) -> dict:
+    env = dict(os.environ, PYTHONPATH=os.getcwd())
+    p = subprocess.run([sys.executable, "-m", "paper_eval._runner", key, mode],
+                       capture_output=True, text=True, env=env)
+    for line in reversed(p.stdout.strip().splitlines()):
+        try:
+            return json.loads(line)
+        except Exception:
+            continue
+    return {"key": key, "mode": mode, "graphs": None, "breaks": None,
+            "out_hash": None, "error": (p.stderr.strip()[-160:] or "no output")}
+
+
+def main(keys):
+    rows = []
+    tot_before = tot_after = 0
+    for key in keys:
+        off = _run(key, "off")
+        on = _run(key, "on")
+        err = off["error"] or on["error"]
+        if err:
+            rows.append((key, "-", "-", "-", "ERR")); print(f"  {key}: {err}", file=sys.stderr); continue
+        b0, b1 = off["breaks"], on["breaks"]
+        fixed = b0 - b1
+        pct = f"{100*fixed//b0 if b0 else 100}%"
+        correct = "yes" if off["out_hash"] == on["out_hash"] else "NO"
+        tot_before += b0; tot_after += b1
+        rows.append((key, b0, b1, pct, correct))
+
+    print(f"\n{'model':28} {'breaks_before':>13} {'breaks_after':>12} {'fixed':>6} {'output_ok':>9}")
+    print("-" * 72)
+    for r in rows:
+        print(f"{r[0]:28} {str(r[1]):>13} {str(r[2]):>12} {str(r[3]):>6} {str(r[4]):>9}")
+    print("-" * 72)
+    if tot_before:
+        print(f"{'TOTAL':28} {tot_before:>13} {tot_after:>12} "
+              f"{100*(tot_before-tot_after)//tot_before:>5}% (eliminated {tot_before-tot_after}/{tot_before})")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:] or list(MODELS))
