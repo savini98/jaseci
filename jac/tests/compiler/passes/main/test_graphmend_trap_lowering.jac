@@ -32,18 +32,28 @@ def _pysrc(name: str, gm: bool) -> str {
 
 test "torch.equal guard lowers to the tensor-equality assert helper" {
     src = _pysrc("val_guard.jac", True);
+    # The original ValueError type/message are folded into a trap marker so the
+    # boundary @__jac_trap_guard__ decorator can restore them at the call site.
     assert (
-        "__jac_tensor_eq_assert__(attention_mask, expected, 'unsupported attention mask')" in src
+        "__jac_tensor_eq_assert__(attention_mask, expected, "
+        "'[[GM-TRAP ValueError]]unsupported attention mask[[/GM-TRAP]]')" in src
     );
-    # helper import is emitted and the raising branch is gone
+    assert "@__jac_trap_guard__" in src;
+    # helper imports are emitted and the raising branch is gone
     assert "import __jac_tensor_eq_assert__" in src;
+    assert "__jac_trap_guard__" in src;
     assert "raise ValueError" not in src;
     assert "if not torch.equal" not in src;
 }
 
 test "tensor-bool guard lowers to torch._assert_async directly" {
     src = _pysrc("val_guard_all.jac", True);
-    assert "torch._assert_async(mask.all(), 'mask must be all true')" in src;
+    assert (
+        "torch._assert_async(mask.all(), "
+        "'[[GM-TRAP ValueError]]mask must be all true[[/GM-TRAP]]')" in src
+    );
+    # boundary decorator restores the exception type at the call site
+    assert "@__jac_trap_guard__" in src;
     assert "raise ValueError" not in src;
     assert "if not mask.all()" not in src;
 }

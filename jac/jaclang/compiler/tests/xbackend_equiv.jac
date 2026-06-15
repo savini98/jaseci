@@ -165,6 +165,10 @@ def unbox_jacval(jv: JacVal) -> object {
         st_ptr = ctypes.cast(jv.payload, ctypes.POINTER(SetStruct));
         n = st_ptr.contents.len;
         return {st_ptr.contents.elems[i] for i in range(n)};
+    } elif jv.tag == 7 {
+        # bool: kept distinct from int (tag 0) so it round-trips as True/False
+        # rather than 1/0, matching the Python reference exactly.
+        return jv.payload != 0;
     }
     return None;
 }
@@ -226,21 +230,51 @@ def compare_results(
 # Dispatch helper: run py reference, then try ES and NA backends
 # -----------------------------------------------------------------------
 def run_with_both(
-    fixture: str, py_fn: str, cl_fn: str, na_fn: str, tolerance: float = 1e-9
+    fixture: str,
+    py_fn: str,
+    cl_fn: str,
+    na_fn: str,
+    tolerance: float = 1e-9,
+    require: (list | None) = None
 ) {
+    # `require` names backends ("cl"/"na") that must actually participate: if a
+    # required backend fails to compile/run or shares no comparable keys with
+    # the py reference, that is a hard failure rather than a silent skip. This
+    # turns "support landed" into an enforced regression guard.
+    reqd: list = require if require is not None else [];
     stem = fixture[:-4] if fixture.endswith(".jac") else fixture;
     py_result = run_py_fixture(stem, py_fn);
     label = fixture;
+    cl_keys: int = 0;
     try {
         js_code = compile_fixture_to_js(fixture);
-        compare_results(
-            py_result, run_js_function(js_code, cl_fn), f"{label} [ES]", tolerance
+        cl_result = run_js_function(js_code, cl_fn);
+        cl_keys = len(set(py_result.keys()) & set(cl_result.keys()));
+        compare_results(py_result, cl_result, f"{label} [ES]", tolerance);
+    } except Exception {
+        if "cl" in reqd {
+            raise;
+        }
+    }
+    if ("cl" in reqd) and (cl_keys == 0) {
+        raise AssertionError(
+            f"[{label}] cl backend was required but produced no comparable data"
         );
-    } except Exception { }
+    }
+    na_keys: int = 0;
     try {
         (eng, _) = compile_native(fixture);
-        compare_results(
-            py_result, run_native_function(eng, na_fn), f"{label} [NA]", tolerance
+        na_result = run_native_function(eng, na_fn);
+        na_keys = len(set(py_result.keys()) & set(na_result.keys()));
+        compare_results(py_result, na_result, f"{label} [NA]", tolerance);
+    } except Exception {
+        if "na" in reqd {
+            raise;
+        }
+    }
+    if ("na" in reqd) and (na_keys == 0) {
+        raise AssertionError(
+            f"[{label}] na backend was required but produced no comparable data"
         );
-    } except Exception { }
+    }
 }

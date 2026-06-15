@@ -148,6 +148,98 @@ def test_logger_side_effect_defragmented():
     _assert_defragmented("side_effect_logger.jac", "f", x)
 
 
+def test_print_side_effect_defragmented_with_clone():
+    """The snapshot-clone of a buffered arg must not reintroduce a graph break."""
+    x = torch.tensor([1.0, 2.0, 3.0])
+    _assert_defragmented("side_effect_clone.jac", "f", x)
+
+
+def _run_fixture_capturing_stdout(fixture: str, fn_name: str, *args: object) -> str:
+    """Compile a fixture with GraphMend, drive it through a counting backend, and
+    return everything written to stdout by the deferred-side-effect flush."""
+    import contextlib
+    import io
+
+    src = _compile_src(fixture, True)
+    ns: dict = {}
+    orig_compile = torch.compile
+    torch.compile = lambda *a, **k: a[0] if a else (lambda f: f)
+    try:
+        exec(compile(src, fixture, "exec"), ns)
+    finally:
+        torch.compile = orig_compile
+
+    def backend(gm: object, inputs: object) -> object:
+        return gm.forward  # type: ignore[attr-defined]
+
+    buf = io.StringIO()
+    torch._dynamo.reset()
+    with contextlib.redirect_stdout(buf):
+        torch.compile(ns[fn_name], backend=backend)(*args)
+    return buf.getvalue()
+
+
+def test_buffered_arg_is_snapshotted_against_later_mutation():
+    """The buffered tensor is mutated in place after the print; the deferred
+    output must show the pre-mutation snapshot, not the mutated value.
+
+    relu([1,2,3]) = [1,2,3]; an in-place add of 100 would make it [101,102,103].
+    The clone at the call site means the flushed print still reports [1,2,3].
+    """
+    x = torch.tensor([1.0, 2.0, 3.0])
+    out = _run_fixture_capturing_stdout("side_effect_clone.jac", "f", x)
+    assert "snap:" in out, f"deferred print did not run: {out!r}"
+    assert "101" not in out, f"deferred print saw the post-mutation value: {out!r}"
+    assert "1., 2., 3." in out, f"deferred print lost the snapshot value: {out!r}"
+
+
+def _exec_with_real_eager_compile(fixture: str) -> dict:
+    """Compile a fixture with GraphMend and exec it, with ``@torch.compile``
+    rebound to a REAL eager-backend compile (not identity). The graph-native
+    assert then fails asynchronously at the call boundary, where the injected
+    ``@__jac_trap_guard__`` decorator catches it -- exactly the production path."""
+    src = _compile_src(fixture, True)
+    ns: dict = {}
+    orig_compile = torch.compile
+
+    def eager_compile(*a: object, **k: object) -> object:
+        if a:
+            return orig_compile(a[0], backend="eager")
+        return lambda f: orig_compile(f, backend="eager")
+
+    torch.compile = eager_compile
+    try:
+        exec(compile(src, fixture, "exec"), ns)
+    finally:
+        torch.compile = orig_compile
+    return ns
+
+
+def test_trap_guard_restores_exception_type_and_message():
+    """A failing tensor-bool guard must surface as the ORIGINAL exception type
+    (ValueError) with the original message, not a raw RuntimeError -- restored by
+    the boundary trap-guard decorator after the graph-native assert fails."""
+    ns = _exec_with_real_eager_compile("val_guard_all.jac")
+    x = torch.tensor([1.0, 2.0, 3.0])
+    good = torch.tensor([True, True, True])
+    bad = torch.tensor([True, False, True])
+
+    torch._dynamo.reset()
+    # passing guard returns normally
+    out = ns["f"](x, good)
+    assert torch.allclose(out, torch.sin(torch.relu(x)) * 2.0)
+
+    torch._dynamo.reset()
+    raised = None
+    try:
+        ns["f"](x, bad)
+    except BaseException as e:  # noqa: BLE001
+        raised = e
+    assert type(raised) is ValueError, f"expected ValueError, got {raised!r}"
+    assert str(raised) == "mask must be all true", f"message lost: {raised!r}"
+    assert "GM-TRAP" not in str(raised), "internal trap marker leaked to the user"
+
+
 def _run_model_fixture(graphmend: bool) -> tuple[int, list]:
     """Compile the forward-hook fixture, build the model, and drive it through a
     counting backend. Returns (graph_count, captured_log_messages).

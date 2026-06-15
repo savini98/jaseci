@@ -635,6 +635,8 @@ Roles are stored in the user document and included in JWT claims. The admin user
 - System accounts (role `system`)
 - The guest account (identity `__guest__`)
 
+The guest account's root is the deployment's public graph - every unauthenticated request runs on it, and Jac code addresses it from any request as `root.shared` (see [The Shared Root](../language/osp.md#6-the-shared-root-rootshared)).
+
 Roles are managed via the admin portal API or programmatically through the `UserManager`:
 
 ```bash
@@ -1289,7 +1291,7 @@ with entry {
 All walker and function endpoints are **protected by default** -- they require JWT authentication. You must explicitly opt-in to public access using the `:pub` modifier. This secure-by-default approach prevents accidentally exposing endpoints without authentication.
 
 ```jac
-# Protected (default) -- requires JWT token
+# Protected (default) -- requires JWT token, runs on the caller's own isolated root
 walker get_profile {
     can fetch with Root entry { report [-->]; }
 }
@@ -1299,7 +1301,7 @@ walker :pub health_check {
     can check with Root entry { report {"status": "ok"}; }
 }
 
-# Private -- requires authentication, per-user isolated
+# Private -- identical to the default; `:priv` is the explicit spelling
 walker :priv internal_process {
     can run with Root entry { }
 }
@@ -1307,13 +1309,12 @@ walker :priv internal_process {
 
 ### Walker Access Levels
 
-Walkers have three access levels when served as API endpoints:
+Walkers have two access levels when served as API endpoints (`:priv` is the explicit spelling of the default):
 
 | Access | Description |
 |--------|-------------|
-| Public (`:pub`) | Accessible without authentication |
-| Protected (default) | Requires JWT authentication |
-| Private (`:priv`) | Requires JWT authentication; per-user isolated (each user operates on their own graph) |
+| Public (`:pub`) | Accessible without authentication. Anonymous callers run on the shared guest graph (`root.shared`); a caller presenting a valid token runs on their own root. |
+| Protected (default) and Private (`:priv`) | Require JWT authentication; per-user isolated (each user operates on their own graph). The unmarked default and `:priv` behave identically. |
 
 ### Permission Functions Reference
 
@@ -2406,6 +2407,8 @@ shelf_db_path = ".jac/data/anchor_store.db"  # SQLite/shelf path for local dev
 | `mongodb_uri`| None | External MongoDB URI. When set, K8s MongoDB StatefulSet is not provisioned. |
 | `redis_url`  | None | External Redis URL. When set, K8s Redis is not provisioned. |
 | `shelf_db_path` | `.jac/data/anchor_store.db` | Local shelf/SQLite storage path for `jac start` (no K8s) |
+| `redis_l1_invalidation_enabled` | `true` | Broadcast/apply cross-pod L1 cache evictions over Redis pub/sub (see [Memory Hierarchy](#cross-pod-l1-invalidation)). |
+| `redis_l1_invalidation_channel` | `"jac:anchor:invalidate"` | Pub/sub channel for L1 invalidation messages; all pods sharing a cache must match. |
 
 ---
 
@@ -2478,6 +2481,37 @@ graph TD
     L2 --- L3["L3: MongoDB (persistent)"]
 ```
 
+#### Cross-Pod L1 Invalidation
+
+L1 is an in-process cache: each request gets a fresh, request-scoped L1 that
+loads anchors from L3 and serves repeated reads of the same anchor from memory
+for the rest of that request. This is what makes a single request fast, but it
+also means that while a request holds an anchor in its L1, a **concurrent
+request on another pod** can commit a new version of that same anchor to L3.
+Without coordination, the first request keeps serving the stale snapshot it
+already loaded.
+
+To prevent that, every write broadcasts a small invalidation message over a
+**Redis pub/sub channel**. One daemon listener per process subscribes to that
+channel and, on each message, flags the named anchor _stale_ in every _other_
+live L1 in the process. The listener never mutates a sibling's cache directly;
+instead each owning request, on its next read of that anchor, drops its copy and
+reloads fresh from L3 -- but **only if the copy is unmodified**. A request that
+has its own uncommitted change to that anchor keeps it, so an in-flight write is
+never silently discarded. The writer's own L1 is excluded from the broadcast (it
+already holds the freshly merged copy), and deletes/quarantines flag everyone.
+The listener self-heals across Redis restarts with capped exponential backoff,
+and if Redis or the `redis` extra is unavailable the feature simply stays off:
+the system degrades to plain per-request L1s with no cross-pod coherence.
+
+This is on by default whenever a Redis URL resolves. Tune it under
+`[plugins.scale.database]`:
+
+| `jac.toml` key | Default | Description |
+|----------------|---------|-------------|
+| `redis_l1_invalidation_enabled` | `true` | Broadcast and apply cross-pod L1 evictions over Redis pub/sub. |
+| `redis_l1_invalidation_channel` | `"jac:anchor:invalidate"` | Pub/sub channel used for invalidation messages. All pods sharing a cache must agree on this value. |
+
 ---
 
 ## Kubernetes Deployment
@@ -2524,7 +2558,9 @@ namespace = "production"
 
 Controls how the application is exposed inside the cluster and externally.
 
-All traffic flows through a single **NGINX Ingress controller** deployed per app. The Ingress controller listens on one NodePort and routes requests to the correct ClusterIP service based on path. Individual services (app, Grafana, dashboards) are all ClusterIP and not directly reachable from outside the cluster.
+By default, jac-scale deploys a **dedicated NGINX Ingress controller per app**. The controller listens on one NodePort and routes requests to the correct ClusterIP service based on path. Individual services (app, Grafana, dashboards) are all ClusterIP and not directly reachable from outside the cluster.
+
+To use a pre-existing shared controller instead, see [Shared Ingress](#shared-ingress) below.
 
 **Defaults:**
 
@@ -2549,6 +2585,71 @@ All traffic flows through a single **NGINX Ingress controller** deployed per app
 container_port = 8000
 ingress_node_port = 30080
 ```
+
+---
+
+### Shared Ingress
+
+By default each app deploys its own NGINX controller (one Deployment, one NodePort/NLB, one IngressClass). Set `shared_ingress = true` to skip that and attach the app's routing rules to a pre-existing shared NGINX controller in your cluster instead.
+
+**When to use shared ingress:**
+
+- You already run a cluster-wide `ingress-nginx` controller (e.g. installed via Helm) and don't want a separate controller per app
+- You are deploying multiple apps to the same cluster and want to reduce resource overhead
+
+**Requirements:**
+
+- A running NGINX ingress controller must already exist in the cluster
+- `domain` **must** be set. The shared controller sees Ingress resources from all namespaces, so host-based routing is the only way to differentiate two apps. jac-scale raises an error at deploy time if `domain` is empty when `shared_ingress = true`
+
+**Configuration:**
+
+| TOML Key | Default | Description |
+|----------|---------|-------------|
+| `shared_ingress` | `false` | Use a pre-existing shared controller instead of deploying a dedicated one |
+| `shared_ingress_class` | `"nginx"` | IngressClass name of the shared controller |
+| `shared_ingress_annotations` | `{}` | Extra annotations merged onto the Ingress. Required to drive non-nginx controllers (AWS ALB, Traefik, GKE). Caller-supplied values take precedence |
+| `shared_ingress_tls` | `false` | Set when the controller terminates TLS out-of-band (e.g. ALB via an ACM cert) so the reported URL uses `https`. nginx+cert-manager (`spec.tls`) is detected automatically |
+
+```toml
+[plugins.scale.kubernetes]
+shared_ingress = true
+domain = "myapp.example.com"          # required: used as the Ingress host field
+
+# Override if your shared controller uses a non-default class
+# shared_ingress_class = "nginx"
+```
+
+**Non-nginx controllers (e.g. AWS ALB).** `shared_ingress_class` may name any controller; nginx-specific tuning is emitted only when the class is `nginx`. Supply controller-specific settings via `shared_ingress_annotations` so jac-scale stays cloud-agnostic:
+
+```toml
+[plugins.scale.kubernetes]
+shared_ingress = true
+shared_ingress_class = "alb"
+shared_ingress_tls = true
+domain = "linkedin.jaseci.app"
+
+[plugins.scale.kubernetes.shared_ingress_annotations]
+"alb.ingress.kubernetes.io/group.name" = "shared-alb"     # join one shared ALB
+"alb.ingress.kubernetes.io/scheme" = "internet-facing"
+"alb.ingress.kubernetes.io/target-type" = "ip"
+"alb.ingress.kubernetes.io/certificate-arn" = "arn:aws:acm:...:certificate/..."
+"alb.ingress.kubernetes.io/listen-ports" = '[{"HTTP": 80}, {"HTTPS": 443}]'
+"alb.ingress.kubernetes.io/ssl-redirect" = "443"
+```
+
+**What changes in shared mode:**
+
+| Behaviour | Dedicated (default) | Shared |
+|-----------|---------------------|--------|
+| Controller deployed | Yes (one per app) | No (uses existing controller) |
+| IngressClass | `{namespace}-{app_name}-nginx` | Value of `shared_ingress_class` |
+| Routing rules | Wildcard (host set by `--enable-tls`) | Host set immediately to `domain` |
+| On destroy | Removes controller, RBAC, IngressClass, and Ingress rules | Removes Ingress rules only; controller is untouched |
+| TLS (`--enable-tls`) | Works (cert-manager Issuer uses app-specific class) | Works (cert-manager Issuer uses shared class) |
+
+!!! note
+    Because the shared controller routes by the `Host:` header, each app in the cluster must have a unique domain. Two apps named `jaseci` in `dev` and `prod` namespaces are fully isolated as long as they have different domains (`dev.example.com` vs `prod.example.com`).
 
 ---
 

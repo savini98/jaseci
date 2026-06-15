@@ -367,7 +367,7 @@ glob E0001 = _err("E0001", Category.SYNTAX, "Expected '{expected}', got '{got}'"
          "W1036",
          Category.TYPE,
          "Generic type \"{type}\" used without type arguments, defaulting to"
-         " \"{type}[Any]\"; consider adding explicit type arguments"
+         " \"{type}[any]\"; consider adding explicit type arguments"
      ),
      # Explicit `any` annotation warning
      W1037 = _warn(
@@ -386,6 +386,13 @@ glob E0001 = _err("E0001", Category.SYNTAX, "Expected '{expected}', got '{got}'"
          "that was not awaited",
          help="Add 'await' to the call, e.g. 'await foo()'. 'sv import' (server) "
          "functions are async RPC stubs on the client and always need 'await'."
+     ),
+     E1043 = _err(
+         "E1043",
+         Category.TYPE,
+         "TypedDict \"{type}\" has no key \"{key}\"",
+         help="Add the key to the TypedDict definition, or index with a key "
+         "declared on the type."
      ),
      # Function call errors
      E1050 = _err(
@@ -609,7 +616,7 @@ glob E0001 = _err("E0001", Category.SYNTAX, "Expected '{expected}', got '{got}'"
      W1102 = _warn(
          "W1102",
          Category.IMPORT,
-         "Imported name '{name}' from foreign-source module '{module}' typed as Any"
+         "Imported name '{name}' from foreign-source module '{module}' typed as any"
      ),
      W1103 = _warn(
          "W1103",
@@ -687,6 +694,11 @@ glob E0001 = _err("E0001", Category.SYNTAX, "Expected '{expected}', got '{got}'"
      ),
      E2083 = _err(
          "E2083", Category.SEMANTIC, "'disengage' is only valid inside a walker ability"
+     ),
+     E2027 = _err(
+         "E2027",
+         Category.SEMANTIC,
+         "Endpoint clause ': Src --> Tgt' is only valid on an 'edge' archetype, not on {arch_type} '{name}'"
      ),
      # Def-impl match errors
      E2009 = _err(
@@ -811,6 +823,13 @@ glob E0001 = _err("E0001", Category.SYNTAX, "Expected '{expected}', got '{got}'"
          "for a value ref. It lowers to React's 'useRef', so a bare "
          "declaration has no ref object to hold — '.current' would never be "
          "defined. This mirrors how every other 'has'-field carries a value."
+     ),
+     E2026 = _err(
+         "E2026",
+         Category.SEMANTIC,
+         "Definition '{name}' in .impl.jac file is not linked to its declaration stub. "
+         "Use an `impl` block instead of a bare re-declaration.",
+         help="In Jac, implementation files use `impl Name {{ ... }}` or `impl Name(...) {{ ... }}` blocks to provide bodies for declaration stubs. A bare re-declaration in a `.impl.jac` file is treated as a separate definition and will not be linked to the stub."
      ),
      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
      # Lint warnings (W3xxx)
@@ -1036,6 +1055,11 @@ glob E0001 = _err("E0001", Category.SYNTAX, "Expected '{expected}', got '{got}'"
      E5012 = _err(
          "E5012", Category.CODEGEN, "Expected main module to be a Module node."
      ),
+     E5016 = _err(
+         "E5016",
+         Category.CODEGEN,
+         "Could not generate JavaScript for builtin '{name}': {error}"
+     ),
      W5013 = _warn(
          "W5013",
          Category.CODEGEN,
@@ -1122,6 +1146,12 @@ glob E0001 = _err("E0001", Category.SYNTAX, "Expected '{expected}', got '{got}'"
          "Native pathway does not yet support {kind} '{name}'",
          help="This Jac construct is supported on the @sv/Python pathway but is not implemented in the .na.jac native compiler yet. Move the code to a non-native context, or extend NaIRGenPass to handle this node type."
      ),
+     E5091 = _err(
+         "E5091",
+         Category.CODEGEN,
+         "Native union trigger members {members} disagree on the layout of field '{field}'",
+         help="A tuple/union trigger like `with (A, B) entry` lowers field access on `here`/`visitor` through a single shared layout, so every member must place the common field at the same offset and type. Reorder the `has` declarations so the shared fields line up, or split the trigger into separate abilities per archetype."
+     ),
      # Language server
      E5070 = _err("E5070", Category.CODEGEN, "Error during type check: {error}"),
      E5071 = _err("E5071", Category.CODEGEN, "Error during formatting: {error}"),
@@ -1166,4 +1196,10 @@ glob E0001 = _err("E0001", Category.SYNTAX, "Expected '{expected}', got '{got}'"
      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
      # Internal compiler errors (E9xxx)
      # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-     E9001 = _err("E9001", Category.ICE, "ICE: Pass {pass_name} -- {details}");
+     E9001 = _err("E9001", Category.ICE, "ICE: Pass {pass_name} -- {details}"),
+     E9002 = _err(
+         "E9002",
+         Category.ICE,
+         "ICE: missing semantic annotation -- {details}",
+         help="Codegen required a fact the central analysis pipeline never recorded on the unitree. This is a compiler bug, not an error in your program."
+     );

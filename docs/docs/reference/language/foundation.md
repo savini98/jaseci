@@ -214,12 +214,14 @@ Jac keywords are reserved and cannot be used as identifiers:
 | **Loop** | `break`, `continue` |
 | **Return** | `return`, `yield`, `report`, `skip` |
 | **Exception** | `try`, `except`, `finally`, `raise`, `assert` |
-| **OSP** | `visit`, `disengage`, `spawn`, `here`, `root`, `visitor`, `entry`, `exit` |
+| **OSP** | `visit`, `disengage`, `spawn`, `here`, `root`, `visitor` |
 | **Module** | `import`, `include`, `from`, `as`, `glob` |
 | **Blocks** | `cl` (client), `sv` (server), `na` (native) |
 | **Other** | `with`, `test`, `impl`, `sem`, `by`, `del`, `in`, `is`, `and`, `or`, `not`, `async`, `await`, `flow`, `wait`, `lambda`, `props` |
 
 **Note:** The abstract modifier keyword is `abs`, not `abstract`.
+
+**Note:** `entry` and `exit` are *contextual* keywords -- they have special meaning only in entry/exit clauses (`with entry`, `can ... with Root exit`) and remain valid as ordinary identifiers (`entry = 5;` is fine).
 
 ### 6 Identifiers
 
@@ -426,28 +428,35 @@ with entry {
 
 ### 3 Generic Types
 
-Jac will support generic type parameters using Python-style syntax (coming soon):
+Jac supports declared generic type parameters using Python-style (PEP 695) syntax, with defaults:
 
 ```jac
-# Generic function (coming soon):
-# def first[T](items: list[T]) -> T {
-#     return items[0];
-# }
-
-# Generic object (coming soon):
-# obj Container[T] {
-#     has value: T;
-# }
-
-# For now, use `any` as a placeholder:
-def first(items: list) -> any {
+# Generic function
+def first[T](items: list[T]) -> T {
     return items[0];
 }
 
-obj Container {
-    has value: any;
+# Generic objects, optionally with parameter defaults
+obj Container[T] {
+    has value: T;
+}
+
+obj Result[T, E = Exception] {
+    has value: T | None = None,
+        error: E | None = None;
+}
+
+with entry {
+    c = Container(value=42);   # subscripting the class is optional here
+    print(c.value);
+    print(first([1, 2, 3]));
 }
 ```
+
+Two current limitations to be aware of:
+
+- **Type-parameter defaults don't apply at subscripted construction.** `Result(value=42)` and `Result[int, ValueError](value=42)` work, but `Result[int](value=42)` -- leaving `E` to its default -- passes `jac check` and raises a `TypeError` at runtime. When in doubt, construct without the subscript.
+- **Type-parameter inference is conservative.** The checker treats a returned `T` opaquely in some positions (e.g. `first([1, 2]) + 1` is rejected with E1010). Recover the concrete type with the [`as` cast operator](#10-the-as-cast-operator): `n = first(nums) as int;`.
 
 !!! tip "Remember the backtick"
     If you need to use the built-in function to check if any item is truthy, use `` `any ``:
@@ -490,7 +499,7 @@ obj Example {
     has value: int | str | None;
 }
 
-def process(data: list[int] | dict[str, int]) -> None {
+def process(data: list[int] | dict[str, int]) {
     # Handle either type
 }
 ```
@@ -779,10 +788,10 @@ When Jac looks up a name, it searches in this order:
 ```jac
 glob x = "global";
 
-def outer -> None {
+def outer {
     x = "enclosing";
 
-    def inner -> None {
+    def inner {
         x = "local";
         print(x);  # "local" - found in Local scope
     }
@@ -797,14 +806,14 @@ def outer -> None {
 ```jac
 glob counter: int = 0;
 
-def increment -> None {
+def increment {
     global counter;    # Declares intent to modify global
     counter += 1;
 }
 
-def outer -> None {
+def outer {
     x = 10;
-    def inner -> None {
+    def inner {
         nonlocal x;    # Declares intent to modify enclosing
         x += 1;
     }
@@ -1779,7 +1788,7 @@ def example(input: str) {
 **Multiple exception types:**
 
 ```jac
-def process(data: any) -> None {
+def process(data: any) {
     print(data);
 }
 
@@ -1824,14 +1833,14 @@ def example() {
 **Raising exceptions:**
 
 ```jac
-def validate(input: str) -> None {
+def validate(input: str) {
     if not input {
         # Raise an exception
         raise ValueError("Invalid input");
     }
 }
 
-def process(item: str) -> None {
+def process(item: str) {
     try {
         validate(item);
     } except ValueError as e {
@@ -1849,7 +1858,7 @@ obj ValidationError(Exception) {
     has message: str;
 }
 
-def validate(data: dict) -> None {
+def validate(data: dict) {
     if "name" not in data {
         raise ValidationError(field="name", message="Name is required");
     }
@@ -1880,7 +1889,7 @@ def example() {
 obj Account {
     has balance: float = 0.0;
 
-    def withdraw(amount: float) -> None {
+    def withdraw(amount: float) {
         assert amount > 0, "Withdrawal amount must be positive";
         assert amount <= self.balance, "Insufficient funds";
         self.balance -= amount;
@@ -2010,12 +2019,12 @@ The native backend supports:
 
 ### C Library Imports
 
-Import C shared libraries directly in native Jac code:
+Import C shared libraries directly in native Jac code. A library can be named by its logical name (dotted, extensionless), which the backend resolves to the platform's filename -- `m` becomes `libm.so` on Linux, `libm.dylib` on macOS, and `m.dll` on Windows:
 
 <!-- jac-skip -->
 ```jac
 # compute.na.jac
-import from "libm" {
+import from m {
     def sin(x: f64) -> f64;
     def cos(x: f64) -> f64;
     def sqrt(x: f64) -> f64;
@@ -2031,7 +2040,7 @@ C structs can be declared inside library import blocks and used as normal Jac ob
 
 <!-- jac-skip -->
 ```jac
-import from "libgraphics" {
+import from graphics {
     obj Color {
         has r: u8, g: u8, b: u8, a: u8;
     }
@@ -2039,14 +2048,14 @@ import from "libgraphics" {
 }
 ```
 
+An explicit path string (`import from "/usr/lib/libm.so.6" { ... }`) is still accepted for a pinned or versioned file. See the [C Library Interop](native-pathway.md#c-library-interop) section of the native pathway reference for the full resolution rules.
+
 ### Python-Native Interop
 
 Native and Python codespaces can call each other within the same module:
 
 ```jac
 # main.jac (Python/server codespace)
-to sv:
-
 def process_data(data: list) -> list {
     # Python code with full PyPI access
     return sorted(data);

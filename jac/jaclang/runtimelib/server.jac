@@ -7,6 +7,8 @@ import inspect;
 import json;
 import os;
 import secrets;
+import sqlite3;
+import threading;
 import from collections.abc { Callable }
 import from contextlib { suppress }
 import from http.server { BaseHTTPRequestHandler, HTTPServer }
@@ -24,7 +26,6 @@ import from urllib.parse { parse_qs, urlparse }
 import from jaclang.runtimelib.client_bundle { ClientBundleError }
 import from jaclang.runtimelib.context { CallState, ExecutionContext }
 import from jaclang.runtimelib.transport {
-    BaseTransport,
     TransportRequest,
     TransportResponse,
     HTTPTransport,
@@ -69,8 +70,8 @@ driver (aiosqlite) or per-thread connection pool would obviate this.
 obj UserManager {
     has base_path: str,
         _db_path: str by postinit,
-        _conn: any by postinit,
-        _lock: any by postinit;
+        _conn: (sqlite3.Connection | None) by postinit,
+        _lock: threading.RLock by postinit;
 
     def postinit -> None;
     def _ensure_connection -> None;
@@ -160,6 +161,7 @@ obj ModuleIntrospector {
     def load(force_reload: bool = False) -> None;
     def _load_manifest -> None;
     def _extract_access_levels -> None;
+    def _collect_cross_boundary_endpoints -> None;
     def _fill_endpoint_effect_defaults -> None;
     def _collect_functions -> dict[str, Callable[(..., Any)]];
     def _collect_walkers -> dict[str, type[WalkerArchetype]];
@@ -167,6 +169,7 @@ obj ModuleIntrospector {
     def get_functions -> dict[str, Callable[(..., Any)]];
     def get_walkers -> dict[str, type[WalkerArchetype]];
     def get_client_functions -> dict[str, Callable[(..., Any)]];
+    def resolve_root_app(configured: str = "") -> str;
     def introspect_callable(func: Callable[(..., Any)]) -> dict[str, any];
     def introspect_walker(walker_cls: type[WalkerArchetype]) -> dict[str, any];
     def ensure_bundle -> str;
@@ -269,8 +272,7 @@ obj JacAPIServer {
         auth_handler: AuthHandler by postinit,
         introspection_handler: IntrospectionHandler by postinit,
         execution_handler: ExecutionHandler by postinit,
-        transport: BaseTransport by postinit,
-        server: any by postinit,
+        server: (HTTPServer | None) by postinit,
         scheduler: Scheduler by postinit;
 
     obj RestSpecs {

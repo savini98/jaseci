@@ -41,17 +41,8 @@ impl NativeCompilePass.transform(ir_in: uni.Module) -> uni.Module {
         if clib_paths {
             for lib_path in clib_paths {
                 try {
-                    # Try as absolute/relative path first
-                    if os.path.exists(lib_path) {
-                        llvm.load_library_permanently(lib_path);
-                    } else {
-                        # Try system library lookup
-                        found = ctypes.util.find_library(lib_path);
-                        if found {
-                            llvm.load_library_permanently(found);
-                        } else {
-                            self.emit(W5021, path=lib_path);
-                        }
+                    if not self._jit_load_clib(lib_path) {
+                        self.emit(W5021, path=lib_path);
                     }
                 } except Exception as lib_err {
                     self.emit(W5022, path=lib_path, error=str(lib_err));
@@ -60,7 +51,16 @@ impl NativeCompilePass.transform(ir_in: uni.Module) -> uni.Module {
         }
         mod = llvm.parse_assembly(llvm_ir_str);
         mod.verify();
-        target = llvm.Target.from_default_triple();
+        # Honor a JAC_NATIVE_TARGET cross-compile override; the IR already
+        # carries the matching triple/data layout from NaIRGenPass.postinit.
+        _nc_target_ovr = os.environ.get("JAC_NATIVE_TARGET", "");
+        if _nc_target_ovr {
+            llvm.initialize_all_targets();
+            llvm.initialize_all_asmprinters();
+            target = llvm.Target.from_triple(_nc_target_ovr);
+        } else {
+            target = llvm.Target.from_default_triple();
+        }
         # In debug mode: no optimisation so GDB sees real call frames;
         # jit=True picks the right code model (large on x86-64) for MCJIT.
         _native_debug: bool = bool(os.environ.get("JAC_NATIVE_DEBUG", ""));
@@ -91,6 +91,24 @@ impl NativeCompilePass.transform(ir_in: uni.Module) -> uni.Module {
             );
             # Update llvm_ir with the linked module for caching
             # (the original llvm_ir was pre-linking)
+            module.gen.llvm_ir = mod;
+        }
+
+        # Link the portable OSP kernel's IR when this program uses Object-Spatial
+        # spawn/visit (issue #6146). NaIRGenPass marks DIRECT use on the entry
+        # module via native_transitive_sources. But a thin entry that only
+        # delegates -- doing no OSP itself while an imported module does the
+        # spawn -- carries no such mark, yet the imported IR (already linked into
+        # `mod` above) still references the kernel's glob-init. Link the kernel
+        # whenever ANY linked module needs it: the dangling `__jac_glob_init_osp_kernel`
+        # declaration in the merged IR is the ground truth (issue #6669).
+        _needs_osp_kernel = (manifest is not None)
+        and ("osp_kernel" in manifest.native_transitive_sources);
+        if (not _needs_osp_kernel) and self._references_undefined_osp_kernel(mod) {
+            _needs_osp_kernel = True;
+        }
+        if _needs_osp_kernel {
+            self._link_osp_kernel(mod);
             module.gen.llvm_ir = mod;
         }
 
@@ -137,14 +155,11 @@ impl NativeCompilePass.transform(ir_in: uni.Module) -> uni.Module {
         _ir_dir = "";
         _stem = "";
         if _native_debug {
-            _src_name = _os.path.basename(module.loc.mod_path)
-                if module.loc
-                else "jac_native";
+            import from jaclang.jac0core.jir { get_native_cache_dir }
+            _mod_path = module.loc.mod_path if module.loc else "jac_native";
+            _src_name = _os.path.basename(_mod_path);
             _stem = _os.path.splitext(_src_name)[0];
-            _src_dir = _os.path.dirname(_os.path.abspath(module.loc.mod_path))
-                if module.loc
-                else ".";
-            _ir_dir = _os.path.join(_src_dir, ".jac_ir");
+            _ir_dir = str(get_native_cache_dir(_mod_path));
             _os.makedirs(_ir_dir, exist_ok=True);
             try {
                 _obj_bytes = target_machine.emit_object(mod);
@@ -250,6 +265,62 @@ impl NativeCompilePass.transform(ir_in: uni.Module) -> uni.Module {
         self.emit(E5020, error=str(e));
     }
     return ir_in;
+}
+
+"""Load a C shared library so MCJIT can resolve its symbols at JIT time.
+
+A logical import (issue #6387) may carry a loader token (`$ORIGIN` /
+`@loader_path`) meant for the AOT binary's DT_NEEDED; at JIT time there is no
+output binary, so strip it and resolve the remainder relative to the current
+directory, then fall back to soname / `find_library` lookup. Shared by the
+top-level module's own clibs and the transitive clibs an imported module pulls
+in (issue #6687: an imported module's `$ORIGIN/...` clib was never loaded into
+the JIT, so its FFI symbols resolved to NULL and the program SIGSEGV'd -- while
+the AOT binary, whose loader honors `$ORIGIN`, ran fine). Returns True when the
+library was loaded."""
+impl NativeCompilePass._jit_load_clib(lib_path: str) -> bool {
+    import os;
+    import ctypes.util;
+    probe = lib_path;
+    if probe.startswith("$ORIGIN/") {
+        probe = probe[8:];
+    } elif probe.startswith("@loader_path/") {
+        probe = probe[13:];
+    }
+    base = os.path.basename(probe);
+    # 1. An explicit/relative/sibling file that exists on disk. Pass the
+    #    ABSOLUTE path: dlopen only loads a named file when the string contains
+    #    a slash; a bare "libfoo.so" is treated as a soname and searched on the
+    #    system path instead of the cwd-relative file we just found.
+    for cand in [lib_path, probe, os.path.join(".", base)] {
+        if cand and os.path.exists(cand) {
+            llvm.load_library_permanently(os.path.abspath(cand));
+            return True;
+        }
+    }
+    # 2. dlopen by soname (searches LD_LIBRARY_PATH + ldcache).
+    try {
+        llvm.load_library_permanently(base);
+        return True;
+    } except Exception { }
+    # 3. find_library on the bare stem (handles versioned sonames, e.g.
+    #    libraylib.so -> libraylib.so.5).
+    stem = base;
+    if stem.startswith("lib") {
+        stem = stem[3:];
+    }
+    for _ext in [".so", ".dylib", ".dll"] {
+        _i = stem.find(_ext);
+        if _i != -1 {
+            stem = stem[:_i];
+        }
+    }
+    found = ctypes.util.find_library(stem) or ctypes.util.find_library(probe);
+    if found {
+        llvm.load_library_permanently(found);
+        return True;
+    }
+    return False;
 }
 
 """Link imported .na.jac modules at IR level (before JIT compilation)."""
@@ -390,18 +461,20 @@ impl NativeCompilePass._compile_and_link_native_imports(
 
         # ── Incremental compilation: check IR cache before recompiling ────
         # Hash the source file + compiler fingerprint to form the cache key.
-        # Cache layout: <source_dir>/.jac_ir/<stem>.<src_hash>.<comp_fp>.ir_cache
-        #               <source_dir>/.jac_ir/<stem>.<src_hash>.<comp_fp>.ir_meta
+        # Cache layout: <cache_dir>/<stem>.<src_hash>.<comp_fp>.ir_cache
+        #               <cache_dir>/<stem>.<src_hash>.<comp_fp>.ir_meta
+        # where <cache_dir> is get_native_cache_dir(source) — the project's
+        # .jac/cache/native/ (or the global cache for installed sources).
         # The .ir_cache file contains the raw LLVM IR text (pre-rename).
         # The .ir_meta file contains clib_paths and transitive dep info.
         # Including _compiler_fp ensures stale caches from a previous compiler
         # version are never reused after compiler implementation files change.
-        _src_dir = os.path.dirname(real_path);
+        import from jaclang.jac0core.jir { get_native_cache_dir }
         _src_stem = os.path.splitext(os.path.basename(real_path))[0];
         if _src_stem.endswith(".na") {
             _src_stem = _src_stem[:-3];
         }
-        _ir_cache_dir = os.path.join(_src_dir, ".jac_ir");
+        _ir_cache_dir = str(get_native_cache_dir(real_path));
 
         _source_hash = "";
         _cache_ir_path = "";
@@ -419,6 +492,11 @@ impl NativeCompilePass._compile_and_link_native_imports(
         # globals referenced by imported functions (e.g. _TABLE) even though
         # the importing module never names those globals in its import list.
         dep_owned_symbols: list[str] = [];
+        # `:pub` symbols this dependency exports across the C ABI. Propagated to
+        # the top-level module so a `jac nacompile --shared` build re-exports the
+        # whole transitive public surface, not just the root module's exports.
+        dep_exported_symbols: list[str] = [];
+        dep_exported_cached: list = [];
 
         try {
             with open(real_path, "rb") as _sf {
@@ -442,6 +520,7 @@ impl NativeCompilePass._compile_and_link_native_imports(
                 dep_transitive_cached = _meta.get("transitive_deps", []);
                 dep_imported_symbols = _meta.get("imported_symbols", []);
                 dep_owned_symbols = _meta.get("owned_symbols", []);
+                dep_exported_cached = _meta.get("exported_symbols", []);
                 _cache_hit = True;
             }
         } except Exception { }
@@ -450,6 +529,7 @@ impl NativeCompilePass._compile_and_link_native_imports(
             # Use cached IR — skip full compilation
             # Still need to handle clib paths and transitive deps
             dep_clib_paths = dep_clib_paths_cached;
+            dep_exported_symbols = dep_exported_cached;
 
             # Enqueue transitive deps from cached metadata
             dep_base = os.path.dirname(full_path);
@@ -498,6 +578,7 @@ impl NativeCompilePass._compile_and_link_native_imports(
             }
             imported_llvm_str_raw = str(imported_ir.gen.llvm_ir);
             dep_clib_paths = imported_ir.gen._clib_paths or [];
+            dep_exported_symbols = imported_ir.gen._exported_symbols or [];
             # Collect transitive dep paths for cache metadata
             dep_transitive_paths: list = [];
             dep_manifest = imported_ir.gen.interop_manifest;
@@ -541,7 +622,8 @@ impl NativeCompilePass._compile_and_link_native_imports(
                     "clib_paths": dep_clib_paths,
                     "transitive_deps": dep_transitive_paths,
                     "imported_symbols": dep_imported_symbols,
-                    "owned_symbols": dep_owned_symbols
+                    "owned_symbols": dep_owned_symbols,
+                    "exported_symbols": dep_exported_symbols
                 };
                 with open(_cache_meta_path, "w") as _wmf {
                     _wmf.write(json.dumps(_meta_obj));
@@ -552,8 +634,7 @@ impl NativeCompilePass._compile_and_link_native_imports(
         # Load any .so libraries required by this imported module so that
         # MCJIT can resolve their external symbols at JIT compilation time.
         # Without this, transitive `import from "lib.so" { ... }` in a dep
-        # module causes an unresolved-symbol segfault at runtime.
-        import ctypes.util as _ctu;
+        # module causes an unresolved-symbol segfault at runtime (issue #6687).
         # dep_clib_paths is set by both cache-hit and cache-miss paths above.
         if dep_clib_paths {
             # Propagate dep C-lib paths back to the main module so that
@@ -562,16 +643,25 @@ impl NativeCompilePass._compile_and_link_native_imports(
                 if dep_lib_path not in module.gen._clib_paths {
                     module.gen._clib_paths.append(dep_lib_path);
                 }
+                # Use the same robust loader as the top-level module's clibs:
+                # it strips the AOT-only `$ORIGIN`/`@loader_path` token a
+                # logical import carries, which a bare `os.path.exists` /
+                # `find_library` check could not resolve -- leaving the library
+                # unloaded and its FFI symbols NULL under `jac run` (#6687).
                 try {
-                    if os.path.exists(dep_lib_path) {
-                        llvm.load_library_permanently(dep_lib_path);
-                    } else {
-                        found_lib = _ctu.find_library(dep_lib_path);
-                        if found_lib {
-                            llvm.load_library_permanently(found_lib);
-                        }
-                    }
+                    self._jit_load_clib(dep_lib_path);
                 } except Exception { }
+            }
+        }
+
+        # Propagate this dependency's `:pub` exports up to the top-level module
+        # so a `jac nacompile --shared` build re-exports the whole transitive
+        # public C-ABI surface, not just the root module's own `:pub` symbols.
+        if dep_exported_symbols {
+            for _exp_sym in dep_exported_symbols {
+                if _exp_sym not in module.gen._exported_symbols {
+                    module.gen._exported_symbols.append(_exp_sym);
+                }
             }
         }
 
@@ -737,5 +827,98 @@ impl NativeCompilePass._compile_and_link_native_imports(
         } except Exception as e {
             self.emit(E5025, path=full_path, error=str(e));
         }
+    }
+}
+
+"""Memoized native LLVM IR (text) of the portable OSP kernel (issue #6146)."""
+glob _OSP_KERNEL_IR_CACHE: list = [];
+
+"""Compile `osp_kernel.jac` in native context and return its LLVM IR text, or
+None on failure. Cached for the process. Mirrors the cl `build_osp_kernel_js`
+on-demand compile: a `.na.jac` copy coerces the kernel to native context."""
+def _compile_osp_kernel_ir -> (str | None) {
+    if _OSP_KERNEL_IR_CACHE {
+        return _OSP_KERNEL_IR_CACHE[0];
+    }
+    import os;
+    import shutil;
+    import tempfile;
+    import jaclang;
+    import from jaclang.jac0core.program { JacProgram }
+    import from jaclang.compiler.passes.native.na_ir_gen_pass {
+        _write_native_osp_source
+    }
+    # The native OSP source is the portable kernel + the native-only edge
+    # adjacency, compiled as one module via the same helper as the
+    # NaIRGenPass-side load (osp.impl.jac) so decls and definitions agree.
+    # osp_kernel.jac stays pristine.
+    _core = os.path.join(os.path.dirname(jaclang.__file__), "jac0core");
+    tmp_dir = tempfile.mkdtemp();
+    na_copy = os.path.join(tmp_dir, "osp_kernel.na.jac");
+    ir_str = None;
+    try {
+        _write_native_osp_source(_core, na_copy);
+        prog = JacProgram();
+        m = prog.compile(na_copy);
+        if (m is not None) and m?.gen and (m.gen.llvm_ir is not None) {
+            ir_str = str(m.gen.llvm_ir);
+        }
+    } except Exception {
+        ir_str = None;
+    } finally {
+        shutil.rmtree(tmp_dir, ignore_errors=True);
+    }
+    if ir_str is not None {
+        _OSP_KERNEL_IR_CACHE.append(ir_str);
+    }
+    return ir_str;
+}
+
+"""True when the merged module references the OSP kernel's glob-init symbol
+without defining it. Any OSP-using module emits an `__osp_ensure_init` that calls
+`__jac_glob_init_osp_kernel`; the kernel that DEFINES that symbol is only linked
+by `_link_osp_kernel`. So a dangling declaration in `main_mod` -- after all
+imported modules are linked in -- means an imported (non-entry) module pulled in
+OSP and the kernel still needs linking, even though the entry module's manifest
+never marked it (issue #6669)."""
+impl NativeCompilePass._references_undefined_osp_kernel(main_mod: object) -> bool {
+    try {
+        for _fn in main_mod.functions {
+            if _fn.name == "__jac_glob_init_osp_kernel" and _fn.is_declaration {
+                return True;
+            }
+        }
+    } except Exception {
+        return False;
+    }
+    return False;
+}
+
+"""Compile + link the portable OSP kernel's IR into an OSP program's module.
+
+NaIRGenPass has already registered the kernel's structs / globals / function
+declarations into `main_mod`; this supplies the definitions and the kernel's
+glob-init (renamed to `__jac_glob_init_osp_kernel` so the program entry's
+transitive-source call resolves it). issue #6146."""
+impl NativeCompilePass._link_osp_kernel(main_mod: object) -> None {
+    ir_str = _compile_osp_kernel_ir();
+    if ir_str is None {
+        return;
+    }
+    # Rename the kernel's glob-init to a unique symbol that the program entry
+    # calls (safe_name "osp_kernel"); mirrors the per-import rename in
+    # _compile_and_link_native_imports.
+    ir_str = ir_str.replace('@"__jac_glob_init"', '@"__jac_glob_init_osp_kernel"');
+    ir_str = ir_str.replace("@__jac_glob_init", "@__jac_glob_init_osp_kernel");
+    ir_str = ir_str.replace(
+        'name: "__jac_glob_init"', 'name: "__jac_glob_init_osp_kernel"'
+    );
+    try {
+        kmod = llvm.parse_assembly(ir_str);
+        kmod.verify();
+        main_mod.link_in(kmod);
+    } except Exception as _e {
+        # Leave the kernel unlinked; spawn lowering falls back / errors visibly.
+        ;
     }
 }

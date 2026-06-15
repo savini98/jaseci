@@ -28,6 +28,12 @@ import from jac_scale.targets.kubernetes.microservice.manifest_builder {
 import from jac_scale.targets.kubernetes.microservice.database_provisioner {
     MicroserviceDatabaseProvisioner
 }
+import from jac_scale.factories.autoscaler_factory { AutoscalerFactory }
+import from jac_scale.abstractions.autoscaler {
+    AutoscalerSpec,
+    Trigger,
+    DEFAULT_CPU_UTILIZATION_TARGET
+}
 import from jac_scale.targets.kubernetes.monitoring { MonitoringDeployer }
 import from jac_scale.config_loader { get_scale_config }
 
@@ -157,10 +163,9 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
             );
         }
 
-        # Observability stack (M-14.a): opt-in centralised logs via
-        # `[plugins.scale.microservices.logs].enabled`. Surfaces a failure
-        # in `details` but does not fail the deploy - the app is healthy
-        # without logs; the operator can re-run once Loki settles.
+        # Observability stack (logs and/or traces). Surfaces a failure in
+        # `details` but does not fail the deploy - the app is healthy
+        # without it; the operator can re-run once it settles.
         observability_err: str = "";
         try {
             self._deploy_observability(app_name);
@@ -196,21 +201,16 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
         return DeploymentResult(success=True, message=success_msg, details=bundle);
     }
 
-    """M-14.a: deploy Loki + Grafana Alloy (+ the surrounding Prometheus
-    / Grafana stack the Pod Logs dashboard depends on) when
-    `[plugins.scale.microservices.logs].enabled = true`. No-op otherwise.
-
-    Reuses the same `MonitoringDeployer` the monolith target uses, so
-    microservice mode is the second caller of one builder. The
-    monitoring stack is gated on `KubernetesConfig.monitoring_enabled`
-    and Loki specifically on `loki_enabled`; the deploy path hands
-    `MonitoringDeployer` a fresh `KubernetesConfig` clone with both
-    flags set (see `_build_observability_config`). The destroy path
-    deletes resources by name unconditionally so it stays idempotent
-    regardless of the toggle state at teardown time."""
+    """Deploy the observability stack (Loki/Tempo + Grafana Alloy + the
+    surrounding Prometheus/Grafana stack) when logs and/or tracing is
+    enabled. No-op otherwise. Reuses the monolith target's
+    `MonitoringDeployer` with a `KubernetesConfig` clone carrying the
+    relevant flags; teardown deletes by name so it stays idempotent."""
     def _deploy_observability(app_name: str) -> None {
         logs_cfg = self._read_microservices_logs_config();
-        if not logs_cfg.get("enabled", False) {
+        tracing_cfg = self._read_microservices_tracing_config();
+        if not logs_cfg.get("enabled", False)
+        and not tracing_cfg.get("enabled", False) {
             return;
         }
 
@@ -310,7 +310,16 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
     def _build_observability_config -> KubernetesConfig {
         overrides: dict[str, Any] = dict(self.k8s_config.to_dict());
         overrides["monitoring_enabled"] = True;
-        overrides["loki_enabled"] = True;
+        # loki_enabled / tracing_enabled track the per-leg toggles so a
+        # logs-only, traces-only, or both deploy each builds the right
+        # subset (MonitoringDeployer.deploy gates Loki/Tempo/Alloy on
+        # these). The Prometheus + Grafana base always comes up.
+        overrides["loki_enabled"] = self._read_microservices_logs_config().get(
+            "enabled", False
+        );
+        overrides["tracing_enabled"] = self._read_microservices_tracing_config().get(
+            "enabled", False
+        );
         return KubernetesConfig.from_dict(KubernetesConfig, overrides);
     }
 
@@ -325,6 +334,23 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
                 self.logger.warn(
                     f"Could not read [plugins.scale.microservices.logs] - "
                     f"observability stack will not be deployed: {e}"
+                );
+            }
+            return {};
+        }
+    }
+
+    """Read `[plugins.scale.microservices.tracing]`. Empty dict on any
+    failure (missing block, malformed TOML, loader exception)."""
+    def _read_microservices_tracing_config -> dict[str, Any] {
+        try {
+            ms_cfg = get_scale_config().get_microservices_config();
+            return dict(ms_cfg.get("tracing", {}));
+        } except Exception as e {
+            if self.logger {
+                self.logger.warn(
+                    f"Could not read [plugins.scale.microservices.tracing] - "
+                    f"tracing stack will not be deployed: {e}"
                 );
             }
             return {};
@@ -410,7 +436,6 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
         self._load_kube_config();
         apps_v1 = client.AppsV1Api();
         core_v1 = client.CoreV1Api();
-        autoscaling_v2 = client.AutoscalingV2Api();
         policy_v1 = client.PolicyV1Api();
         networking_v1 = client.NetworkingV1Api();
         namespace: str = self.k8s_config.namespace;
@@ -431,6 +456,15 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
         }
 
         ensure_namespace_exists(namespace);
+
+        # Ops Console RBAC (opt-in). Applied right after the
+        # namespace so the read-only Role + RoleBinding exist before the
+        # gateway pod (which uses them) rolls. Best-effort: an RBAC failure
+        # must not abort the app deploy, so it logs and continues.
+        ops_rbac = bundle.get("ops_rbac");
+        if ops_rbac {
+            self._apply_ops_rbac(namespace, ops_rbac);
+        }
 
         for (pvc_name, pvc_manifest) in bundle.get("pvcs", {}).items() {
             self._apply_or_replace_pvc(core_v1, namespace, pvc_manifest);
@@ -479,12 +513,38 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
             }
         }
 
-        for (svc_name, hpa_manifest) in bundle.get("hpas", {}).items() {
-            self._apply_or_replace_hpa(autoscaling_v2, namespace, hpa_manifest);
+        for svc_name in bundle.get("autoscalers", {}).keys() {
+            k8s_name = k8s_safe_name(svc_name);
+            cfg = dict(bundle.get("autoscalers", {}).get(svc_name, {}));
+            autoscaler = AutoscalerFactory.create(
+                self.k8s_config.autoscaler_engine,
+                self.k8s_config.to_dict(),
+                self.logger
+            );
+            autoscaler.apply(
+                AutoscalerSpec(
+                    scale_target_name=f"{k8s_name}-deployment",
+                    autoscaler_name=f"{k8s_name}-hpa",
+                    namespace=namespace,
+                    min_replicas=int(cfg.get("min", 1)),
+                    max_replicas=int(cfg.get("max", 3)),
+                    triggers=[
+                        Trigger(
+                            type="cpu",
+                            metadata={
+                                "averageUtilization": str(
+                                    cfg.get(
+                                        "cpu_target", DEFAULT_CPU_UTILIZATION_TARGET
+                                    )
+                                )
+                            }
+                        )
+                    ]
+                )
+            );
             if self.logger {
                 self.logger.info(
-                    f"Applied HPA for '{svc_name}'",
-                    {"name": hpa_manifest["metadata"]["name"]}
+                    f"Applied HPA for '{svc_name}'", {"name": f"{k8s_name}-hpa"}
                 );
             }
         }
@@ -506,6 +566,67 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
                 self.logger.info(
                     "Applied Ingress for gateway",
                     {"name": ingress_manifest["metadata"]["name"]}
+                );
+            }
+        }
+    }
+
+    # Ops Console RBAC: namespace-scoped Role + RoleBinding bound to
+    # the gateway SA. Idempotent read-then-replace/create, mirroring the
+    # ingress/monitoring RBAC pattern. Best-effort - a failure here (e.g. the
+    # deployer lacks rbac create perms) logs a warning and continues; the
+    # app still deploys, the Ops Console pages just render a 403 detail.
+    def _apply_ops_rbac(namespace: str, ops_rbac: dict[str, any]) {
+        try {
+            rbac_v1 = client.RbacAuthorizationV1Api();
+            role = ops_rbac["role"];
+            binding = ops_rbac["role_binding"];
+            role_name: str = role["metadata"]["name"];
+            binding_name: str = binding["metadata"]["name"];
+
+            try {
+                rbac_v1.read_namespaced_role(name=role_name, namespace=namespace);
+                rbac_v1.replace_namespaced_role(
+                    name=role_name, namespace=namespace, body=role
+                );
+            } except ApiException as e {
+                if e.status == 404 {
+                    rbac_v1.create_namespaced_role(namespace=namespace, body=role);
+                } else {
+                    raise;
+                }
+            }
+
+            try {
+                rbac_v1.read_namespaced_role_binding(
+                    name=binding_name, namespace=namespace
+                );
+                rbac_v1.replace_namespaced_role_binding(
+                    name=binding_name, namespace=namespace, body=binding
+                );
+            } except ApiException as e {
+                if e.status == 404 {
+                    rbac_v1.create_namespaced_role_binding(
+                        namespace=namespace, body=binding
+                    );
+                } else {
+                    raise;
+                }
+            }
+
+            if self.logger {
+                subj = binding["subjects"][0]["name"];
+                self.logger.info(
+                    f"Applied Ops Console RBAC (read-only Role + RoleBinding)",
+                    {"name": role_name, "serviceAccount": subj}
+                );
+            }
+        } except Exception as e {
+            if self.logger {
+                self.logger.warning(
+                    f"Ops Console RBAC not applied ({e}); the in-admin "
+                    f"deploy-health pages will render a 403 until the Role is "
+                    f"bound to the gateway ServiceAccount."
                 );
             }
         }
@@ -576,28 +697,6 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
         }
     }
 
-    def _apply_or_replace_hpa(
-        autoscaling_v2: any, namespace: str, manifest: dict[str, any]
-    ) {
-        name: str = manifest["metadata"]["name"];
-        try {
-            autoscaling_v2.read_namespaced_horizontal_pod_autoscaler(
-                name=name, namespace=namespace
-            );
-            autoscaling_v2.patch_namespaced_horizontal_pod_autoscaler(
-                name=name, namespace=namespace, body=manifest
-            );
-        } except ApiException as e {
-            if e.status == 404 {
-                autoscaling_v2.create_namespaced_horizontal_pod_autoscaler(
-                    namespace=namespace, body=manifest
-                );
-            } else {
-                raise;
-            }
-        }
-    }
-
     def _apply_or_replace_pdb(
         policy_v1: any, namespace: str, manifest: dict[str, any]
     ) {
@@ -654,7 +753,6 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
         self._load_kube_config();
         apps_v1 = client.AppsV1Api();
         core_v1 = client.CoreV1Api();
-        autoscaling_v2 = client.AutoscalingV2Api();
         policy_v1 = client.PolicyV1Api();
         networking_v1 = client.NetworkingV1Api();
         namespace: str = self.k8s_config.namespace;
@@ -673,8 +771,12 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
         }
 
         try {
-            autoscaling_v2.delete_collection_namespaced_horizontal_pod_autoscaler(
-                namespace=namespace, label_selector=ms_selector
+            AutoscalerFactory.create(
+                self.k8s_config.autoscaler_engine,
+                self.k8s_config.to_dict(),
+                self.logger
+            ).destroy_collection(
+                namespace, ms_selector
             );
         } except ApiException as e {
             if e.status != 404 {
@@ -727,11 +829,9 @@ obj KubernetesMicroserviceTarget(KubernetesTarget) {
             }
         }
 
-        # M-14.a: tear down the observability stack symmetrically to
-        # `_deploy_observability`. Unconditional (mirroring the monolith
-        # destroy at kubernetes_target.jac) because MonitoringDeployer
-        # treats every API not-found as a no-op; calling it on a stack
-        # that was never deployed is harmless.
+        # Tear down the observability stack. Unconditional: MonitoringDeployer
+        # treats every API not-found as a no-op, so calling it on a stack that
+        # was never deployed is harmless.
         try {
             monitoring = MonitoringDeployer(self.k8s_config, self.logger);
             monitoring.destroy(app_name, namespace, apps_v1, core_v1);

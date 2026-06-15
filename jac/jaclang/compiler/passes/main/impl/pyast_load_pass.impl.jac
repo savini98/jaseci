@@ -1835,6 +1835,21 @@ impl PyastBuildPass.proc_constant(nd: py_ast.Constant) -> uni.Literal {
         if (value_type is str) {
             # Use get_source_segment to preserve original escape sequences and quote style
             value = self._get_source_segment(nd);
+            # Downstream consumers treat `value` as a single literal token,
+            # but an implicitly concatenated constant ("a" "b", possibly
+            # spanning lines) covers several literals in source. Keep the
+            # segment only if it round-trips to the constant's value on its
+            # own (multi-line concatenation without the enclosing parens
+            # does not even parse).
+            if value is not None {
+                try {
+                    if py_ast.literal_eval(value) != nd.value {
+                        value = None;
+                    }
+                } except (ValueError, SyntaxError) {
+                    value = None;
+                }
+            }
             if value is None {
                 # Fallback to repr approach if source segment unavailable
                 raw_repr = repr(nd.value);
@@ -2300,37 +2315,6 @@ impl PyastBuildPass.proc_if(nd: py_ast.If) -> uni.IfStmt {
     return ret;
 }
 
-"""
-Flatten version conditionals inside class bodies.
-
-In typeshed, classes like zip use `if sys.version_info >= (3, 10):` to define
-version-specific methods. This function evaluates these conditionals and
-includes the appropriate branch's methods directly in the class body.
-"""
-impl PyastBuildPass._flatten_version_conditionals(
-    body: list[uni.UniNode]
-) -> list[uni.UniNode] {
-    result: list[uni.UniNode] = [];
-    for item in body {
-        if isinstance(item, (uni.IfStmt, uni.ElseIf)) {
-            eval_result = evaluate_version_condition(item.condition);
-            if eval_result is None {
-                result.append(item);
-            } elif eval_result {
-                result.extend(item.body);
-            } elif item.else_body {
-                if isinstance(item.else_body, uni.ElseStmt) {
-                    result.extend(item.else_body.body);
-                } elif isinstance(item.else_body, uni.ElseIf) {
-                    result.extend(self._flatten_version_conditionals([item.else_body]));
-                }
-            }
-        } else {
-            result.append(item);
-        }
-    }
-    return result;
-}
 
 """
 Process While node.
@@ -2653,8 +2637,6 @@ impl PyastBuildPass.proc_class_def(nd: py_ast.ClassDef) -> (uni.Archetype | uni.
         pos_end=0
     );
     body = [self.convert(i) for i in nd.body];
-    # Flatten version conditionals inside class body (e.g., zip.__new__ definitions)
-    body = self._flatten_version_conditionals(body);
     for body_stmt in body {
         if (
             isinstance(body_stmt, uni.Ability)
@@ -2909,7 +2891,6 @@ impl PyastBuildPass.proc_module(nd: py_ast.Module) -> uni.Module {
         return uni.Module.make_stub(inject_src=self.ir_in.orig_src);
     }
     elements: list[uni.UniNode] = [self.convert(i) for i in nd.body];
-    elements = self._flatten_version_conditionals(elements);
     elements[0] = elements[0].expr
         if (
             isinstance(elements[0], uni.ExprStmt)

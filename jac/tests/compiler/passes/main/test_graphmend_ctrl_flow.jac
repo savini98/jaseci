@@ -102,6 +102,16 @@ test "multi-statement branches with shared call hoist and merge (Fig. 4)" {
     assert "if not hasattr(self_obj, 'long_inv_freq')" in src;
 }
 
+test "non-idempotent observable setup write is declined (soundness)" {
+    src = _pysrc("where_unsafe_setup.jac", True);
+    # `self_obj.calls = self_obj.calls + 1` is an observable, non-idempotent
+    # write; hoisting it onto both paths would change state, so the legality
+    # check declines and the break is left intact (no predication).
+    assert "torch.where(" not in src;
+    assert "if seq_len > 8:" in src;
+    assert "self_obj.calls = self_obj.calls + 1" in src;
+}
+
 test "nested guard in a data-dependent branch composes trap + predication" {
     src = _pysrc("nested_guard_in_branch.jac", True);
     # the data-dependent outer branch is predicated...

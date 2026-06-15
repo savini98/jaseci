@@ -7,7 +7,7 @@ import type from jaclang.jac0core.unitree { Expr, Symbol }
 import type from jaclang.jac0core.unitree { UniScopeNode as SymbolTable }
 
 """Enumeration of type categories."""
-enum TypeCategory ( IntEnum ) {
+enum TypeCategory(IntEnum) {
     Unbound,
     Unknown,
     Never,
@@ -69,6 +69,11 @@ obj TypeBase(ABC) {
     has category: TypeCategory { getter; }
 
     static def unknown -> UnknownType;
+    # Canonical, stable string key for this type ("int", "list[int]",
+    # "dict[str,MyStruct]"). The ONLY string form of a type intended for
+    # keying (backend emission caches, layout tables, cached semantics);
+    # `__str__` stays the human-facing display form.
+    def mangle -> str;
     def is_instantiable -> bool;
     def is_instance -> bool;
     def is_instantiable_class -> bool;
@@ -197,6 +202,9 @@ Holds the shared details of class type.
             is_from_stdlib_stub: bool = False,  # True if from vendor/typeshed/stdlib/
             is_data_class: bool = False,
             is_namedtuple: bool = False,
+            is_typeddict: bool = False,
+            # Ordered field name -> declared value type; None for non-TypedDicts.
+            typeddict_fields: (dict[str, TypeBase] | None) = None,
             is_root_class: bool = False,
             is_enum_class: bool = False,
             enum_value_type: (TypeBase | None) = None,
@@ -251,6 +259,7 @@ Holds the private details of class type.
     def is_builtin(class_name: (str | list[str] | None) = None) -> bool;
     def is_data_class -> bool;
     def is_namedtuple -> bool;
+    def is_typeddict -> bool;
     def is_enum_class -> bool;
     def is_edge_type -> bool;
     def is_node_type -> bool;
@@ -282,7 +291,7 @@ class ParamKind(IntEnum) {
 Based on Pyright's FunctionTypeFlags. These flags control how the
 function type behaves during type checking.
 """
-enum FunctionTypeFlags ( IntEnum ) {
+enum FunctionTypeFlags(IntEnum) {
     Null = 0,
     # The *args and **kwargs parameters do not need to be present for this
     # function to be compatible. This is used for Callable[..., x] (gradual typing).

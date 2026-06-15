@@ -1,10 +1,7 @@
 import from jaclang.cli.console { console }
 import from jaclang.cli.banners { JAC_DISCORD_URL }
 import from jaclang.runtimelib.serializer { Serializer }
-import from jaclang.runtimelib.client_bundle {
-    _lookup_module_in_hub,
-    _ensure_js_generated
-}
+import from jaclang.runtimelib.client_bundle { _ensure_js_generated }
 import from jaclang.runtimelib.auth_models {
     IdentityType,
     LoginRequest,
@@ -57,6 +54,7 @@ impl UserManager._ensure_connection -> None {
 impl UserManager.create_user(username: str, password: str) -> dict[str, str] {
     import from jaclang.jac0core.constructs { Root }
     self._ensure_connection();
+    assert self._conn is not None;
     with self._lock {
         # Check if user already exists
         cursor = self._conn.execute(
@@ -88,6 +86,7 @@ impl UserManager.authenticate(
     username: str, password: str
 ) -> (dict[(str, str)] | None) {
     self._ensure_connection();
+    assert self._conn is not None;
     password_hash = hashlib.sha256(password.encode()).hexdigest();
     with self._lock {
         cursor = self._conn.execute(
@@ -105,6 +104,7 @@ impl UserManager.authenticate(
 """Validate token and return username."""
 impl UserManager.validate_token(token: str) -> (str | None) {
     self._ensure_connection();
+    assert self._conn is not None;
     with self._lock {
         cursor = self._conn.execute(
             "SELECT username FROM users WHERE token = ?", (token, )
@@ -117,6 +117,7 @@ impl UserManager.validate_token(token: str) -> (str | None) {
 """Get user's root node ID."""
 impl UserManager.get_root_id(username: str) -> (str | None) {
     self._ensure_connection();
+    assert self._conn is not None;
     with self._lock {
         cursor = self._conn.execute(
             "SELECT root_id FROM users WHERE username = ?", (username, )
@@ -134,6 +135,7 @@ impl UserManager.aget_root_id(username: str) -> (str | None) {
 """Get user data by username."""
 impl UserManager.get_user(username: str) -> (dict[(str, str)] | None) {
     self._ensure_connection();
+    assert self._conn is not None;
     with self._lock {
         cursor = self._conn.execute(
             "SELECT token, root_id FROM users WHERE username = ?", (username, )
@@ -149,6 +151,7 @@ impl UserManager.get_user(username: str) -> (dict[(str, str)] | None) {
 """Check if a user exists."""
 impl UserManager.user_exists(username: str) -> bool {
     self._ensure_connection();
+    assert self._conn is not None;
     with self._lock {
         cursor = self._conn.execute(
             "SELECT 1 FROM users WHERE username = ?", (username, )
@@ -163,6 +166,7 @@ impl UserManager.update_username(
 ) -> dict[str, str] {
     import hashlib;
     self._ensure_connection();
+    assert self._conn is not None;
     with self._lock {
         # Check if new username already exists
         cursor = self._conn.execute(
@@ -195,6 +199,7 @@ impl UserManager.update_password(
 ) -> dict[str, str] {
     import hashlib;
     self._ensure_connection();
+    assert self._conn is not None;
     with self._lock {
         # Verify current password
         current_password_hash = hashlib.sha256(current_password.encode()).hexdigest();
@@ -268,10 +273,15 @@ Returns the fork and the reset token. Callers MUST call
 `Jac.reset_request_context(token)` in a `finally` block.
 """
 async def _begin_request_context(user_root_id: str) -> tuple[(ExecutionContext, Any)] {
+    import from jaclang.jac0core.osp_kernel_sv { isolate_request_walk_stack }
     parent = Jac.get_context();
     req_ctx = ExecutionContext(_parent=parent);
     await req_ctx.aset_user_root(user_root_id);
     token = Jac.push_request_context(req_ctx);
+    # Each request handles an independent walk: reset the OSP walk-scope stack
+    # so an in-process request (e.g. an sv-to-sv RPC served by the test client)
+    # does not inherit the caller's walk scope and bubble reports into it.
+    isolate_request_walk_stack();
     return (req_ctx, token);
 }
 
@@ -384,6 +394,10 @@ impl ExecutionManager.execute_function_sync(
         }
         return await self._finalize_call_response(call_state, result);
     } except Exception as e {
+        # Abort-on-error: a failed call must not half-mutate the graph.
+        # Discard its uncommitted unit of work instead of leaving it in
+        # the shared working set for the next commit to flush (#6619).
+        ctx.mem.abort();
         return {'error': str(e)};
     } finally {
         ctx.call_state.reset(call_token);
@@ -410,6 +424,10 @@ impl ExecutionManager.execute_function_async(
         result = await func(**args);
         return await self._finalize_call_response(call_state, result);
     } except Exception as e {
+        # Abort-on-error: a failed call must not half-mutate the graph.
+        # Discard its uncommitted unit of work instead of leaving it in
+        # the shared working set for the next commit to flush (#6619).
+        ctx.mem.abort();
         return {'error': str(e)};
     } finally {
         ctx.call_state.reset(call_token);
@@ -425,7 +443,7 @@ Internal callers should prefer `spawn_walker_sync` / `spawn_walker_async`.
 impl ExecutionManager.spawn_walker(
     walker_cls: type[WalkerArchetype], fields: dict[(str, Any)], username: str
 ) -> dict[str, JsonValue] {
-    if getattr(walker_cls, '__jac_async__', False) {
+    if walker_cls.__jac_async__ {
         return await self.spawn_walker_async(walker_cls, fields, username);
     }
     return await self.spawn_walker_sync(walker_cls, fields, username);
@@ -471,6 +489,10 @@ impl ExecutionManager.spawn_walker_sync(
         return await self._finalize_call_response(call_state, result);
     } except Exception as e {
         import traceback;
+        # Abort-on-error: a failed walker must not half-mutate the graph.
+        # Discard its uncommitted unit of work instead of leaving it in
+        # the shared working set for the next commit to flush (#6619).
+        ctx.mem.abort();
         return {'error': str(e), 'traceback': traceback.format_exc()};
     } finally {
         ctx.call_state.reset(call_token);
@@ -514,6 +536,10 @@ impl ExecutionManager.spawn_walker_async(
         return await self._finalize_call_response(call_state, result);
     } except Exception as e {
         import traceback;
+        # Abort-on-error: a failed walker must not half-mutate the graph.
+        # Discard its uncommitted unit of work instead of leaving it in
+        # the shared working set for the next commit to flush (#6619).
+        ctx.mem.abort();
         return {'error': str(e), 'traceback': traceback.format_exc()};
     } finally {
         ctx.call_state.reset(call_token);
@@ -545,6 +571,9 @@ impl ModuleIntrospector.load(force_reload: bool = False) -> None {
     self._extract_access_levels();
     self._functions = self._collect_functions();
     self._walkers = self._collect_walkers();
+    # After Path A (entry-namespace) collection, so cross-boundary additions to
+    # `_functions`/`_walkers` are not clobbered by the reassignments above.
+    self._collect_cross_boundary_endpoints();
     self._fill_endpoint_effect_defaults();
     self._bundle = None;
     self._bundle_error = None;
@@ -558,7 +587,7 @@ impl ModuleIntrospector._load_manifest -> None {
     base: dict = {};
     mod_path = self._module?.__file__;
     if mod_path {
-        mod = _lookup_module_in_hub(os.path.abspath(mod_path), Jac.program.mod.hub);
+        mod = Jac.program.find_module(os.path.abspath(mod_path));
         if not mod {
             mod = Jac.program.compile(mod_path);
         }
@@ -582,10 +611,16 @@ impl ModuleIntrospector._load_manifest -> None {
     # module's interop_manifest, so the authoritative set is the union over the
     # hub.
     aggregated: dict = {};
-    for hub_mod in Jac.program.mod.hub.values() {
-        if hub_mod and hub_mod.gen.interop_manifest {
-            for (ekey, eeff) in hub_mod.gen.interop_manifest.endpoint_effects.items() {
-                aggregated[ekey] = eeff;
+    # Span both program hubs: jaclang-bundled apps (e.g. `jac ai --ui`) route
+    # their modules to the compiler's internal_program, so the boundary facts
+    # live there, not in `Jac.program.mod.hub`. `_search_hubs` is the same dual
+    # span `find_module` uses.
+    for hub in Jac.program._search_hubs() {
+        for hub_mod in hub.values() {
+            if hub_mod and hub_mod.gen.interop_manifest {
+                for (ekey, eeff) in hub_mod.gen.interop_manifest.endpoint_effects.items() {
+                    aggregated[ekey] = eeff;
+                }
             }
         }
     }
@@ -610,18 +645,33 @@ impl ModuleIntrospector._extract_access_levels -> None {
     self._function_access = {};
     self._walker_access = {};
     mod_path = self._module?.__file__;
-    main_mod = _lookup_module_in_hub(os.path.abspath(mod_path), Jac.program.mod.hub)
-        if mod_path
-        else None;
+    main_mod = Jac.program.find_module(os.path.abspath(mod_path)) if mod_path else None;
+    # A bytecode-only cache hit leaves the entry module out of the hub; compile
+    # it so its access map is available rather than defaulting all to auth.
+    if not main_mod and mod_path {
+        try {
+            main_mod = Jac.program.compile(os.path.abspath(mod_path));
+        } except Exception as e {
+            import logging;
+            logging.getLogger(__name__).warning(
+                "serve: fallback compile of %s failed; access table will be "
+                "empty and endpoints default to auth-required: %s",
+                mod_path,
+                e
+            );
+            main_mod = None;
+        }
+    }
     if not main_mod {
         return;
     }
     # Gather the source modules whose tables we read: the main module plus its
-    # directly-imported `.jac`/`.cl.jac` providers. We compile a provider only
-    # if it is not already in the hub — this populates its interop_manifest
-    # (BoundaryAnalysisPass derives access once, per module); we never re-derive
-    # access by walking ASTs here. Main module first so its defs win on a name
-    # collision (matching the prior direct-defs-before-imports order).
+    # directly-imported `.jac`/`.cl.jac` providers. `find_module` spans both
+    # programs (a jaclang-bundled app's modules live in the internal program),
+    # so we read each provider's already-built interop_manifest and only compile
+    # one that was never compiled at all -- we never re-derive access by walking
+    # ASTs here. Main module first so its defs win on a name collision (matching
+    # the prior direct-defs-before-imports order).
     sources: list = [main_mod];
     for item in main_mod.body {
         if isinstance(item, uni.Import) and item.is_jac and item.from_loc {
@@ -633,7 +683,7 @@ impl ModuleIntrospector._extract_access_levels -> None {
             if not (src and src.endswith(('.jac', '.cl.jac'))) {
                 continue;
             }
-            prov = _lookup_module_in_hub(src, Jac.program.mod.hub);
+            prov = Jac.program.find_module(src);
             if not prov {
                 try {
                     prov = Jac.program.compile(src);
@@ -646,11 +696,29 @@ impl ModuleIntrospector._extract_access_levels -> None {
             }
         }
     }
+    import from jaclang.jac0core.compiler { get_boundary_analysis_sched }
     for src_mod in sources {
         if not (src_mod and src_mod.gen and src_mod.gen.interop_manifest) {
             continue;
         }
         man = src_mod.gen.interop_manifest;
+        # BoundaryAnalysisPass runs on a compile's entry module, not on the
+        # providers it imports -- so a provider's access map is empty until we
+        # run the pass on it here (a no-op when it declares no endpoints).
+        if not (man.walker_access or man.func_access) {
+            try {
+                Jac.program.run_schedule(src_mod, get_boundary_analysis_sched());
+            } except Exception as e {
+                import logging;
+                logging.getLogger(__name__).warning(
+                    "serve: boundary analysis of %s failed; its imported "
+                    "endpoints will default to auth-required: %s",
+                    src_mod?.loc?.mod_path,
+                    e
+                );
+            }
+            man = src_mod.gen.interop_manifest;
+        }
         for (name, auth) in man.func_access.items() {
             if name not in self._function_access {
                 self._function_access[name] = auth;
@@ -661,6 +729,180 @@ impl ModuleIntrospector._extract_access_levels -> None {
                 self._walker_access[name] = auth;
             }
         }
+    }
+}
+
+
+"""Register cross-boundary RPC endpoints from the compile-time interop table.
+
+`_collect_functions` / `_collect_walkers` register the endpoints in the entry
+module's own namespace (Path A). This complements them with the endpoints a
+client (`.cl.jac`) calls over RPC via `sv import from <server> { ep }` that the
+entry module never re-imported -- the silent 404/405 of issue #6221. Both
+endpoint shapes are covered: `def` functions (POST /function/<name>) and walker
+archetypes (POST /walker/<name>), since a client app commonly spawns walkers
+across the boundary (e.g. littleX, whose every endpoint is a walker).
+
+These are read from the IR-resident InteropManifest, not re-derived from ASTs at
+request time: `BoundaryAnalysisPass` records each such call as a CLIENT->SERVER
+binding (`server_exports_to_client`) in the importing client module's manifest,
+tagged `kind='function'` or `kind='walker'`, and the callee's auth level in its
+*defining* module's `func_access`/`walker_access`. We union these across the
+program hub (mirroring how `_load_manifest` unions `endpoint_effects`), then for
+each binding resolve the live symbol from its source server module -- importing
+it if it is not already live so the symbol exists and its module-level
+`with entry` side effects run. Endpoints already registered by Path A are left
+untouched; a `priv`/`prot` callee stays auth-gated (the cross-boundary call
+infers the endpoint's existence, never its auth)."""
+impl ModuleIntrospector._collect_cross_boundary_endpoints -> None {
+    # Do not gate on `Jac.program.mod.hub` truthiness: a jaclang-bundled app
+    # (e.g. `jac ai --ui`) routes its modules to the compiler's internal_program,
+    # leaving this program's own hub an empty dict (falsy) even though the
+    # boundary facts exist. The union below spans both hubs via `_search_hubs`.
+    if not (self._module and Jac.program and Jac.program.mod) {
+        return;
+    }
+    import from jaclang.jac0core.constant { Tokens as Tok }
+    import from jaclang.jac0core.constructs { WalkerArchetype }
+
+    # Pure read-only consumer of the compile-time interop table: the static
+    # compiler is responsible for landing every reachable client module's
+    # boundary facts in the program hub (see the client-module analysis hook in
+    # the compile flow). Here we only union those facts and resolve live
+    # symbols -- no AST walking, no recompilation, at request time.
+    #
+    # Union the cross-boundary facts over every compiled module: client->server
+    # bindings (recorded in each client module's manifest) and the per-symbol
+    # auth requirement (recorded in each callee's defining module). An endpoint
+    # may live in any module, so the authoritative set is the union over the hub.
+    fn_bindings: dict[str, any] = {};
+    walker_bindings: dict[str, any] = {};
+    func_access: dict[str, bool] = {};
+    walker_access: dict[str, bool] = {};
+    # Span both program hubs: jaclang-bundled apps (e.g. `jac ai --ui`) route
+    # their modules to the compiler's internal_program, so the cross-boundary
+    # facts the static compiler landed there are invisible to a plain
+    # `Jac.program.mod.hub` scan. `_search_hubs` is the same dual span
+    # `find_module` already uses to resolve across the two programs.
+    for hub in Jac.program._search_hubs() {
+        for mod in hub.values() {
+            man = mod.gen.interop_manifest if (mod and mod.gen) else None;
+            if not man {
+                continue;
+            }
+            for binding in man.server_exports_to_client {
+                if binding.kind == 'walker' {
+                    walker_bindings[binding.name] = binding;
+                } else {
+                    fn_bindings[binding.name] = binding;
+                }
+            }
+            for (acc_name, auth) in man.func_access.items() {
+                if acc_name not in func_access {
+                    func_access[acc_name] = auth;
+                }
+            }
+            for (acc_name, auth) in man.walker_access.items() {
+                if acc_name not in walker_access {
+                    walker_access[acc_name] = auth;
+                }
+            }
+        }
+    }
+
+    def resolve_symbol(src_path: str, name: str) -> any {
+        # Prefer an already-live module (the common case: another symbol from
+        # this server module was imported, so its `with entry` has already run).
+        # Match on the source file so we do not re-import it under a second name.
+        for loaded in list(Jac.loaded_modules.values()) {
+            f = loaded?.__file__;
+            if f and os.path.abspath(f) == os.path.abspath(src_path) {
+                sym = getattr(loaded, name, None);
+                if sym is not None {
+                    return sym;
+                }
+            }
+        }
+        target = os.path.basename(src_path);
+        if target.endswith('.jac') {
+            target = target.removesuffix('.jac');
+        }
+        try {
+            imported = Jac.jac_import(
+                target=target, base_path=os.path.dirname(src_path), lng='jac'
+            );
+            if imported {
+                return getattr(imported[0], name, None);
+            }
+        } except Exception as e {
+            # Fail loud: a cross-boundary endpoint whose provider module fails
+            # to import would otherwise vanish from the API with no trace (the
+            # #6507 debugging trap). Surface it on the server log so a broken
+            # module is visible instead of silently dropping its endpoints.
+            import logging;
+            logging.getLogger("jaclang.serve").warning(
+                "cross-boundary endpoint '%s' unavailable: server module %r "
+                "failed to import (%s: %s)",
+                name,
+                src_path,
+                type(e).__name__,
+                e
+            );
+            return None;
+        }
+        return None;
+    }
+
+    # Honor the callee's own access level (secure by default). Prefer the
+    # compile-time access table; fall back to the binding's defining node when
+    # the source module was only parse-resolved (so its access map was never
+    # recorded in the hub -- the common cl->sv case, where the server module is
+    # reached only through `sv import` and is not itself compiled in).
+    def auth_for(name: str, table: dict, ast_node: any) -> bool {
+        auth = table.get(name, None);
+        if auth is None {
+            is_pub = ast_node is not None
+            and ast_node?.access is not None
+            and ast_node.access.tag.name == Tok.KW_PUB;
+            auth = not is_pub;
+        }
+        return auth;
+    }
+
+    for (name, binding) in fn_bindings.items() {
+        # Path A wins: never override an entry-module registration.
+        if name in self._functions {
+            continue;
+        }
+        ast_node = binding?.ast_node;
+        src_path = ast_node.loc.mod_path if (ast_node and ast_node?.loc) else None;
+        if not src_path {
+            continue;
+        }
+        fn = resolve_symbol(src_path, name);
+        if fn is None or not callable(fn) {
+            continue;
+        }
+        self._functions[name] = fn;
+        self._function_access[name] = auth_for(name, func_access, ast_node);
+    }
+
+    for (name, binding) in walker_bindings.items() {
+        # Path A wins: never override an entry-module registration.
+        if name in self._walkers {
+            continue;
+        }
+        ast_node = binding?.ast_node;
+        src_path = ast_node.loc.mod_path if (ast_node and ast_node?.loc) else None;
+        if not src_path {
+            continue;
+        }
+        wcls = resolve_symbol(src_path, name);
+        if not (isinstance(wcls, type) and issubclass(wcls, WalkerArchetype)) {
+            continue;
+        }
+        self._walkers[name] = wcls;
+        self._walker_access[name] = auth_for(name, walker_access, ast_node);
     }
 }
 
@@ -756,6 +998,7 @@ impl ModuleIntrospector._check_module_freshness -> None {
         self._extract_access_levels();
         self._functions = self._collect_functions();
         self._walkers = self._collect_walkers();
+        self._collect_cross_boundary_endpoints();
         self._fill_endpoint_effect_defaults();
         self._bundle = None;
         self._bundle_error = None;
@@ -777,6 +1020,7 @@ impl ModuleIntrospector._check_module_freshness -> None {
         self._extract_access_levels();
         self._functions = self._collect_functions();
         self._walkers = self._collect_walkers();
+        self._collect_cross_boundary_endpoints();
         self._bundle = None;
         self._bundle_error = None;
     }
@@ -816,6 +1060,44 @@ impl ModuleIntrospector.get_client_functions -> dict[str, Callable[(..., Any)]] 
         self.load();
     }
     return dict(self._client_functions);
+}
+
+"""Resolve which client page should be served at the root path (/).
+
+Honors an explicitly configured base_route_app first. When none is set,
+infers a root page only from an intent-bearing signal: a conventionally
+named entry point (app/index/main/home/root). Returns "" otherwise, leaving
+the root path as the JSON API index.
+
+Inference is deliberately driven by intent, not incidence. A page named by
+convention says "this is the entry point"; an app that merely happens to
+expose one `cl` page (reachable at /cl/<name>) has not asked to become a
+single-page app, and silently promoting it would replace the JSON API index
+and impose the full client build toolchain on an otherwise API-only server.
+To serve a non-conventionally-named page at /, set base_route_app explicitly.
+Name matching is case-insensitive; the first declared spelling wins.
+"""
+impl ModuleIntrospector.resolve_root_app(configured: str = "") -> str {
+    if configured {
+        return configured;
+    }
+    # Client-only `cl` pages have no server-side attribute, so the manifest's
+    # export list (not get_client_functions) is the source of truth here.
+    self.load();
+    names = list(self._client_manifest.get('exports', []));
+    if not names {
+        return "";
+    }
+    by_lower: dict[(str, str)] = {};
+    for n in names {
+        by_lower.setdefault(n.lower(), n);
+    }
+    for candidate in ["app", "index", "main", "home", "root"] {
+        if candidate in by_lower {
+            return by_lower[candidate];
+        }
+    }
+    return "";
 }
 
 """Get callable signature information."""
@@ -1323,6 +1605,16 @@ impl ExecutionHandler.spawn_walker(
 impl JacAPIServer.postinit -> None {
     import from jaclang.runtimelib.scheduler { Scheduler }
     self.user_manager = Jac.get_user_manager(base_path=self.base_path);
+    # Back `root.shared`: map the internal guest user to its root id, creating
+    # the guest account on first use (request paths create it lazily too).
+    _um = self.user_manager;
+    def _shared_root_id -> (str | None) {
+        if not _um.user_exists(Con.GUEST.value) {
+            _um.create_user(Con.GUEST.value, '__no_password__');
+        }
+        return _um.get_root_id(Con.GUEST.value);
+    }
+    Jac.set_shared_root_resolver(_shared_root_id);
     self.introspector = ModuleIntrospector(self.module_name, self.base_path);
     self.execution_manager = ExecutionManager(
         base_path=self.base_path, user_manager=self.user_manager
@@ -1357,6 +1649,23 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
     server = self;
     """Handle HTTP requests.""";
     class JacRequestHandler(BaseHTTPRequestHandler) {
+        """Dispatch one request, swallowing client-disconnect errors.
+
+        A client that reloads, navigates away, or closes the tab mid-response
+        drops the socket while the handler is still writing -- raising
+        BrokenPipeError/ConnectionResetError out of `do_GET`/`do_POST`. The base
+        handler lets that escape, so socketserver prints an alarming traceback
+        for what is a routine disconnect. There is nothing to send to a peer that
+        already hung up, so end the connection quietly instead.
+        """
+        def handle_one_request(self: JacRequestHandler) {
+            try {
+                BaseHTTPRequestHandler.handle_one_request(self);
+            } except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) {
+                self.close_connection = True;
+            }
+        }
+
         """Extract auth token from Authorization header."""
         def _get_auth_token(self: JacRequestHandler) -> (str | None) {
             auth_header = self.headers.get('Authorization');
@@ -1390,9 +1699,96 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
             # Handle legacy Response objects for backward compatibility
             if isinstance(response, Response) {
                 Jac.send_json(self, response.status, response.body);
+            } elif isinstance(response, TransportResponse)
+            and (
+                isgenerator(response.data) or isinstance(response.data, AsyncGenerator)
+            ) {
+                # A `def:pub` endpoint that returns an iterator (e.g.
+                # `-> Iterator[dict]`) is a stream, not a single value. The
+                # JSON transport cannot encode a generator (it raises
+                # "generator is not JSON serializable"); stream it as SSE.
+                self._send_sse_response(response.data);
             } else {
                 transport = HTTPTransport(handler=self);
                 transport.send(response);
+            }
+        }
+
+        """Stream a generator result to the client as Server-Sent Events.
+
+        Each yielded item becomes a canonical `data: {json}\n\n` frame (the same
+        framing jac-scale's gateway emits, so one client SSE consumer works
+        against either server). A terminating `event: end` lets the consumer tell
+        a clean close from a dropped connection; a producer error surfaces as
+        `event: error`. Sync generators (the common cross-thread-queue pattern)
+        iterate directly; an async generator is driven on a private event loop
+        since the base server's request handler is synchronous.
+        """
+        def _send_sse_response(self: JacRequestHandler, gen: any) {
+            self.send_response(200);
+            self.send_header('Content-Type', 'text/event-stream');
+            self.send_header('Cache-Control', 'no-cache');
+            self.send_header('Connection', 'keep-alive');
+            # Defeat proxy/CDN response buffering so frames arrive as produced.
+            self.send_header('X-Accel-Buffering', 'no');
+            ResponseBuilder._add_cors_headers(self);
+            self.end_headers();
+            wfile = self.wfile;
+            try {
+                if isgenerator(gen) {
+                    for item in gen {
+                        wfile.write(
+                            f"data: {json.dumps(item, default=str)}\n\n".encode()
+                        );
+                        wfile.flush();
+                    }
+                } else {
+                    loop = asyncio.new_event_loop();
+                    try {
+                        while True {
+                            try {
+                                item = loop.run_until_complete(gen.__anext__());
+                            } except StopAsyncIteration {
+                                break;
+                            }
+                            wfile.write(
+                                f"data: {json.dumps(item, default=str)}\n\n".encode()
+                            );
+                            wfile.flush();
+                        }
+                    } finally {
+                        loop.close();
+                    }
+                }
+                wfile.write(b"event: end\ndata: {}\n\n");
+                wfile.flush();
+            } except (BrokenPipeError, ConnectionResetError) {
+                # Client disconnected mid-stream; the socket is gone, so there
+                # is nothing left to write.
+                pass;
+            } except Exception as e {
+                err_payload = {'error_type': type(e).__name__, 'message': str(e)};
+                try {
+                    wfile.write(
+                        f"event: error\ndata: {json.dumps(
+                            err_payload, default=str
+                        )}\n\n".encode()
+                    );
+                    wfile.flush();
+                } except Exception {
+                    pass;
+                }
+            } finally {
+                # Let a long-running queue producer drop its state if the
+                # consumer went away mid-stream.
+                close_fn = gen?.close;
+                if close_fn {
+                    try {
+                        close_fn();
+                    } except Exception {
+                        pass;
+                    }
+                }
             }
         }
 
@@ -1435,6 +1831,14 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
                 } except RuntimeError as exc {
                     Jac.send_json(self, 500, {'error': str(exc)});
                 }
+                return;
+            }
+            if (path == '/__build_status') {
+                # Dev-mode build health for external tooling — HTTP 200 alone
+                # can't tell a clean build from a broken one (compile errors
+                # still serve the error-overlay page).
+                import from jaclang.runtimelib.hmr { get_build_status }
+                Jac.send_json(self, 200, get_build_status());
                 return;
             }
             is_static_path = path.startswith('/static/');
@@ -1572,9 +1976,10 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
                 return;
             }
             if (path == '/') {
-                base_route_app = config.serve.base_route_app if config else "";
+                configured_root = config.serve.base_route_app if config else "";
+                base_route_app = server.introspector.resolve_root_app(configured_root);
                 if base_route_app {
-                    # Serve the configured base route app at /
+                    # Serve the configured (or inferred) base route app at /
                     query_params = parse_qs(parsed_path.query, keep_blank_values=True);
                     args = {
                         key: values[0] if (len(values) == 1) else values
@@ -1678,7 +2083,8 @@ impl JacAPIServer.create_handler -> type[BaseHTTPRequestHandler] {
                 );
             } else {
                 # SPA catch-all: serve base_route_app for unmatched extensionless paths
-                base_route_app = config.serve.base_route_app if config else "";
+                configured_root = config.serve.base_route_app if config else "";
+                base_route_app = server.introspector.resolve_root_app(configured_root);
                 if base_route_app {
                     self._render_page(base_route_app, {});
                 } else {
@@ -2042,7 +2448,13 @@ impl JacAPIServer.start(
     }
     config = get_config();
     cl_route_prefix = config.serve.cl_route_prefix if config else "cl";
-    base_route_app = config.serve.base_route_app if config else "";
+    configured_root = config.serve.base_route_app if config else "";
+    base_route_app = self.introspector.resolve_root_app(configured_root);
+    if self.server is None {
+        raise RuntimeError(
+            "Cannot start server: no socket was bound (test mode, port=0)"
+        );
+    }
     with self.server as httpd {
         console.print(f"Jac API Server running on http://0.0.0.0:{self.port}");
         console.print(f"Module: {self.module_name}");
@@ -2064,7 +2476,8 @@ impl JacAPIServer.start(
             f'  GET /{cl_route_prefix}/<name> - Render HTML page for client function'
         );
         if base_route_app {
-            console.print(f'\nBase route (/) configured to serve: {base_route_app}');
+            origin = "configured" if configured_root else "inferred";
+            console.print(f'\nBase route (/) {origin} to serve: {base_route_app}');
         }
         console.print('\nPress Ctrl+C to stop the server');
         # Display bundle error after endpoints if one occurred
@@ -2191,7 +2604,8 @@ impl print_endpoint_docs(server: JacAPIServer) -> None {
     }
     config = get_config();
     cl_route_prefix = config.serve.cl_route_prefix if config else "cl";
-    base_route_app = config.serve.base_route_app if config else "";
+    configured_root = config.serve.base_route_app if config else "";
+    base_route_app = server.introspector.resolve_root_app(configured_root);
     section('CLIENT PAGES', 'Public');
     if client_exports {
         funcs_list = ', '.join(sorted(client_exports)[:8]);

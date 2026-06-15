@@ -56,17 +56,17 @@ obj GraphBreakDetectPass(UniPass) {
     """
     def _collect_entry_points -> set[int] {
         ids: set[int] = set();
-        for ab in UniPass.get_all_sub_nodes(self.ir_in, uni.Ability, True) {
+        for ab in UniPass.get_all_sub_nodes(self.ir_in, uni.Ability) {
             if self._has_torch_compile_decorator(ab) {
                 ids.add(id(ab));
             }
         }
-        for arch in UniPass.get_all_sub_nodes(self.ir_in, uni.Archetype, True) {
+        for arch in UniPass.get_all_sub_nodes(self.ir_in, uni.Archetype) {
             if self._has_torch_compile_decorator(arch) {
                 ids.add(id(arch));
             }
         }
-        for call in UniPass.get_all_sub_nodes(self.ir_in, uni.FuncCall, True) {
+        for call in UniPass.get_all_sub_nodes(self.ir_in, uni.FuncCall) {
             if self._call_is_torch_compile(call) {
                 entry = self._resolve_wrapped_entry(call);
                 if entry is not None {

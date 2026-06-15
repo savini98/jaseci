@@ -584,6 +584,7 @@ impl JirReader._init_caches -> None {
         Source,
         ParamVar,
         ParamKind,
+        FuncCall,
         Token,
         Module,
         Import,
@@ -621,6 +622,7 @@ impl JirReader._init_caches -> None {
     self._WalkerStmtOnlyNode = WalkerStmtOnlyNode;
     self._Source = Source;
     self._ParamVar = ParamVar;
+    self._FuncCall = FuncCall;
     self._ParamKind_NORMAL = ParamKind.NORMAL;
     self._Token = Token;
     self._Module = Module;
@@ -872,6 +874,18 @@ impl JirReader._read_node(data: (bytes | memoryview), pos: int, idx: int) -> int
     # ParamVar.init: param_kind
     if isinstance(ir_node, self._ParamVar) {
         nd.setdefault('param_kind', self._ParamKind_NORMAL);
+    }
+
+    # FuncCall postinit: call_kind, callee_decl. Neither is serialized to JIR
+    # (the checker restamps them on a real inference run), but `__new__`-based
+    # construction skips postinit, so a JIR-reloaded FuncCall would otherwise
+    # have no attribute at all. Seed the postinit defaults so backends that
+    # read `.callee_decl`/`.call_kind` (native + client/JS codegen) see a clean
+    # `None` — an unresolved call — instead of crashing with AttributeError on
+    # a warm build. See jaseci-labs/jaseci#6656 (Ask #2).
+    if isinstance(ir_node, self._FuncCall) {
+        nd.setdefault('call_kind', None);
+        nd.setdefault('callee_decl', None);
     }
 
     # WalkerStmtOnlyNode.init: from_walker
@@ -1240,18 +1254,9 @@ impl JirReader._read_name_atom_overlay(
         na_node._sym_category = ST3.UNKNOWN;
     }
 
-    # Ensure remaining defaults
-    if not hasattr(na_node, 'name_of') {
-        na_node.name_of = na_node;
-    }
-    if not hasattr(na_node, '_sym') {
-        na_node._sym = None;
-    }
-    if not hasattr(na_node, '_py_ctx_func') {
-        import ast as ast3;
-        na_node._py_ctx_func = ast3.Load;
-    }
-
+    # name_of / _sym / _py_ctx_func defaults are already seeded by `_read_node`
+    # (via setdefault) when the NameAtom is constructed, before this overlay
+    # runs, so no backfill is needed here.
     return pos;
 }
 

@@ -280,7 +280,7 @@ impl Parser._make_alert(
 impl Parser.error(message: str) {
     sloc = self.current().loc;
     self.error_count += 1;
-    if self.prog is not None and hasattr(self.prog, "errors_had") {
+    if self.prog is not None {
         alrt = self._make_alert(message, sloc);
         self.prog.errors_had.append(alrt);
     }
@@ -288,14 +288,14 @@ impl Parser.error(message: str) {
 
 impl Parser.error_at(message: str, loc: SourceLoc) {
     self.error_count += 1;
-    if self.prog is not None and hasattr(self.prog, "errors_had") {
+    if self.prog is not None {
         alrt = self._make_alert(message, loc);
         self.prog.errors_had.append(alrt);
     }
 }
 
 impl Parser.warn_at(message: str, loc: SourceLoc) {
-    if self.prog is not None and hasattr(self.prog, "warnings_had") {
+    if self.prog is not None {
         alrt = self._make_alert(message, loc);
         self.prog.warnings_had.append(alrt);
     }
@@ -307,7 +307,7 @@ impl Parser.emit_diag(
     sloc = loc if loc is not None else self.current().loc;
     msg = diag.format_message(**kwargs);
     self.error_count += 1;
-    if self.prog is not None and hasattr(self.prog, "errors_had") {
+    if self.prog is not None {
         alrt = self._make_alert(msg, sloc, code=diag);
         self.prog.errors_had.append(alrt);
     }
@@ -318,7 +318,7 @@ impl Parser.emit_warn(
 ) {
     sloc = loc if loc is not None else self.current().loc;
     msg = diag.format_message(**kwargs);
-    if self.prog is not None and hasattr(self.prog, "warnings_had") {
+    if self.prog is not None {
         alrt = self._make_alert(msg, sloc, code=diag);
         self.prog.warnings_had.append(alrt);
     }
@@ -3110,7 +3110,11 @@ impl Parser.parse_lambda_param -> ParamVar | None {
     } elif self.is_keyword_token() {
         kw = self.current().value;
         self.emit_diag(E0013, keyword=kw, context="lambda parameter");
-        return None;
+        # Error recovery: keep the param (see parse_param_var) so the lambda's
+        # arity is preserved and call sites don't get cascading argument-count
+        # errors; E0013 already reports the keyword misuse.
+        name_tok = self.advance();
+        name = self.make_name_or_special(name_tok);
     } else {
         # No name follows - not a valid parameter
         return None;
@@ -5594,9 +5598,16 @@ impl Parser.parse_import_items(kid: list, is_clib_import: bool) -> tuple {
     clib_decls: list = [];
     self.expect(TokenKind.LBRACE);
     kid.append(self.make_uni_token(self.previous()));
-    # C library import: import from "libname" { def ...; obj ...; }
-    if is_clib_import
-    and self.check_any(
+    # C library import:
+    #   import from "libname" { def ...; obj ...; }   (explicit path)
+    #   import from raylib    { def ...; obj ...; }    (logical name, issue #6387)
+    # A block that opens with a declaration keyword is unambiguously a clib block
+    # regardless of whether the from-path was a string or a dotted name, because a
+    # `def`/`obj`/`has`/... can never begin a normal import *item* (which is a Name,
+    # `*`, or `Name as Name`). A leading STRING (a docstring before the first decl)
+    # only marks a clib block in the explicit-string form -- hence the trailing
+    # guard, which excludes a STRING lead for a non-string (logical-name) path.
+    if self.check_any(
         TokenKind.KW_DEF,
         TokenKind.KW_CAN,
         TokenKind.KW_OBJECT,
@@ -5606,7 +5617,8 @@ impl Parser.parse_import_items(kid: list, is_clib_import: bool) -> tuple {
         TokenKind.STRING,
         TokenKind.KW_GLOBAL,
         TokenKind.KW_HAS
-    ) {
+    )
+    and (is_clib_import or not self.check(TokenKind.STRING)) {
         while not self.check(TokenKind.RBRACE) and not self.at_end() {
             stmt = self.parse_element_stmt();
             if stmt is not None {
@@ -5716,6 +5728,21 @@ impl Parser.parse_archetype -> Archetype {
         }
         rp_uni = self.consume_uni(TokenKind.RPAREN);
     }
+    # Optional edge endpoint clause: `edge E: Src --> Tgt { ... }` declaring the
+    # source/target node types an edge connects (issue #6657). Orthogonal to the
+    # `(Base)` inheritance list above. The `-->` reads in the same direction a
+    # traversal does (`->:E:->` yields Tgt, `<-:E:<-` yields Src).
+    src_endpoint = None;
+    tgt_endpoint = None;
+    ep_colon_uni = None;
+    ep_arrow_uni = None;
+    if self.check(TokenKind.COLON) {
+        self.advance();
+        ep_colon_uni = self.make_uni_token(self.previous());
+        src_endpoint = self.parse_atomic_chain();
+        ep_arrow_uni = self.consume_uni(TokenKind.ARROW_R);
+        tgt_endpoint = self.parse_atomic_chain();
+    }
     body: list | None = None;
     has_body = False;
     body_lb_uni = None;
@@ -5772,6 +5799,12 @@ impl Parser.parse_archetype -> Archetype {
         }
         kid.append(rp_uni);
     }
+    if src_endpoint is not None {
+        kid.append(ep_colon_uni);
+        kid.append(src_endpoint);
+        kid.append(ep_arrow_uni);
+        kid.append(tgt_endpoint);
+    }
     if has_body {
         kid.append(body_lb_uni);
         kid.extend(body);
@@ -5788,7 +5821,9 @@ impl Parser.parse_archetype -> Archetype {
         kid=kid,
         doc=None,
         decorators=decorators,
-        type_params=type_params
+        type_params=type_params,
+        src_endpoint=src_endpoint,
+        tgt_endpoint=tgt_endpoint
     );
     if is_async {
         arch.is_async = True;
@@ -6332,15 +6367,13 @@ impl Parser.parse_ability -> Ability {
         }
         kid.append(tp_rb_uni);
     }
-    # Only add signature if it has actual content (parens/return type present)
-    has_sig_content = not (
-        len(signature.kid) == 1 and isinstance(signature.kid[0], EmptyToken)
-    );
-    if has_sig_content {
-        kid.append(signature);
-    } else {
-        signature = None;
-    }
+    # A function with neither a parameter list nor a return type is semantically
+    # `def foo() -> None`. Always keep the (possibly empty) signature so every
+    # ability uniformly carries one and an absent return type consistently means
+    # `None` across the whole stack (type check, pyast gen, native backend). An
+    # empty FuncSignature holds only an EmptyToken, so it still round-trips to
+    # source as `def foo` (no parens) rather than `def foo()`.
+    kid.append(signature);
     if body_type == "brace" {
         kid.append(body_lb_uni);
         kid.extend(body);
@@ -6533,7 +6566,13 @@ impl Parser.parse_param_var -> ParamVar | None {
     } elif self.is_keyword_token() {
         kw = self.current().value;
         self.emit_diag(E0013, keyword=kw, context="parameter");
-        return None;
+        # Error recovery: consume the keyword as the parameter name anyway so
+        # the signature keeps its correct arity. Dropping the param (return
+        # None) truncates the signature at this point, which cascades into
+        # spurious E1051 "too many positional arguments" at every call site
+        # (#6353 gap #3); E0013 already reports the real problem.
+        name_tok = self.advance();
+        name = self.make_name_or_special(name_tok);
     } else {
         return None;
     }
@@ -7059,7 +7098,7 @@ impl Parser.parse_impl_def -> ImplDef {
         if lb_uni {
             kid.append(lb_uni);
         }
-        impl_enum_commas = getattr(self, "_impl_enum_comma_unis", []);
+        impl_enum_commas = self._impl_enum_comma_unis;
         comma_idx = 0;
         for (i, item) in enumerate(body) {
             kid.append(item);

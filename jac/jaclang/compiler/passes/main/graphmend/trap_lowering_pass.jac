@@ -15,9 +15,18 @@ graph-native assertion that raises at runtime without breaking the graph
 torch.equal is special-cased because it returns a Python bool; the runtime helper
 rebuilds it as a tensor op with a static shape/dtype guard (see tensor_eq_assert).
 
-Limitation (documented): torch._assert_async raises a RuntimeError rather than the
-original exception type. Preserving the exact exception type via a hoisted
-error-id wrapper (paper) is left as future work. Gated by --graphmend.
+Exception-type preservation: torch._assert_async raises a RuntimeError, but a
+graph-native assert fails ASYNCHRONOUSLY -- the error surfaces at the call
+boundary, outside the traced region, so an in-source try/except cannot catch it.
+When the guard sits in a `@torch.compile`-decorated function, we instead fold the
+original exception type + message into a self-describing marker on the assert
+message (`[[GM-TRAP <Type>]]msg[[/GM-TRAP]]`) and prepend an eager boundary
+decorator `@__jac_trap_guard__`; it catches the RuntimeError at the boundary and
+re-raises the original type with the original message. The marker is folded at
+compile time so the assert stays a native torch op (no graph break). This applies
+only when the message is a string literal and the entry is a decorated function;
+module/forward entries (compiled at a call site) stay message-only. Gated by
+--graphmend.
 """
 import jaclang.jac0core.unitree as uni;
 import from jaclang.jac0core.passes { UniPass }
@@ -63,6 +72,24 @@ obj TrapLoweringPass(UniPass) {
         }
         x = cond.operand;
         msg = self._raise_message(rs, nd);
+        # The original exception type is preserved only when the guard sits in a
+        # `@torch.compile`-decorated function: there we can prepend an eager
+        # boundary decorator (`__jac_trap_guard__`) that catches the RuntimeError
+        # the graph-native assert raises -- outside the traced region -- and
+        # re-raises the original type. Module/forward entries (compiled at a call
+        # site) have no decorator to attach, so they stay message-only.
+        wrap = self._enclosing_compiled_fn(nd);
+        type_name = self._exception_type_name(rs) if (wrap is not None) else None;
+        # Preserve the exception type by folding a self-describing marker into the
+        # message LITERAL at compile time, keeping the assert a native torch op (a
+        # runtime concat would cross the opaque jaclib proxy and break the graph).
+        # When the message is not a string literal, degrade to message-only.
+        marked = (
+            self._marked_message(nd, msg, type_name)
+            if (type_name is not None)
+            else None
+        );
+        use_msg = marked if (marked is not None) else msg;
         eq = self._torch_equal_args(x);
         if eq is not None {
             (a, b) = eq;
@@ -70,10 +97,103 @@ obj TrapLoweringPass(UniPass) {
             if mod is not None {
                 mod._gm_needs_eq_assert = True;
             }
-            self._replace(nd, [self._eq_assert_stmt(nd, a, b, msg)]);
+            self._replace(nd, [self._eq_assert_stmt(nd, a, b, use_msg)]);
+            if marked is not None {
+                self._mark_guard(wrap);
+            }
         } elif self._returns_tensor_bool(x) {
-            self._replace(nd, [self._assert_async_stmt(nd, x, msg)]);
+            self._replace(nd, [self._assert_async_stmt(nd, x, use_msg)]);
+            if marked is not None {
+                self._mark_guard(wrap);
+            }
         }
+    }
+
+    """Return the nearest enclosing `@torch.compile`-decorated function, or None.
+    Only such a function can carry the boundary trap-guard decorator."""
+    def _enclosing_compiled_fn(nd: uni.UniNode) -> (uni.Ability | None) {
+        ab = nd.find_parent_of_type(uni.Ability);
+        if (ab is not None) and self._has_torch_compile_decorator(ab) {
+            return ab;
+        }
+        return None;
+    }
+
+    """True if `nd` carries a `@torch.compile` / `@torch.compile(...)` decorator."""
+    def _has_torch_compile_decorator(nd: uni.UniNode) -> bool {
+        for dec in (nd?.decorators or []) {
+            target = dec.target if isinstance(dec, uni.FuncCall) else dec;
+            if (
+                isinstance(target, uni.AtomTrailer)
+                and isinstance(target.right, uni.Name)
+                and (target.right.value == 'compile')
+                and isinstance(target.target, uni.Name)
+                and (target.target.value == 'torch')
+            ) {
+                return True;
+            }
+        }
+        return False;
+    }
+
+    """Name the original exception type from a raise (e.g. 'ValueError'), or None
+    for a bare re-raise. `raise mod.Err(..)` yields the trailing 'Err'."""
+    def _exception_type_name(rs: uni.RaiseStmt) -> (str | None) {
+        cause = rs.cause;
+        if cause is None {
+            return None;
+        }
+        target = cause.target if isinstance(cause, uni.FuncCall) else cause;
+        if isinstance(target, uni.Name) {
+            return target.value;
+        }
+        if isinstance(target, uni.AtomTrailer) and isinstance(target.right, uni.Name) {
+            return target.right.value;
+        }
+        return None;
+    }
+
+    """Fold the trap marker into a string-literal message at compile time, so the
+    boundary guard can restore `type_name`. Returns a new String literal, or None
+    when the message is not a plain literal (then we degrade to message-only)."""
+    def _marked_message(
+        at: uni.UniNode, msg: uni.Expr, type_name: str
+    ) -> (uni.String | None) {
+        # Jac parses a string literal as MultiString, the Python loader as String;
+        # both expose the unquoted text via `lit_value`.
+        if not isinstance(msg, (uni.String, uni.MultiString)) {
+            return None;
+        }
+        text = "[[GM-TRAP " + type_name + "]]" + msg.lit_value + "[[/GM-TRAP]]";
+        return self._str(at, text);
+    }
+
+    """Mark a function as needing the boundary trap-guard decorator (applied once
+    in exit_ability) and request its jaclib import. No-op for a missing function."""
+    def _mark_guard(ability: (uni.Ability | None)) -> None {
+        if ability is None {
+            return;
+        }
+        ability._gm_needs_trap_guard = True;
+        mod = ability.find_parent_of_type(uni.Module);
+        if mod is not None {
+            mod._gm_needs_trap_guard = True;
+        }
+    }
+
+    """Prepend `@__jac_trap_guard__` to a flagged function so its compiled call is
+    wrapped by the eager exception-restoring boundary."""
+    def exit_ability(nd: uni.Ability) -> None {
+        if not self._enabled {
+            return;
+        }
+        if not getattr(nd, '_gm_needs_trap_guard', False) {
+            return;
+        }
+        dec = self._gen_name(nd, '__jac_trap_guard__');
+        nd.decorators = [dec] + list(nd.decorators or []);
+        nd.set_kids([dec] + list(nd.kid));
+        dec.parent = nd;
     }
 
     # ---- pattern matching ----
@@ -152,7 +272,8 @@ obj TrapLoweringPass(UniPass) {
         return uni.ExprStmt(expr=call, in_fstring=False, kid=[call]);
     }
 
-    """Build `__jac_tensor_eq_assert__(a, b, msg)`."""
+    """Build `__jac_tensor_eq_assert__(a, b, msg)`. `msg` may already carry the
+    trap marker (folded in by `_marked_message`)."""
     def _eq_assert_stmt(
         at: uni.UniNode, a: uni.Expr, b: uni.Expr, msg: uni.Expr
     ) -> uni.ExprStmt {

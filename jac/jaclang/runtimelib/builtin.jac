@@ -9,14 +9,14 @@ import type from jaclang.jac0core.constructs { AccessLevel, NodeArchetype }
 import type from jaclang.jac0core.runtime { LLMModel }
 import type from jaclang { JacRuntimeInterface }
 
-enum APIProtocol ( StrEnum ) {
+enum APIProtocol(StrEnum) {
     HTTP = 'http',
     WEBHOOK = 'webhook',
     WEBSOCKET = 'websocket'
 }
 
 """Trigger mode for a scheduled task."""
-enum ScheduleTrigger ( StrEnum ) {
+enum ScheduleTrigger(StrEnum) {
     STATIC = 'static',
     DYNAMIC = 'dynamic'
 }
@@ -44,6 +44,8 @@ def _get_store -> Callable[..., any];
 def _get_llm -> LLMModel;
 
 def _get_archetype_alias -> Callable[..., any];
+
+def _get_schema_builder(name: str) -> Callable[..., any];
 
 def __getattr__(name: str) -> object;
 
@@ -109,5 +111,9 @@ glob __all__ = [
          'ScheduleTrigger',
          'APIProtocol',
          'archetype_alias',
+         'schema_was',
+         'schema_alias',
+         'schema_drop',
+         'schema_upgrade',
          'unsafe_html'
      ];

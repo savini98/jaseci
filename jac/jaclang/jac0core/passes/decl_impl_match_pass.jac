@@ -33,11 +33,14 @@ import from jaclang.jac0core.diagnostics {
     W2013,
     E2016,
     E2017,
+    E2026,
     W2080
 }
 
 """Decls and Def matching pass."""
 class DeclImplMatchPass(Transform[uni.Module, uni.Module]) {
+    has _e2026_reported: set[int];
+
     """Connect Decls and Defs."""
     def transform(self: DeclImplMatchPass, ir_in: uni.Module) -> uni.Module;
 
@@ -75,7 +78,7 @@ declarations in the main module.
 
     """Resolve unresolved Name and AtomTrailer symbols in a subtree."""
     def _resolve_symbols_in_subtree(
-        self: DeclImplMatchPass, root: uni.UniNode
+        self: DeclImplMatchPass, root_node: uni.UniNode
     ) -> None;
 
     """Populate self-member symbols from impl body to archetype's symbol table.

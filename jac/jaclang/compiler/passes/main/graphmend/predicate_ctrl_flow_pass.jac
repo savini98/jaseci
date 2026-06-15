@@ -28,8 +28,15 @@ the selected branch:
 and both branches to return matching tensor structures. If a branch yields a
 non-tensor (e.g. `None`), no transform applies and the break is left intact.
 
-Anything more complex (differing targets, multi-statement branches, elif chains)
-is left untouched. Gated by --graphmend.
+Multi-statement branches sharing a trailing call hoist their setups to run
+unconditionally, but only when each setup is provably effect-neutral on the
+untaken path (pure-local write, idempotent `.to()` device move, `hasattr`-guarded
+init, or a re-gated lowered assert) -- see `_setups_safe`/`_effect_neutral`. A
+non-idempotent observable write (e.g. `self.counter += 1`) is declined, leaving
+the break intact rather than hoisting it unsoundly.
+
+Anything more complex (differing targets, deeper multi-statement branches, elif
+chains) is left untouched. Gated by --graphmend.
 """
 import ast as ast3;
 import jaclang.jac0core.unitree as uni;
@@ -104,9 +111,16 @@ obj PredicateCtrlFlowPass(UniPass) {
 
     """True if setup statements can be safely hoisted out of the branch.
 
-    Hoisting is unsound if a setup transfers control (return/raise/break/
-    continue), since that would no longer be conditional. Pure computations and
-    static nested guards are fine -- that is exactly what predication assumes.
+    A setup runs UNCONDITIONALLY after the rewrite (predication computes both
+    paths), so it must be observationally neutral on the untaken path. Two
+    obligations (paper Table 1 / Fig. 3 Phi-4 legality):
+
+      1. Control neutrality -- no return/raise/break/continue, else hoisting
+         would make a control transfer unconditional.
+      2. Effect neutrality -- any write must be unobservable when run on the
+         untaken path: see `_effect_neutral`. This rejects non-idempotent
+         observable writes (e.g. `self.counter += 1`) that the old control-only
+         check would have hoisted unsoundly.
     """
     def _setups_safe(setups: list) -> bool {
         for s in setups {
@@ -122,8 +136,99 @@ obj PredicateCtrlFlowPass(UniPass) {
             if s.get_all_sub_nodes(uni.CtrlStmt) {
                 return False;
             }
+            if not self._effect_neutral(s) {
+                return False;
+            }
         }
         return True;
+    }
+
+    """True if hoisting `s` to run on both paths changes nothing observable.
+
+    Licensed forms (anything else is conservatively declined):
+      - a lowered validation guard `torch._assert_async(...)` -- re-gated onto the
+        branch predicate afterwards (`_gate_asserts`), so it stays conditional;
+      - an existence-guarded initialization `if not hasattr(X, "k"): ...` -- the
+        guard makes re-execution a no-op (paper's idempotent init);
+      - an assignment that is either a pure write to local name(s) (the value is
+        recomputed, not an escaping effect) or an idempotent device move
+        `x = x.to(...)` (writing a tensor back to itself).
+    """
+    def _effect_neutral(s: uni.UniNode) -> bool {
+        if self._is_assert_async(s) {
+            return True;
+        }
+        if self._is_existence_guard(s) {
+            return True;
+        }
+        if isinstance(s, uni.Assignment) {
+            return self._assignment_neutral(s);
+        }
+        return False;
+    }
+
+    """True if `s` is `if not hasattr(X, "..."): ...` -- an existence guard whose
+    body initializes once and is a no-op on re-execution."""
+    def _is_existence_guard(s: uni.UniNode) -> bool {
+        if not isinstance(s, uni.IfStmt) {
+            return False;
+        }
+        c = s.condition;
+        if (not isinstance(c, uni.UnaryExpr)) or (c.op is None) or (c.op.value != 'not') {
+            return False;
+        }
+        inner = c.operand;
+        return (
+            isinstance(inner, uni.FuncCall)
+            and isinstance(inner.target, uni.Name)
+            and (inner.target.value == 'hasattr')
+        );
+    }
+
+    """True if assignment `s` is neutral to hoist: an idempotent device move, or a
+    pure write to local name target(s) (no call in the value)."""
+    def _assignment_neutral(s: uni.Assignment) -> bool {
+        if self._is_device_move(s) {
+            return True;
+        }
+        return (
+            (s.value is not None)
+            and (not self._has_call(s.value))
+            and self._all_local_targets(s.target)
+        );
+    }
+
+    """True if `s` is `lhs = <recv>.to(...)` with `lhs` textually equal to the
+    receiver -- a device move that is idempotent (re-running is a no-op)."""
+    def _is_device_move(s: uni.Assignment) -> bool {
+        v = s.value;
+        if (v is None) or (len(s.target) != 1) {
+            return False;
+        }
+        if not (
+            isinstance(v, uni.FuncCall)
+            and isinstance(v.target, uni.AtomTrailer)
+            and isinstance(v.target.right, uni.Name)
+            and (v.target.right.value == 'to')
+        ) {
+            return False;
+        }
+        recv = v.target.target;
+        return (
+            recv.unparse().replace(' ', '')
+            == s.target[0].unparse().replace(' ', '')
+        );
+    }
+
+    """True if every assignment target is a bare local Name (not an attribute or
+    subscript), so the write does not escape to observable state."""
+    def _all_local_targets(targets: list) -> bool {
+        for t in targets {
+            if not isinstance(t, uni.Name) {
+                return False;
+            }
+        }
+        return len(targets) > 0;
     }
 
     """Return the common LHS name if both assigns target the same single name."""

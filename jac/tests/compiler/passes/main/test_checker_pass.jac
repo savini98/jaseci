@@ -3,6 +3,7 @@
 import os;
 import from pathlib { Path }
 import jaclang;
+import jaclang.jac0core.unitree as uni;
 import from jaclang.compiler.passes.main.type_checker_pass { TypeCheckPass }
 import from jaclang.jac0core.program { JacProgram }
 import from jaclang.jac0core.compile_options { CompileOptions }
@@ -238,6 +239,20 @@ test "from_import" {
            ^^^^^^^^^^^^^^
     """,
         program.errors_had[0].pretty_print()
+    );
+}
+
+"""Calling an @overload-ed function imported through a re-export chain matches
+the later overload. Overloads must be gathered at the definition scope, not the
+single-symbol re-export scope (regression: SQLAlchemy `create_engine`)."""
+test "imported_overloaded_function_call_resolves" {
+    path = os.path.join(CHECKER_FIXTURES, "checker_imported_overload.jac");
+    program = JacProgram();
+    program.compile(path, type_check=True);
+    assert program.errors_had == [] , (
+        "make(\"a\") matches the no-strict overload; expected no errors, got: " + str(
+            [e.pretty_print() for e in program.errors_had]
+        )
     );
 }
 
@@ -1044,6 +1059,29 @@ test "disconnect_op_no_w1051" {
     ]}";
 }
 
+test "named_entry_no_w1051" {
+    # Regression: a named entry block (`with entry:__main__`, `with entry:foo`)
+    # emitted a spurious W1051 on the entry-point label. A ModuleCode's `name`
+    # is a Name node that is a label, not a variable reference -- it has no
+    # symbol -- but exit_name type-evaluated it, got Unknown, and warned. This
+    # fired on the idiomatic `with entry:__main__` guard of nearly every program.
+    path = os.path.join(CHECKER_FIXTURES, "checker_named_entry_no_w1051.jac");
+    program = JacProgram();
+    mod = program.compile(path, options=NO_TC);
+    TypeCheckPass(ir_in=mod, prog=program);
+    w1051 = [
+        w
+        for w in program.warnings_had
+        if w.code and w.code.code == "W1051"
+    ];
+    assert len(w1051) == 0 , f"Expected no W1051 on named entry labels, got {len(
+        w1051
+    )}:\n" + "\n---\n".join(w.pretty_print() for w in w1051);
+    assert len(program.errors_had) == 0 , f"Unexpected errors: {[
+        e.pretty_print() for e in program.errors_had
+    ]}";
+}
+
 test "ability_trigger_archetype" {
     # Walker abilities must trigger on a node/edge/Root; node/edge
     # abilities must trigger on a walker. Tuple and union triggers are
@@ -1316,6 +1354,30 @@ test "inferred_local_type_frozen" {
         a = "some str";  # <-- Error
     """,
         program.errors_had[0].pretty_print()
+    );
+}
+
+test "inferred_local_type_widens_literals" {
+    # Only the cross-type reassignment errors, and the message reports the
+    # widened base type (`str`), not a leaked `Literal[...]`.
+    program = JacProgram();
+    mod = program.compile(
+        os.path.join(CHECKER_FIXTURES, "checker_literal_widening_reassignment.jac"),
+        options=NO_TC
+    );
+    TypeCheckPass(ir_in=mod, prog=program);
+    assert len(program.errors_had) == 1 , f"Expected 1 type error, but got {len(
+        program.errors_had
+    )}: " + "\n".join([err.pretty_print() for err in program.errors_had]);
+    assert program.errors_had[0].code.code == "E1001";
+    msg = program.errors_had[0].pretty_print();
+    assert "Cannot assign int to str" in msg , f"Expected widened-base message, got: {msg}";
+    assert "Literal[" not in msg , f"Frozen type should not leak a literal: {msg}";
+    assert_error_pretty_found(
+        """
+        name = 5;  # <-- Error
+        ^^^^^^^^
+    """, msg
     );
 }
 
@@ -5129,4 +5191,108 @@ test "duplicate_archetype_decl_is_hard_error" {
     assert "Animal" in e0077[1].pretty_print() , f"second E0077 should name 'Animal': {e0077[
         1
     ].pretty_print()}";
+}
+
+test "comprehension_in_ternary_narrowing" {
+    path = os.path.join(CHECKER_FIXTURES, "checker_comprehension_in_ternary.jac");
+    program = JacProgram();
+    mod = program.compile(path, options=NO_TC);
+    TypeCheckPass(ir_in=mod, prog=program);
+    assert len(program.errors_had) == 1 , "Expected exactly 1 error (no-guard case), got " + f"{len(
+        program.errors_had
+    )}:\n" + "\n---\n".join(e.pretty_print() for e in program.errors_had);
+}
+
+test "spread_with_explicit_kwarg_no_false_positive" {
+    # Regression: a call that mixes a `*`/`**` spread with an explicit keyword
+    # argument must not emit E1057 "Parameter 'X' already matched". The spread
+    # contents are statically unknown, so the explicit keyword wins and the
+    # spread only satisfies the required-param check.
+    path = os.path.join(CHECKER_FIXTURES, "checker_spread_with_kwarg.jac");
+    program = JacProgram();
+    mod = program.compile(path, options=NO_TC);
+    TypeCheckPass(ir_in=mod, prog=program);
+    assert len(program.errors_had) == 0 , f"Expected no errors for spread + explicit kwarg, got {len(
+        program.errors_had
+    )}:\n" + "\n---\n".join(e.pretty_print() for e in program.errors_had);
+}
+
+test "circular_import_preserves_class_identity" {
+    abs_entry = os.path.join(CHECKER_FIXTURES, "circular_import_identity", "entry.jac");
+    rel_entry = os.path.relpath(abs_entry);
+    program = JacProgram();
+    program.compile(rel_entry, type_check=True);
+    assert len(program.errors_had) == 0 , f"Circular import split the class identity, got {len(
+        program.errors_had
+    )} error(s):\n" + "\n---\n".join(e.pretty_print() for e in program.errors_had);
+}
+
+test "callable_null_default_rejected_outside_native" {
+    # Issue #6569 allows `Callable[[...], ret] = 0` (a C NULL function
+    # pointer) in native modules only. Regular Jac must keep rejecting it.
+    path = os.path.join(CHECKER_FIXTURES, "checker_callable_null_default.jac");
+    program = JacProgram();
+    mod = program.compile(path, options=NO_TC);
+    TypeCheckPass(ir_in=mod, prog=program);
+    assert len(program.errors_had) == 1 , "Expected exactly 1 error, got " + f"{len(
+        program.errors_had
+    )}:\n" + "\n---\n".join(e.pretty_print() for e in program.errors_had);
+    assert program.errors_had[0].code.code == "E1001";
+    assert_error_pretty_found(
+        """
+        has fn: Callable[[int], int] = 0;  # <-- Error
+    """,
+        program.errors_had[0].pretty_print()
+    );
+}
+
+test "edge_endpoint_typing_narrows_neighbour_traversals" {
+    # Issue #6657: an edge that declares `: Src --> Tgt` lets a neighbour
+    # traversal infer the declared node type instead of `any`, with no
+    # `[?:Type]` filter -- so a field read off the result resolves statically.
+    program = JacProgram();
+    mod = program.compile(
+        os.path.join(CHECKER_FIXTURES, "edge_endpoint_typing.jac"), type_check=True
+    );
+    assert len(program.errors_had) == 0 , "Unexpected errors:\\n" + "\\n---\\n".join(
+        e.pretty_print() for e in program.errors_had
+    );
+    expected = {
+        "follow_out": "list[Profile]",  # ->:Follow:-> narrows to target
+        "post_in": "list[Profile]",  # <-:Post:<- narrows to source
+        "post_out": "list[Tweet]",  # ->:Post:-> narrows to target
+        "untyped": "list[<any>]",  # bare edge stays gradual
+        "inherited": "list[Profile]",  # subtype edge inherits endpoints
+        "one": "Tweet",  # subscript element of a narrowed list
+        "field_read": "str"  # field read off a narrowed element
+    };
+    seen: dict[str, str] = {};
+    for nm in mod.get_all_sub_nodes(uni.Name) {
+        if nm.value in expected and nm.type is not None {
+            seen[nm.value] = str(nm.type);
+        }
+    }
+    for (target, want) in expected.items() {
+        assert seen.get(target) == want , f"{target}: expected {want}, got {seen.get(
+            target
+        )}";
+    }
+}
+
+test "edge_endpoint_clause_rejected_on_non_edge" {
+    # Issue #6657: the endpoint clause is edge-only; a node carrying one is an
+    # E2027 rather than a silently-ignored declaration.
+    program = JacProgram();
+    program.compile(
+        os.path.join(CHECKER_FIXTURES, "edge_endpoint_on_node.jac"), type_check=True
+    );
+    has_e2027 = False;
+    for alrt in program.errors_had {
+        if alrt.code is not None and alrt.code.code == "E2027" {
+            has_e2027 = True;
+        }
+    }
+    assert has_e2027 , "Expected E2027 for endpoint clause on a node, got:\\n" + "\\n---\\n".join(
+        e.pretty_print() for e in program.errors_had
+    );
 }

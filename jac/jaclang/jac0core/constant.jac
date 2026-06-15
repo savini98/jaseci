@@ -35,7 +35,7 @@ enum SymbolType {
 }
 
 """LSP Token types for Jac."""
-enum JacSemTokenType : int {
+enum JacSemTokenType: int {
     NAMESPACE = 0,
     TYPE = 1,
     CLASS = 2,
@@ -134,6 +134,24 @@ enum SymbolAccess {
     PROTECTED = 'protected',
     with entry {
         def __str__(self: SymbolAccess) -> str {
+            return self.value;
+        }
+    }
+}
+
+"""Where a symbol's runtime binding lives (storage class).
+
+Computed centrally from the symbol table so backends never re-derive
+scoping facts (see analysis-centralization-plan, Phase 2).
+"""
+enum SymbolStorage {
+    LOCAL = 'local',
+    PARAM = 'param',
+    MODULE_GLOBAL = 'module_global',
+    CAPTURED = 'captured',
+    CLASS_FIELD = 'class_field',
+    with entry {
+        def __str__(self: SymbolStorage) -> str {
             return self.value;
         }
     }

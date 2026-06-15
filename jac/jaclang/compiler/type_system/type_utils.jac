@@ -55,6 +55,23 @@ codegen backends instead of each re-deriving it.
 def primitive_type_name_of(ty: (types.TypeBase | None)) -> (str | None);
 
 """
+Primitive type name of an EXPRESSION, resolved through the program's type
+authority, or "" when unknown.
+
+This is the sanctioned codegen-time read of expression types: the
+evaluator is the single type authority and `Expr.type` is its
+memoization, populated lazily - checking stamps what its rules evaluate,
+and the first query for anything else computes and caches it (diagnostics
+from such late queries are deferred/managed by the checker's reporter
+machinery, see TypeCheckPass.emit). Backends call this instead of
+importing the evaluator, so expression-type derivation has exactly one
+owner. (Measured across the ES + OSP corpora: a stamp, when present,
+never disagrees with the evaluator - the lazy query only ever fills
+gaps.)
+"""
+def expr_primitive_name(prog: object, expr_node: uni.UniNode) -> str;
+
+"""
 Tracks parameter assignments for function calls.
 
     This class helps in tracking which parameters have been matched
@@ -65,6 +82,12 @@ obj ParamAssignmentTracker {
     has params: list[types.Parameter],
         curr_param_idx: int = 0,
         matched_params: set[types.Parameter] = set(),
+        # Params *possibly* filled by a `*`/`**` spread of statically-unknown
+        # contents. Kept apart from `matched_params` (definite positional/keyword
+        # binds): a spread satisfies required-param checks but must NOT trigger a
+        # duplicate-argument error for a later explicit keyword, since we cannot
+        # prove the spread actually set that key.
+        spread_filled: set[types.Parameter] = set(),
         varargs: (types.Parameter | None) = None,
         kwargs: (types.Parameter | None) = None;
 
@@ -122,6 +145,12 @@ def get_completion_items(
 def lookup_symtab(
     symtable: uni.UniScopeNode, name: str, builtins_to_inject: uni.Module
 ) -> (Symbol | None);
+
+"""Collect a name's [primary, *overloads], descending only the statically-live
+branch of `if`/`elif`/`else` guards so dead-branch declarations don't resolve."""
+def collect_member_syms(
+    scope: uni.UniScopeNode, name: str, deep: bool = False
+) -> list[Symbol];
 
 def class_implements_protocol(
     cls: types.ClassType, proto: types.ClassType, evaluator: any = None

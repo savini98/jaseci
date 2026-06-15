@@ -3,6 +3,7 @@
 This module provides the CompileOptions obj which encapsulates
 all options that control compilation behavior.
 """
+import from dataclasses { field }
 
 """Options controlling Jac compilation behavior."""
 obj CompileOptions {
@@ -14,6 +15,7 @@ obj CompileOptions {
         force_target_program: bool = False,
         aot_mode: bool = False,
         graphmend: bool = False,
+        suppress_codes: list[str] = field(default_factory=`list),
         cancel_token: any = None;
 
     """Return a copy with skip_native_engine set."""

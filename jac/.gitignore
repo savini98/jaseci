@@ -7,8 +7,12 @@ db.sqlite3
 media
 migrations
 venv
-.jaccache/
+
+# Jac build & cache artifacts
+.jac/
+*.jir
 *.jbc
+.jac_ir/        # legacy native IR cache (superseded by .jac/cache/native)
 
 # Distribution / packaging
 .Python
@@ -62,7 +66,3 @@ out.txt
 *.dat
 *.dir
 *.log
-
-.jac_ir
-
-.jac_ir

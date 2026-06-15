@@ -60,6 +60,7 @@ glob __all__ = [
          'thread_wait',
          '__jac_flush_se_buffer__',
          '__jac_tensor_eq_assert__',
+         '__jac_trap_guard__',
          '__jac_log_register__',
          '__jac_log_emit__',
          '__jac_log_flush_hook__'
@@ -96,6 +97,7 @@ glob __all__ = [
      thread_wait = JacRuntimeInterface.thread_wait,
      __jac_flush_se_buffer__ = JacRuntimeInterface.flush_se_buffer,
      __jac_tensor_eq_assert__ = JacRuntimeInterface.tensor_eq_assert,
+     __jac_trap_guard__ = JacRuntimeInterface.trap_guard,
      __jac_log_register__ = JacRuntimeInterface.log_register,
      __jac_log_emit__ = JacRuntimeInterface.log_emit,
      __jac_log_flush_hook__ = JacRuntimeInterface.log_flush_hook;

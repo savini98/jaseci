@@ -129,6 +129,12 @@ Legend: `[≡]` = value-equivalence of a lowered check.
             │ Hoisted setups control-free?[INV2] ├─return/    ► ⛔ DECLINE
             └─────────────────┬─────────────────┘  break)
                               │ Yes
+            ┌─────────────────▼─────────────────┐  No (escaping
+            │ Hoisted setups effect-neutral?     ├─non-idemp. ► ⛔ DECLINE
+            │ pure-local / idemp. .to() / hasattr│  write)
+            │ init / lowered assert       [INV3] │
+            └─────────────────┬─────────────────┘
+                              │ Yes
             ┌─────────────────▼─────────────────┐ Yes
             │ Setup has a lowered assert?         ├──► re-gate ¬cond∨check
             │ compose w/ Transform 3      [INV2] │    (preserve guard)
@@ -222,8 +228,11 @@ Legend: `[≡]` = value-equivalence of a lowered check.
             │ Emit torch._assert_async(C, msg)   │
             │ • nested in predicated branch →    │
             │   re-gated later by Transform 1    │
-            │ • RuntimeError (exact-type UID     │
-            │   hoist = future work)             │
+            │ • in @torch.compile fn + literal   │
+            │   msg → fold [[GM-TRAP type]]       │
+            │   marker + prepend @trap_guard,     │
+            │   which restores the type at the    │
+            │   async failure boundary            │
             └─────────────────┬─────────────────┘
                               ▼
                          ✅ TRANSFORM
@@ -251,7 +260,13 @@ Input : IfStmt n tagged dyn_ctrl_fl;  Output: predicated dataflow, or ⊥
 10      foreach s ∈ S do
 11          if IsEqAssert(s)                     then return ⊥        // cannot re-gate (Alg.4)
 12          else if IsLoweredAssert(s)           then s ← Regate(s,c,taken)  ▷ INV2 compose
-13          else if ¬Pure(s) ∧ ¬Independent(s,·) then return ⊥        ▷ INV2/INV3
+13          else if ¬EffectNeutral(s)            then return ⊥        ▷ INV3 escape/idempotency
+
+EffectNeutral(s) ≡                                   // licensed-safe hoist forms only
+   PureLocalWrite(s)            // s: ‹x̄ ← e›, x̄ all bare locals, ¬HasCall(e)
+ ∨ DeviceMove(s)               // s: ‹x ← r.to(..)›, x ≡ r  (idempotent self-write)
+ ∨ ExistenceGuardedInit(s)     // s: ‹if ¬hasattr(X,k): …›  (init once, no-op on replay)
+   // everything else (escaping attr/subscript writes, unresolved calls) ⇒ false
 14  p ← fresh();  emit  p ← c                                        // hoist predicate
 15  emit Hoist(ST); emit Hoist(SF)
 16  if HasCall(vT) ∨ HasCall(vF) then  sel ← cond(p, λ.vT, λ.vF, ()) // run only taken path
@@ -277,18 +292,26 @@ Input : Call n tagged side_effect, in region R;  Output: deferred effect, or ⊥
  2  if ¬BindingStable(n)             then return ⊥                   ▷ INV3 binding stability
  3  if ¬Independent(n, succ(n))      then return ⊥                   ▷ INV3 reorder legality
  4  if f = print then
- 5      emit  buf.append(⟨f, args(n), kwargs(n)⟩)                    // value-replayable
+ 5      emit  buf.append(⟨f, snapshot(args(n)), kwargs(n)⟩)          // value-replayable, cloned
  6  else if IsLogger(f) then                                        // Logger object ∉ graph
  7      if n ∈ forward-method M then
  8          sl ← RegisterSlot(f) @ load(M)                           // bound method out of graph
  9          emit  log_emit(sl, args(n), kwargs(n))                   // int slot + const args
 10          ensure  M.register_forward_hook(flush)                  // replay post-graph
 11      else
-12          emit  buf.append(⟨f, args(n), kwargs(n)⟩)               // relocates, log preserved
+12          emit  buf.append(⟨f, snapshot(args(n)), kwargs(n)⟩)     // relocates, log preserved
 13  remove n;  mark enclosingFn as needs-flush
 ─── once per enclosing fn ───
 14  HoistReturnValue()              // r ← expr; flush(); return r   ▷ INV3 output-neutral
 15  emit  flush()  as trailing epilogue                             // in original order
+
+snapshot(args):                                       // INV3 value-snapshot at call site
+   foreach non-constant aᵢ ∈ args:                    // literals are immutable, left as-is
+      tᵢ ← fresh();  hoist  tᵢ ← aᵢ  before the append // bind once, original eval order
+      replace aᵢ with  (tᵢ.clone() if hasattr(tᵢ,'clone') else tᵢ)
+   // hasattr resolves statically under Dynamo ⇒ clone is a native in-graph op for
+   // tensors, a no-op otherwise; protects the deferred value from a later in-place
+   // mutation of the same tensor (paper Table 1, clone(args)).
 ```
 
 ### Algorithm 4 -- Predicated Trap-Lowering Legality & Rewrite
@@ -304,9 +327,15 @@ Input : IfStmt n tagged val_guard;  Output: graph-native assertion, or ⊥
  7      C ← g ? (a==b).all() : tensor(False)                         // value-equiv of equal
  8  else if TensorBool(X) then  C ← X                                // already tensor bool
  9  else                        return ⊥                             ▷ INV4 not tensor-bool
-10  emit  _assert_async(C, m);   remove n
-11  // C is a value ⇒ if n nested in a dyn_ctrl_fl branch, Alg.2:12 re-gates C  ▷ INV2 seam
-12  // caveat: raises RuntimeError; exact-type (UID hoist) = future work
+10  e ← exceptionType(n)                                            // e.g. ValueError
+11  if n ∈ a @torch.compile fn ∧ m is a literal then               // type-preservation scope
+12      m ← "[[GM-TRAP "+e+"]]"+m+"[[/GM-TRAP]]"                    // fold marker at compile time
+13      mark enclosingFn → prepend @trap_guard (boundary restore)
+14  emit  _assert_async(C, m);   remove n
+15  // C is a value ⇒ if n nested in a dyn_ctrl_fl branch, Alg.2:12 re-gates C  ▷ INV2 seam
+16  // A graph-native assert fails ASYNC at the call boundary, so the type is
+17  // restored there (not in-source): @trap_guard catches the RuntimeError and
+18  // re-raises e(m). Module/forward entries have no decorator ⇒ message-only.
 ```
 
 ### Algorithm 5 -- Driver (scheduling = the composition guarantee)
@@ -348,9 +377,9 @@ predicate-safely. Post-order resolves inner regions before their enclosers.
 | Concept | Where |
 |---------|-------|
 | Detection / tagging (Alg. 1) | `graph_break_detect_pass.jac` |
-| Alg. 2 (predicate ctrl-flow) | `predicate_ctrl_flow_pass.jac` -- `_setups_safe` (INV2), `_has_none` (INV4), `Reconcile` ≈ `_same_lhs`/`_merge_common_call`, `_use_cond` (where vs cond), `_gate_asserts`/`Regate` (INV2 compose), `_is_eq_assert` bail |
-| Alg. 3 (defer side effects) | `defer_side_effect_pass.jac` -- `_is_user_defined` (INV3 binding), forward-hook slot mechanism, return-value hoist |
-| Alg. 4 (trap lowering) | `trap_lowering_pass.jac` -- `if not C: raise` match, `torch.equal` → `__jac_tensor_eq_assert__` with shape/dtype guard, tensor-bool direct |
+| Alg. 2 (predicate ctrl-flow) | `predicate_ctrl_flow_pass.jac` -- `_setups_safe` (INV2 control + INV3 effect), `_effect_neutral`/`_is_existence_guard`/`_is_device_move`/`_all_local_targets` (idempotent-write licensing & escape), `_has_none` (INV4), `Reconcile` ≈ `_same_lhs`/`_merge_common_call`, `_use_cond` (where vs cond), `_gate_asserts`/`Regate` (INV2 compose), `_is_eq_assert` bail |
+| Alg. 3 (defer side effects) | `defer_side_effect_pass.jac` -- `_is_user_defined` (INV3 binding), `_buffer_entry`/`_clone_guard` (snapshot: hoist + clone-if-tensor), forward-hook slot mechanism, return-value hoist |
+| Alg. 4 (trap lowering) | `trap_lowering_pass.jac` -- `if not C: raise` match, `torch.equal` → `__jac_tensor_eq_assert__` with shape/dtype guard, tensor-bool direct; `_marked_message` (fold exception type into a literal marker), `_enclosing_compiled_fn`/`exit_ability` (prepend `@__jac_trap_guard__`); `runtime.impl.jac` `trap_guard` (boundary restore) |
 | Alg. 5 (scheduling) | `jac0core/compiler.jac` `get_py_code_gen` -- order: Detect → Trap → Predicate → DeferSideEffect |
 
 ### Tests
@@ -364,14 +393,27 @@ predicate-safely. Post-order resolves inner regions before their enclosers.
 
 ### Known limitations (honest scope)
 
-- **Exception type.** `_assert_async` raises `RuntimeError`, not the user's
-  exception type. The UID-hoist that re-raises the original type (described in the
-  paper) is not yet implemented.
+- **Exception type — restored within scope.** The original exception type and
+  message are restored when the guard sits in a `@torch.compile`-decorated
+  function and the message is a string literal: the type is folded into a marker
+  and an eager `@__jac_trap_guard__` boundary decorator re-raises it. Out of
+  scope (still message-only as a `RuntimeError`): guards in `nn.Module` forward
+  entries compiled at a call site (no decorator to attach), non-literal messages,
+  and custom non-builtin exception types (these fall back to `RuntimeError` so
+  the message is never lost). Because the assert is graph-native and fails
+  asynchronously, the error surfaces at the next sync/call boundary rather than
+  at the original guard line.
 - **`torch.equal` nested in a predicated branch** is declined (its check is
   computed inside the helper and cannot be re-gated). Only the tensor-bool guard
   form composes.
 - **Multi-statement same-LHS assignment** branches: predication's multi-statement
   path currently handles only a shared *trailing call* (`Reconcile` call case), so
   compound fixtures must end in a shared `ExprStmt` call.
+- **Hoist effect-neutrality is conservative.** Setups are hoisted only when proven
+  neutral by the licensed forms in `EffectNeutral` (pure-local write, idempotent
+  `.to()` device move, `hasattr`-guarded init, re-gated lowered assert). A setup
+  with an escaping attribute/subscript write, or a call we do not resolve, is
+  declined even if it would in fact be safe — coverage is traded for soundness,
+  so an unsafe non-idempotent write (e.g. `self.counter += 1`) is never hoisted.
 
 ```

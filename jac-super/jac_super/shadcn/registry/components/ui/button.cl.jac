@@ -1,8 +1,8 @@
-cl import from "class-variance-authority" { cva }
-cl import from "radix-ui" { Slot }
-cl import from ...lib.utils { cn }
+import from "class-variance-authority" { cva }
+import from "radix-ui" { Slot }
+import from ...lib.utils { cn }
 
-glob _buttonVariants: Any = cva(
+glob _buttonVariants: any = cva(
          "cn-button focus-visible:border-ring focus-visible:ring-ring/50 aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive dark:aria-invalid:border-destructive/50 rounded-lg border border-transparent bg-clip-padding text-sm font-medium focus-visible:ring-3 aria-invalid:ring-3 [&_svg:not([class*='size-'])]:size-4 inline-flex items-center justify-center whitespace-nowrap transition-all disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none shrink-0 [&_svg]:shrink-0 outline-none group/button select-none",
          {
              "variants": {
@@ -28,55 +28,57 @@ glob _buttonVariants: Any = cva(
              "defaultVariants": {"variant": "default", "size": "default"}
          }
      ),
-     _buttonExcludeKeys: list = ["className", "variant", "size", "asChild", "children"];
+     _buttonExcludeKeys: list[str] = [
+         "className",
+         "variant",
+         "size",
+         "asChild",
+         "children"
+     ];
 
-cl {
-    def:pub Button(props: Any) -> JsxElement {
-        variant = props.variant or "default";
-        size = props.size or "default";
-        asChild = props.asChild or False;
+def:pub Button(props: any) -> JsxElement {
+    variant = props["variant"] or "default";
+    size = props["size"] or "default";
+    asChild = props["asChild"] or False;
 
-        restProps = {};
-        excludeKeys = _buttonExcludeKeys;
-        Object.keys(props).forEach(
-            lambda (key: Any) { if excludeKeys.indexOf(key) == -1 {
-                restProps[key] = props[key];
-            }}
-        );
-
-        variantsFn = _buttonVariants;
-        computedClass = cn(
-            variantsFn.call(
-                None, {"variant": variant, "size": size, "className": props.className}
-            )
-        );
-
-        if asChild {
-            return
-                <Slot.Root
-                    data-slot="button"
-                    data-variant={variant}
-                    data-size={size}
-                    className={computedClass}
-                    {...restProps}
-                >
-                    {props.children}
-                </Slot.Root>;
+    restProps = {};
+    for key in Object.keys(props) {  # jac:ignore[W6001]
+        if key not in _buttonExcludeKeys {
+            restProps[key] = props[key];
         }
+    }
 
+    computedClass = cn(
+        _buttonVariants.call(
+            None, {"variant": variant, "size": size, "className": props["className"]}
+        )
+    );
+
+    if asChild {
         return
-            <button
+            <Slot.Root
                 data-slot="button"
                 data-variant={variant}
                 data-size={size}
                 className={computedClass}
-                {...restProps}
+                {**restProps}
             >
-                {props.children}
-            </button>;
+                {props["children"]}
+            </Slot.Root>;
     }
 
-    def:pub buttonVariants -> Any {
-        return _buttonVariants;
-    }
+    return
+        <button
+            data-slot="button"
+            data-variant={variant}
+            data-size={size}
+            className={computedClass}
+            {**restProps}
+        >
+            {props["children"]}
+        </button>;
+}
+
+def:pub buttonVariants -> any {
+    return _buttonVariants;
 }

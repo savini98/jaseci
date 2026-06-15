@@ -3,14 +3,13 @@ import from "@jac/runtime" { Navigate, useNavigate }
 import from '..lib.auth' { AuthContext }
 import from '..components.Button' { Button }
 
-cl def:pub Login -> JsxElement {
+def:pub Login -> JsxElement {
     auth = useContext(AuthContext);
     navigate = useNavigate();
 
     # If already logged in, redirect to dashboard
     if auth.user {
-        return
-            <Navigate to="/dashboard" replace/>;
+        return <Navigate to="/dashboard" replace/>;
     }
 
     # Handle Google login - redirects to backend

@@ -18,7 +18,10 @@ program order -- after the compiled graph has run (paper Figs. 5-6).
 list.append is a side effect TorchDynamo tracks and replays, so the appends do
 not break the graph; only the trailing flush touches the runtime, after all
 compute. Each buffer entry is a (callee, args, kwargs) triple so values are
-captured at the original call site. Gated by --graphmend.
+captured at the original call site; mutable positional args are snapshotted
+(hoisted to a temp and cloned when they are tensors) so a later in-place
+mutation cannot corrupt the deferred value (paper Table 1, clone(args)). Gated
+by --graphmend.
 """
 import ast as ast3;
 import jaclang.jac0core.unitree as uni;
@@ -29,6 +32,7 @@ import from jaclang.jac0core.constant { Tokens as Tok }
 obj DeferSideEffectPass(UniPass) {
     has _enabled: bool = False,
         _counter: int = 0,
+        _se_arg_counter: int = 0,
         _pending_regs: list = [];
 
     """Logger methods whose calls break tracing (logging.Logger API)."""
@@ -92,9 +96,15 @@ obj DeferSideEffectPass(UniPass) {
                 return;
             }
         }
-        append_call = self._buffer_append(nd, self._buffer_entry(nd));
+        (entry, hoists) = self._buffer_entry(nd);
+        append_call = self._buffer_append(nd, entry);
         parent.expr = append_call;
         parent.set_kids([append_call]);
+        # Snapshot temps are bound just before the (replayable) append so the
+        # buffered values are captured at the original call site, not at flush.
+        for h in hoists {
+            self._insert_before(parent, h);
+        }
         ability._gm_needs_se = True;
     }
 
@@ -331,7 +341,7 @@ obj DeferSideEffectPass(UniPass) {
     }
 
     """Split call params into positional args and KWPair list."""
-    def _split_params(params: any) -> tuple {
+    def _split_params(params: any) -> tuple[(list, list)] {
         pos = [];
         kws = [];
         for p in (params or []) {
@@ -361,13 +371,83 @@ obj DeferSideEffectPass(UniPass) {
         return uni.DictVal(kv_pairs=pairs, kid=kid);
     }
 
-    """Build the `(callee, (args...), {kwargs})` buffer entry for a call."""
-    def _buffer_entry(call: uni.FuncCall) -> uni.TupleVal {
+    """Build the `(callee, (args...), {kwargs})` buffer entry for a call, plus the
+    list of temp-assignment statements that snapshot its non-constant positional
+    args. Returns `(entry, hoists)`.
+
+    Each mutable positional arg is hoisted to `__gm_se_arg_N = <arg>` and stored
+    in the entry as `__gm_se_arg_N.clone() if hasattr(__gm_se_arg_N, 'clone') else
+    __gm_se_arg_N` -- cloning tensors so a later in-place mutation cannot corrupt
+    the value the deferred call observes (paper Table 1, `clone(args)`). The
+    `hasattr` guard is resolved statically by Dynamo, so the clone is a native
+    in-graph op for tensors and a no-op for everything else; literals (immutable)
+    are buffered as-is. Logger calls do not pass through here -- their args cross
+    the opaque `log_emit` boundary, so they are constant-only by construction."""
+    def _buffer_entry(call: uni.FuncCall) -> tuple[(uni.TupleVal, list[uni.UniNode])] {
         (pos, kws) = self._split_params(call.params);
-        args_tuple = self._tuple(call, pos);
+        hoists = [];
+        new_pos = [];
+        for p in pos {
+            if isinstance(p, (uni.Literal, uni.MultiString, uni.FString)) {
+                new_pos.append(p);
+            } else {
+                n = self._se_arg_counter;
+                self._se_arg_counter += 1;
+                tmp = f"__gm_se_arg_{n}";
+                store = self._gen_name(call, tmp, True);
+                hoists.append(
+                    uni.Assignment(
+                        target=[store],
+                        value=p,
+                        type_tag=None,
+                        mutable=True,
+                        kid=[store, p]
+                    )
+                );
+                new_pos.append(self._clone_guard(call, tmp));
+            }
+        }
+        args_tuple = self._tuple(call, new_pos);
         kwargs_dict = self._dict_from_kws(call, kws);
         items = [call.target, args_tuple, kwargs_dict];
-        return uni.TupleVal(values=items, kid=items);
+        return (uni.TupleVal(values=items, kid=items), hoists);
+    }
+
+    """Build `<tmp>.clone() if hasattr(<tmp>, 'clone') else <tmp>` over a hoisted
+    snapshot temp. Three fresh Name nodes reference the temp, so no AST node is
+    aliased into more than one parent."""
+    def _clone_guard(at: uni.UniNode, tmp: str) -> uni.IfElseExpr {
+        recv = self._gen_name(at, tmp, False);
+        clone_nm = self._gen_name(at, 'clone', False);
+        trailer = uni.AtomTrailer(
+            target=recv,
+            right=clone_nm,
+            is_attr=True,
+            is_null_ok=False,
+            kid=[recv, clone_nm]
+        );
+        clone_call = uni.FuncCall(
+            target=trailer, params=[], genai_call=None, kid=[trailer]
+        );
+        has_nm = self._gen_name(at, 'hasattr', False);
+        test_recv = self._gen_name(at, tmp, False);
+        attr_name = self._str(at, 'clone');
+        test = uni.FuncCall(
+            target=has_nm,
+            params=[test_recv, attr_name],
+            genai_call=None,
+            kid=[has_nm, test_recv, attr_name]
+        );
+        else_recv = self._gen_name(at, tmp, False);
+        val_cfg = uni.CfgExpr(expr=clone_call, kid=[clone_call]);
+        cond_cfg = uni.CfgExpr(expr=test, kid=[test]);
+        else_cfg = uni.CfgExpr(expr=else_recv, kid=[else_recv]);
+        return uni.IfElseExpr(
+            value=val_cfg,
+            condition=cond_cfg,
+            else_value=else_cfg,
+            kid=[val_cfg, cond_cfg, else_cfg]
+        );
     }
 
     """Build `_gm_se_buffer.append(ent)`."""

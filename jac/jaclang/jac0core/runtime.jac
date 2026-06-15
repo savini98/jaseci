@@ -36,8 +36,7 @@ import from jaclang.jac0core.archetype {
     ObjectSpatialDestination,
     ObjectSpatialFunction,
     ObjectSpatialPath,
-    Root,
-    TriggerKind
+    Root
 }
 import from jaclang.jac0core.constant { EdgeDir, colors }
 import from jaclang.jac0core.constructs {
@@ -54,7 +53,12 @@ import from jaclang.jac0core.constructs {
     WalkerAnchor,
     WalkerArchetype
 }
-import from jaclang.jac0core.modresolver { infer_language }
+import from jaclang.jac0core.modresolver {
+    infer_language,
+    find_jac_project_root,
+    push_import_base,
+    pop_import_base
+}
 import from jaclang.jac0core.mtp { MTIR, Info, MTRuntime }
 import from jaclang.jac0core { plugin }
 import type from http.server { BaseHTTPRequestHandler }
@@ -87,7 +91,14 @@ glob plugin_manager = plugin.PluginManager('jac'),
      # poison a live ctx. Live behavior always follows the ctx; these
      # values are only consulted during ctx construction.
      _default_base_path_dir: list = [os.getcwd()],
-     _default_full_target_path: list = [None];
+     _default_full_target_path: list = [None],
+     # Shared-root resolver seed. Slot 0 holds the callable an API server
+     # registers at startup to map the internal guest user to its root id;
+     # slot 1 caches the resolved id (root ids are stable per deployment).
+     # When no resolver is registered (CLI, scripts, embedders) `root.shared`
+     # falls back to the current context's root — in those single-user
+     # contexts the caller IS the shared graph's owner.
+     _shared_root_resolver: list = [None, None];
 
 """Jac Access Validation Specs."""
 class JacAccessValidation {
@@ -191,6 +202,56 @@ def _prefetch_edges(origin: list[NodeArchetype]) -> None {
     }
 }
 
+"""Resolve a possibly-stub reference to a live anchor, healing danglers.
+
+Given the no-transactions stance of the storage layer, brief inter-document
+inconsistency is inherent, so a dangling reference is a legitimate runtime
+state — not an exception. Before this boundary existed, touching a stub
+whose referent was deleted (the #6587 corruption minted before the
+ChangeSet delete-ordering shipped) raised `ValueError: ... is not a valid
+reference` on *every* traversal shape, 500-ing the affected user's reads.
+
+`resolve_ref` makes traversal resolve-or-skip: return the populated anchor
+if it loads; otherwise skip-and-heal — log, file the dangler under
+DANGLING_REF, prune the stale citation from `referrer` — and return None so
+the loop continues. Direct attribute access on a stale handle still raises
+(programmer error, not a storage state); this is for graph traversal only.
+"""
+def resolve_ref(
+    stub: (Anchor | None), referrer: (Anchor | None) = None
+) -> (Anchor | None) {
+    if stub is None {
+        return None;
+    }
+    if stub.is_populated() {
+        return stub;
+    }
+    stub.populate();
+    if stub.is_populated() {
+        return stub;
+    }
+    ctx = JacRuntimeInterface.get_context();
+    # A referent that is recoverable-quarantined (schema drift / class missing)
+    # is not a permanent dangler: leave it and its citations to the existing
+    # quarantine/recovery machinery (`jac db recover`). Only genuinely-absent
+    # referents are healed. (DANGLING_REF rows are excluded by the gate, so a
+    # stub we already filed last pass is re-healed, not skipped.)
+    if ctx.mem.is_recoverable_quarantine(stub.id) {
+        return None;
+    }
+    ref_repr = referrer.id if referrer is not None else '?';
+    logger.error(
+        f"dangling reference: {type(stub).__name__} [{stub.id}] cited by "
+        f"{ref_repr} does not resolve; quarantining and pruning"
+    );
+    try {
+        ctx.mem.quarantine_ref(referrer, stub);
+    } except Exception as e {
+        logger.debug(f"heal of dangling ref {stub.id} failed: {e}");
+    }
+    return None;
+}
+
 """Jac Node Operations."""
 class JacNode {
     """Get edges connected to this node."""
@@ -220,40 +281,6 @@ class JacEdge {
     static def detach(`edge: EdgeAnchor) -> None;
 }
 
-"""Backend seam for object-spatial side effects.
-
-The traversal engine talks to this plain interface (a normal method call the
-native/JS backends can lower to a vtable dispatch) instead of reaching for
-sv-only machinery directly. The default instance below carries the server
-behavior — bridging to the ExecutionContext's `CallState`/contextvar — so sv is
-unchanged; native/client builds will supply a subclass with trivial impls.
-
-This first slice covers the report sink (the `report` statement and the
-spawn-boundary report collection); persistence/permission/identity move behind
-the same seam in later changes.
-"""
-obj OspHost {
-    """Record a `report` value in the current walk scope."""
-    def record_report(expr: any) -> None;
-
-    """Open a report scope at a spawn. Returns an opaque token if this spawn
-        owns the scope (outermost), else None."""
-    def open_walk_scope -> object;
-
-    """Close a report scope: when the token marks the outermost spawn, collect
-        the accumulated reports onto the walker and tear the scope down."""
-    def close_walk_scope(scope: object, warch: WalkerArchetype) -> None;
-
-    """Finalize persistence at the outermost spawn boundary (truthy scope), on
-        success only. Server: flush the L1 buffer via commit; native/client:
-        no-op."""
-    def on_spawn_complete(scope: object, succeeded: bool) -> None;
-}
-
-"""Active object-spatial host. Defaults to the server-backed behavior; a
-native/client build swaps in a subclass with no-op persistence."""
-glob _osp_host = OspHost();
-
 """GraphMend logger-deferral state (process-global, shared across modules).
 
 `_gm_log_registry` maps an integer slot -> a bound logger callable captured at
@@ -279,44 +306,7 @@ class JacWalker {
         insert_loc: int = -1
     ) -> bool;
 
-    """Classify an ability's trigger (location/walker/untyped), caching the
-        result on the ObjectSpatialFunction so dispatch avoids re-running
-        `all_issubclass` on every visited location."""
-    static def _trigger_kind(i: ObjectSpatialFunction) -> TriggerKind;
-
-    """Execute all entry abilities for current location.
-
-        Returns True if walker should continue, False if disengaged.
-        """
-    static def _execute_entries(
-        warch: WalkerArchetype,
-        `walker: WalkerAnchor,
-        current_loc: (NodeArchetype | EdgeArchetype)
-    ) -> bool;
-
-    """Execute all exit abilities for current location.
-
-        Returns True if walker should continue, False if disengaged.
-        """
-    static def _execute_exits(
-        warch: WalkerArchetype,
-        `walker: WalkerAnchor,
-        current_loc: (NodeArchetype | EdgeArchetype)
-    ) -> bool;
-
-    """Recursively visit a node with DFS semantics.
-
-        1. Execute entries for this node
-        2. Recursively visit all children added during entry
-        3. Execute exits for this node (post-order)
-
-        Returns True if walker should continue, False if disengaged.
-        """
-    static def _visit_node_recursive(
-        warch: WalkerArchetype, `walker: WalkerAnchor, anchor: (NodeAnchor | EdgeAnchor)
-    ) -> bool;
-
-    """Jac's spawn operator feature with recursive DFS semantics.
+    """Jac's spawn operator feature.
 
         Entry abilities execute when entering a node, exit abilities execute
         after all descendants are visited (post-order/LIFO).
@@ -324,38 +314,6 @@ class JacWalker {
     static def spawn_call(
         `walker: WalkerAnchor, nd: (NodeAnchor | EdgeAnchor)
     ) -> WalkerArchetype;
-
-    """Async version: Execute all entry abilities for current location.
-
-        Returns True if walker should continue, False if disengaged.
-        """
-    static async def _async_execute_entries(
-        warch: WalkerArchetype,
-        `walker: WalkerAnchor,
-        current_loc: (NodeArchetype | EdgeArchetype)
-    ) -> bool;
-
-    """Async version: Execute all exit abilities for current location.
-
-        Returns True if walker should continue, False if disengaged.
-        """
-    static async def _async_execute_exits(
-        warch: WalkerArchetype,
-        `walker: WalkerAnchor,
-        current_loc: (NodeArchetype | EdgeArchetype)
-    ) -> bool;
-
-    """Async version: Recursively visit a node with DFS semantics.
-
-        1. Execute entries for this node
-        2. Recursively visit all children added during entry
-        3. Execute exits for this node (post-order)
-
-        Returns True if walker should continue, False if disengaged.
-        """
-    static async def _async_visit_node_recursive(
-        warch: WalkerArchetype, `walker: WalkerAnchor, anchor: (NodeAnchor | EdgeAnchor)
-    ) -> bool;
 
     """Jac's async spawn operator feature with recursive DFS semantics.
 
@@ -435,7 +393,7 @@ class JacBasics {
     static async def acommit(anchor: Anchor | Archetype | None = None) -> None;
 
     """Purge current or target graph."""
-    static def reset_graph(root: (Root | None) = None) -> int;
+    static def reset_graph(root_node: (Root | None) = None) -> int;
 
     """Get object given id."""
     static def get_object(id: str) -> (Archetype | None);
@@ -547,8 +505,18 @@ system,
     tensor op. A static shape/dtype precheck guards the elementwise `(a==b).all()`
     against silently broadcasting mismatched shapes to True (which torch.equal
     would report as False), then asserts via the graph-native torch._assert_async.
-    """
+    The message may carry a GraphMend trap marker (folded in at compile time) so
+    the boundary `trap_guard` decorator can restore the original exception type."""
     static def tensor_eq_assert(a: any, b: any, msg: str) -> None;
+
+    """GraphMend: entry-boundary decorator that restores a guard's original
+    exception type. Wraps a torch.compile'd callable; a graph-native assertion
+    fails as a RuntimeError that surfaces at the call boundary (outside the
+    traced region), where this catches it, and if the message carries a GraphMend
+    trap marker (`[[GM-TRAP <Type>]]msg[[/GM-TRAP]]`), re-raises the original
+    exception type with the original message. Unmarked RuntimeErrors propagate
+    unchanged."""
+    static def trap_guard(fn: any) -> any;
 
     """GraphMend: register a logger callable (captured outside the graph) -> slot.
 
@@ -1085,6 +1053,23 @@ class JacRuntimeInterface(JacClassReferences, JacAccessValidation, JacNode, JacE
             Storage instance (LocalStorage by default)
         """
     static def store(base_path: str = './storage', create_dirs: bool = True) -> any;
+
+    """Get the L3 persistent backend (hookable for plugins).
+
+        A DB-backend plugin (Postgres, etc.) supplies its own PersistentMemory
+        here instead of cloning the whole execution-context joint. Because
+        every hook is firstresult, the core default returns None so
+        TieredMemory falls back to SqliteMemory; a plugin that returns a
+        backend wins, composing with both core bare-serve and jac-scale.
+
+        Args:
+            config: resolved backing config (db_path, base_path, target_path)
+                so the backend can select its own keys.
+
+        Returns:
+            A PersistentMemory instance, or None to use the default.
+        """
+    static def get_persistent_memory(config: dict) -> any;
 }
 
 """Generate three helper classes based on a plugin class.
@@ -1270,6 +1255,29 @@ class JacRuntime(JacRuntimeInterface) {
         Mutates only the seed — already-constructed contexts are unaffected.
         """
     static def set_full_target_path(target_path: (str | None)) -> None;
+
+    """Return the deployment's shared root — the root every unauthenticated
+    request runs on (surfaced in Jac as `root.shared`). Resolution goes
+    through the resolver an API server registered at startup; when none is
+    registered (CLI, scripts, embedders) the current context's root is
+    returned, since single-user contexts have no separate shared graph.
+
+    Default policy: the shared root is a commons — its `access.all` is
+    floored to CONNECT on access, so every user can read it and attach to
+    it without app-side arming. Nodes users hang on the shared graph stay
+    owned by their author and closed until the author grants. Apps may
+    lower the root's level explicitly (any level other than NO_ACCESS is
+    respected, e.g. ReadPerm for a read-only commons).
+    """
+    static def get_shared_root -> Root;
+
+    """Register (or clear, with None) the callable that maps the internal
+    guest user to its root id (the shared root). API servers call this at
+    startup; replacing the resolver invalidates the cached id.
+    """
+    static def set_shared_root_resolver(
+        resolver: (Callable[([], (str | None))] | None)
+    ) -> None;
 
     """Install the process-global execution context for CLI and other
     non-server callers. Server request paths use `push_request_context`

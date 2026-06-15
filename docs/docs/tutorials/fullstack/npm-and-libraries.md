@@ -323,34 +323,36 @@ This resolves the chosen style's `.cl.jac` components into `components/ui/`, ins
 
 ### Adding Components to Your Code
 
+Components install as `components/ui/<name>.cl.jac`, keeping their hyphenated registry names (`button.cl.jac`, `dropdown-menu.cl.jac`). **Quote the import path** -- it is required for hyphenated names (an unquoted `dropdown-menu` is a parse error) -- and make the leading dots relative to the importing file's folder: `.components.ui.<name>` from a root file like `main.jac`, `.ui.<name>` from a file in `components/`.
+
 ```jac
-cl import from "./components/ui/button" { Button }
+cl {
+    import from ".components.ui.button" { Button }
+    import from ".components.ui.dropdown-menu" { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent }
 
-to cl:
-
-def:pub MyPage() -> JsxElement {
-    return <div>
-        <Button variant="outline">Click me</Button>
-    </div>;
+    def:pub MyPage() -> JsxElement {
+        return <div>
+            <Button variant="outline">Click me</Button>
+        </div>;
+    }
 }
 ```
 
 ### The cn() Utility in Jac
 
-The standard shadcn `cn()` utility can be written entirely in Jac (no TypeScript needed):
+`jac add --shadcn` and `jac create --use jac-shadcn` generate `lib/utils.cl.jac` for you, so you rarely write this by hand. For reference, the standard shadcn `cn()` utility is written entirely in Jac (no TypeScript needed) using a variadic parameter:
 
 ```jac
 # lib/utils.cl.jac
-import from "clsx" { clsx }
-import from "tailwind-merge" { twMerge }
+cl import from "clsx" { clsx }
+cl import from "tailwind-merge" { twMerge }
 
-def:pub cn(inputs: any) -> str {
-    args = [].slice.call(arguments);
-    return twMerge(clsx(args));
+def:pub cn(*inputs: any) -> str {
+    return twMerge(clsx(inputs));
 }
 ```
 
-Required dependencies:
+Required dependencies (added automatically by `jac add --shadcn`):
 
 ```toml
 [dependencies.npm]
@@ -359,6 +361,8 @@ tailwind-merge = "*"
 ```
 
 ### Building shadcn Components in Jac
+
+`jac add --shadcn` already installs the full, production-ready primitives into `components/ui/`, so you don't normally hand-write them -- build your own higher-level components on top instead. The simplified examples below are illustrative: they show how a bundled component is structured (CVA for variants, a `...lib.utils` import for `cn()`, JSX prop spread) and how you'd author a custom one.
 
 Here's how the shadcn Button component looks in Jac, using Class Variance Authority (CVA) for variant management:
 
@@ -391,7 +395,7 @@ glob _buttonVariants: any = cva(
     }
 );
 
-def:pub Button(props: any) -> JsxElement {
+def:pub Button(props: any, ref: Ref[HTMLButtonElement]) -> JsxElement {
     variant = props.variant or "default";
     size = props.size or "default";
     computedClass = cn(
@@ -399,11 +403,13 @@ def:pub Button(props: any) -> JsxElement {
         props.className
     );
 
-    return <button className={computedClass} {**props}>
+    return <button ref={ref} className={computedClass} {**props}>
         {props.children}
     </button>;
 }
 ```
+
+The trailing `ref: Ref[HTMLButtonElement]` parameter is what lets this `Button` be used as a radix `asChild` trigger (`DropdownMenuTrigger`, `Tooltip.Trigger`, ...). It forwards the anchor ref radix needs for positioning down to the real `<button>`; without it the trigger would silently never open. See [forwarding a ref into your component](state.md#forwarding-a-ref-into-your-component) for the details.
 
 Required dependencies:
 
@@ -414,31 +420,33 @@ Required dependencies:
 
 ### Wrapping Radix UI Primitives
 
-shadcn components wrap Radix UI primitives. Here's a Dialog example in Jac:
+shadcn components wrap Radix UI primitives. Each wrapper that renders a DOM node **forwards a ref** to it (via a trailing `ref: Ref` parameter) so the primitive stays a valid `asChild` / positioning target -- exactly as upstream shadcn does with `React.forwardRef`. The exception is a wrapper around a context-only primitive like `Dialog.Root`, which renders no element and takes no ref. Here's a Dialog example in Jac:
 
 ```jac
 # components/ui/dialog.cl.jac
 import from "radix-ui" { Dialog as DialogPrimitive }
 import from ...lib.utils { cn }
 
+# Root is a context provider -- it renders no DOM node, so it takes no ref.
 def:pub Dialog(props: any) -> JsxElement {
     return <DialogPrimitive.Root {**props}>
         {props.children}
     </DialogPrimitive.Root>;
 }
 
-def:pub DialogTrigger(props: any) -> JsxElement {
-    return <DialogPrimitive.Trigger {**props}>
+def:pub DialogTrigger(props: any, ref: Ref[HTMLButtonElement]) -> JsxElement {
+    return <DialogPrimitive.Trigger ref={ref} {**props}>
         {props.children}
     </DialogPrimitive.Trigger>;
 }
 
-def:pub DialogContent(props: any) -> JsxElement {
+def:pub DialogContent(props: any, ref: Ref[HTMLElement]) -> JsxElement {
     return <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay
             className={cn("fixed inset-0 z-50 bg-black/50", props.overlayClassName)}
         />
         <DialogPrimitive.Content
+            ref={ref}
             className={cn(
                 "fixed left-1/2 top-1/2 z-50 -translate-x-1/2 -translate-y-1/2",
                 "w-full max-w-lg rounded-lg bg-background p-6 shadow-lg",
@@ -450,6 +458,8 @@ def:pub DialogContent(props: any) -> JsxElement {
     </DialogPrimitive.Portal>;
 }
 ```
+
+Forwarding the ref on `DialogTrigger` is what lets `<DialogTrigger asChild>` wrap your own `Button` and still open: radix attaches the anchor ref through the trigger down to the host node. See [forwarding a ref into your component](state.md#forwarding-a-ref-into-your-component) for how the trailing `ref: Ref` parameter lowers to `forwardRef`.
 
 Required dependencies:
 

@@ -38,7 +38,15 @@ def _pysrc(name: str, gm: bool) -> str {
 test "print is buffered and flushed via the runtime helper" {
     src = _pysrc("side_effect.jac", True);
     assert "_gm_se_buffer = []" in src;
-    assert "_gm_se_buffer.append((print, (x,), {}))" in src;
+    # The mutable positional arg is snapshotted: hoisted to a temp and cloned (if
+    # a tensor) at the call site so a later in-place mutation cannot corrupt the
+    # deferred value (paper Table 1, clone(args)).
+    assert "__gm_se_arg_0 = x" in src;
+    assert (
+        "_gm_se_buffer.append((print, "
+        "(__gm_se_arg_0.clone() if hasattr(__gm_se_arg_0, 'clone') "
+        "else __gm_se_arg_0,), {}))"
+    ) in src;
     assert "__jac_flush_se_buffer__(_gm_se_buffer)" in src;
     assert "import __jac_flush_se_buffer__" in src;
 }

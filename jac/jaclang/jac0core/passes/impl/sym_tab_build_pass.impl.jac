@@ -3,8 +3,6 @@
 """Before pass."""
 impl SymTabBuildPass.before_pass(self: SymTabBuildPass) -> None {
     self.cur_sym_tab: list[UniScopeNode] = [];
-    # Track version conditional if statements (don't create scope, only traverse matched branch)
-    self._version_cond_ifs: set[int] = set();
 }
 
 """Push scope."""
@@ -294,11 +292,22 @@ impl SymTabBuildPass.enter_archetype(self: SymTabBuildPass, nd: uni.Archetype) -
     # same scope is a hard error -- inline bodies don't merge, and the
     # silent collision used to produce empty class scopes that cascaded
     # into spurious E1030 "no attribute" errors downstream.
+    #
+    # Codespace blocks (na {} / cl {} / sv {}) lower to separate backends, so
+    # one archetype name may be declared once per target -- the cross-backend
+    # equivalence fixtures depend on this. The decl/decl collision only applies
+    # within the same target context, so the guard compares contexts first.
     if self.cur_sym_tab {
         existing_sym = self.cur_scope.names_in_scope.get(nd.sym_name, None);
         if existing_sym {
+            nd_native = nd.in_native_context();
+            nd_client = nd.in_client_context();
             for d in existing_sym.defn {
-                if isinstance(d.name_of, uni.Archetype) {
+                if (
+                    isinstance(d.name_of, uni.Archetype)
+                    and (d.name_of.in_native_context() == nd_native)
+                    and (d.name_of.in_client_context() == nd_client)
+                ) {
                     self.emit(
                         E0077,
                         node_override=nd,
@@ -466,75 +475,27 @@ impl SymTabBuildPass.exit_typed_ctx_block(
 }
 
 impl SymTabBuildPass.enter_if_stmt(self: SymTabBuildPass, nd: uni.IfStmt) -> None {
-    # Pyright: evaluateStaticBoolLikeExpression for sys.version_info conditionals
-    eval_result = evaluate_version_condition(nd.condition);
-
-    if eval_result is None {
-        # Not a version conditional - normal processing with scope
-        self.push_scope_and_link(nd);
-        return;
-    }
-
-    # Version conditional: don't push scope, don't link
-    # sym_tab will skip unlinked scopes, so symbols go to parent
-    self._version_cond_ifs.add(id(nd));
-
-    if eval_result {
-        # Condition True - only process if body
-        for stmt in nd.body {
-            self.traverse(stmt);
-        }
-    } else {
-        # Condition False - only process else body
-        if nd.else_body {
-            self._version_cond_ifs.add(id(nd.else_body));
-            self.traverse(nd.else_body);
-        }
-    }
-    # Skip automatic child traversal
-    self.prune();
+    self.push_scope_and_link(nd);
 }
 
 impl SymTabBuildPass.exit_if_stmt(self: SymTabBuildPass, nd: uni.IfStmt) -> None {
-    if id(nd) not in self._version_cond_ifs {
-        self.pop_scope();
-    }
+    self.pop_scope();
 }
 
 impl SymTabBuildPass.enter_else_if(self: SymTabBuildPass, nd: uni.ElseIf) -> None {
-    if id(nd) in self._version_cond_ifs {
-        # Part of version conditional - don't push scope
-        for stmt in nd.body {
-            self.traverse(stmt);
-        }
-        self.prune();
-        return;
-    }
     self.push_scope_and_link(nd);
 }
 
 impl SymTabBuildPass.exit_else_if(self: SymTabBuildPass, nd: uni.ElseIf) -> None {
-    if id(nd) not in self._version_cond_ifs {
-        self.pop_scope();
-    }
+    self.pop_scope();
 }
 
 impl SymTabBuildPass.enter_else_stmt(self: SymTabBuildPass, nd: uni.ElseStmt) -> None {
-    if id(nd) in self._version_cond_ifs {
-        # Part of version conditional - don't push scope
-        for stmt in nd.body {
-            self.traverse(stmt);
-        }
-        self.prune();
-        return;
-    }
     self.push_scope_and_link(nd);
 }
 
 impl SymTabBuildPass.exit_else_stmt(self: SymTabBuildPass, nd: uni.ElseStmt) -> None {
-    if id(nd) not in self._version_cond_ifs {
-        self.pop_scope();
-    }
+    self.pop_scope();
 }
 
 impl SymTabBuildPass.enter_try_stmt(self: SymTabBuildPass, nd: uni.TryStmt) -> None {
