@@ -493,16 +493,49 @@ impl BaseLLM.invoke(mt_run: MTRuntime) -> object {
     if mt_run.stream and mt_run.call_params.get("logging", False) {
         return self._invoke_streaming(mt_run);
     }
-    # If streaming without tools, stream immediately
+    # If streaming without tools, stream immediately. Typed returns get
+    # wrapped in a StructuredStream so the caller can iterate streamed
+    # tokens AND retrieve the fully-parsed object via `.parsed`.
     if mt_run.stream and len(mt_run.tools) == 0 {
-        return self.dispatch_streaming(mt_run);
+        gen = self.dispatch_streaming(mt_run);
+        if mt_run.resp_type is not None and mt_run.resp_type is not str {
+            return StructuredStream(_generator=gen, _runtime=mt_run);
+        }
+        return gen;
     }
     # Streaming ReAct: defer write_back until the inner generator exhausts,
-    # otherwise the streamed assistant message is missed.
+    # otherwise the streamed assistant message is missed. Typed returns get
+    # wrapped in a StructuredStream so the caller can iterate the streamed
+    # answer-field tokens AND retrieve the fully-parsed object via `.parsed`.
     if mt_run.stream {
-        return self._invoke_react_loop_streaming(mt_run);
+        gen = self._invoke_react_loop_streaming(mt_run);
+        if mt_run.resp_type is not None and mt_run.resp_type is not str {
+            return StructuredStream(_generator=gen, _runtime=mt_run);
+        }
+        return gen;
     }
-    return self._invoke_typed_retry(mt_run);
+    result = self._invoke_typed_retry(mt_run);
+    # Context: capture the assistant's final reply into the graph.
+    # Doing this here (rather than in MockLLM/dispatch_no_streaming)
+    # avoids touching backward-compat assumptions test fixtures make
+    # about MockLLM's message bookkeeping. Skipped when the caller
+    # didn't opt into memory or the result isn't a plain string
+    # (typed returns + streaming both populate streaming_result via
+    # other paths).
+    graph = mt_run.context;
+    if graph is not None and isinstance(result, str) {
+        graph.record_message(
+            role="assistant",
+            turn=graph.turn_count,
+            content=result
+        );
+        # Stage 4 reference detection: scan the assistant text for
+        # identifiers from prior tool results and bump their
+        # ref_count + last_referenced_at. Drives ReferenceAwarePolicy's
+        # eviction order on the next call.
+        record_references_from_text(graph, result, graph.turn_count);
+    }
+    return result;
 }
 
 
@@ -901,6 +934,22 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
     just_compacted = False;
     while True {
         iter_count += 1;
+        # Stage 4: pre-LLM-call pruning dispatch. When a ContextPolicy is
+        # wired, ask it whether to prune and apply any returned eviction
+        # decisions before the next dispatch. Skipped on iteration 1 (no
+        # prior history to act on) so first-turn behavior matches today's.
+        _mem_policy = mt_run.context_policy;
+        _mem_graph = mt_run.context;
+        if (
+            _mem_policy is not None
+            and _mem_graph is not None
+            and iter_count > 1
+            and _mem_policy.should_prune(_mem_graph, mt_run)
+        ) {
+            for _decision in _mem_policy.select_eviction(_mem_graph, mt_run) {
+                apply_eviction_decision(_decision);
+            }
+        }
         if on_iteration and iter_count > 1 {
             ctx = IterationContext(
                 iteration=iter_count,
@@ -954,9 +1003,21 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                 if isinstance(usage, dict)
                 else getattr(usage, "total_tokens", 0)
         );
-        # Threshold-based proactive compaction: check current input size against the
-        # context window and compact before the next iteration crosses the limit.
-        just_compacted = self._maybe_compact(mt_run, usage, just_compacted, _cp);
+        # Stage 3: when a ContextPolicy is wired through Context, dispatch
+        # to it for compaction decisions and bypass the framework's
+        # threshold-based compaction. The policy mutates the graph
+        # itself; we don't need to reach into mt_run.messages here.
+        policy = mt_run.context_policy;
+        graph_for_policy = mt_run.context;
+        if policy is not None and graph_for_policy is not None {
+            if policy.should_compact(graph_for_policy, mt_run) {
+                policy.compact(graph_for_policy, mt_run);
+            }
+        } else {
+            # Threshold-based proactive compaction: check current input size against the
+            # context window and compact before the next iteration crosses the limit.
+            just_compacted = self._maybe_compact(mt_run, usage, just_compacted, _cp);
+        }
         if resp.tool_calls {
             # Split at first finish_tool - anything after it is discarded.
             # This normalizes history regardless of parallel/sequential mode:
@@ -991,6 +1052,23 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                         last_tool = btc.tool.get_name();
                         last_result = str(result_msg.content)[:500];
                         mt_run.add_message(result_msg);
+                        # Auto-record into the memory graph when the
+                        # caller opted in via context=Context(...).
+                        # call_id carries the tool_use_id forward so
+                        # materialize() can pair this tool result back
+                        # to the originating tool_use block when it
+                        # rebuilds the LLM message list.
+                        graph = mt_run.context;
+                        if graph is not None {
+                            graph.record_tool_result(
+                                tool_name=last_tool,
+                                args=btc.args,
+                                full_content=str(result_msg.content),
+                                visible_content=str(result_msg.content),
+                                turn=graph.turn_count,
+                                call_id=btc.call_id
+                            );
+                        }
                     }
                 }
             }
@@ -1466,7 +1544,19 @@ impl BaseLLM._should_retry_stream(
 
 """Dispatch the LLM call with streaming.
 
-Makes a streaming API call and yields content chunks as they arrive.
+Two modes:
+
+- Plain text streaming (the original behavior). Used when the by-llm
+  function returns `str`. Yields each chunk's `delta.content` verbatim.
+- Structured streaming. Used when the by-llm function declares a typed
+  return AND streaming is on. Sets `response_format` from `mt_run`'s
+  output schema, threads each chunk through a `StreamingFieldExtractor`
+  for the designated text field (`call_params["streaming_text_field"]`,
+  default `"answer"`), and yields only the characters of that field.
+  After the stream completes, the buffered raw JSON is parsed and the
+  resulting typed instance is stored on `mt_run.streaming_result` so
+  the caller can retrieve fields beyond the streamed text (citations,
+  metadata, etc.).
 """
 impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None] {
     # Construct the parameters for the LLM call
@@ -1476,9 +1566,38 @@ impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
     self.log_info(f"Calling LLM: {self.model_name} with params:\n{log_params}");
     self.api_base = params.pop("api_base", DEFAULT_BASE_URL);
     params.pop("api_key", None);
+
+    # Decide whether this is a structured-streaming pass. Handler-driven
+    # calls (`visit ... by model(stream=True, stream_handler=fn)`) are
+    # excluded: that path streams the raw structured tokens to the handler
+    # and parses the buffered whole itself, so the field extractor must
+    # not filter what it sees.
+    is_structured = (
+        mt_run.resp_type is not None
+        and mt_run.resp_type is not str
+        and mt_run.call_params.get("stream_handler") is None
+    );
+    explicit_field = (
+        mt_run.call_params.get("streaming_text_field")
+        or self.call_params.get("streaming_text_field")
+    );
+    text_field = resolve_streaming_text_field(
+        explicit_field,
+        mt_run.get_output_schema() if is_structured else None
+    );
+    extractor: StreamingFieldExtractor | None = None;
+
     attempt = 0;
     usage_base = len(self._usage_history);
     while True {
+        # Fresh extractor each attempt: a mid-stream retry re-streams the
+        # response from scratch, so buffered parser state must not carry
+        # over into the retried pass.
+        extractor = (
+            StreamingFieldExtractor(field_name=text_field)
+                if is_structured
+                else None
+        );
         try {
             response = self.model_call_with_stream(params);
             for chunk in response {
@@ -1489,7 +1608,15 @@ impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
                 }
                 if chunk?.choices and chunk?.choices?[0]?.delta {
                     delta = chunk.choices[0].delta;
-                    yield delta.content or "";
+                    content = delta.content or "";
+                    if is_structured and extractor is not None {
+                        tokens = extractor.feed(content);
+                        if tokens {
+                            yield tokens;
+                        }
+                    } else {
+                        yield content;
+                    }
                 }
             }
             break;
@@ -1503,6 +1630,26 @@ impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
                 continue;
             }
             raise;
+        }
+    }
+
+    # Post-stream: parse the buffered JSON and stash the typed instance.
+    if is_structured and extractor is not None {
+        raw_text: str = extractor.get_raw().strip();
+        target_type = mt_run.resp_type;
+        if raw_text and target_type is not None {
+            try {
+                parsed_dict = json.loads(raw_text);
+                mt_run.streaming_result = json_to_instance(
+                    parsed_dict, target_type
+                );
+            } except Exception as e {
+                logger.warning(
+                    "byLLM structured streaming: failed to parse final JSON "
+                    f"({type(e).__name__}: {e}). raw={raw_text[:200]!r}"
+                );
+                mt_run.streaming_result = None;
+            }
         }
     }
 }
@@ -1817,16 +1964,35 @@ impl BaseLLM._stream_final_answer(mt_run: MTRuntime) -> Generator[str, None, Non
         "Be comprehensive and synthesize all the information gathered.",
     );
     mt_run.add_scaffolding_message(final_instruction);
-    # Keep only finish_tool so Anthropic sees a valid tools= param
-    # (conversation history may already contain tool_use blocks)
+
+    # Two flavors of "final answer streaming":
+    #
+    # - str return: keep finish_tool in the tools= list (so Anthropic still
+    #   sees a valid tools= param, and conversation tool_use blocks line up),
+    #   force tool_choice="none" so the model produces plain text.
+    # - typed return: clear tools entirely. dispatch_streaming detects
+    #   `mt_run.resp_type` is non-str and routes through
+    #   StreamingFieldExtractor against the response_format JSON schema,
+    #   yielding tokens from the designated text field. After the stream
+    #   completes, mt_run.streaming_result is populated with the parsed
+    #   typed instance (citations etc. come along on that object).
+    is_typed = (
+        mt_run.resp_type is not None
+        and mt_run.resp_type is not str
+        and mt_run.call_params.get("stream_handler") is None
+    );
+
     original_tools = mt_run.tools;
-    finish_tool_obj = mt_run.get_tool("finish_tool");
-    mt_run.tools = [finish_tool_obj] if finish_tool_obj else [];
-    # Force text generation - tool_choice="none" tells the LLM
-    # "tools are defined but do NOT call any, just produce text"
-    # Save caller's original tool_choice (if any) so we can restore it after.
     original_tool_choice = mt_run.call_params.pop("tool_choice", None);
-    mt_run.call_params["tool_choice"] = "none";
+
+    if is_typed {
+        mt_run.tools = [];
+    } else {
+        finish_tool_obj = mt_run.get_tool("finish_tool");
+        mt_run.tools = [finish_tool_obj] if finish_tool_obj else [];
+        mt_run.call_params["tool_choice"] = "none";
+    }
+
     accumulated: str = "";
     try {
         # Make the actual streaming call - this is REAL streaming from the LLM!
@@ -1847,6 +2013,15 @@ impl BaseLLM._stream_final_answer(mt_run: MTRuntime) -> Generator[str, None, Non
             mt_run.add_message(
                 Message(role=MessageRole.ASSISTANT, content=accumulated)
             );
+            # Reference detection (parity with non-streaming invoke()).
+            # Bumps reference_count + last_referenced_at on prior tool
+            # results whose identifiers appear in the final assistant text.
+            graph = mt_run.context;
+            if graph is not None {
+                record_references_from_text(
+                    graph, accumulated, graph.turn_count
+                );
+            }
         }
     }
 }
@@ -1959,6 +2134,22 @@ impl BaseLLM._invoke_streaming(
         just_compacted = False;
         while True {
             iter_count += 1;
+            # Stage 4 prune dispatch (mirrors _invoke_react_loop). The
+            # streaming variant pays the same policy at the same
+            # boundary so eval results don't depend on whether the
+            # caller asked for `logging=True`.
+            _mem_policy_s = mt_run.context_policy;
+            _mem_graph_s = mt_run.context;
+            if (
+                _mem_policy_s is not None
+                and _mem_graph_s is not None
+                and iter_count > 1
+                and _mem_policy_s.should_prune(_mem_graph_s, mt_run)
+            ) {
+                for _decision_s in _mem_policy_s.select_eviction(_mem_graph_s, mt_run) {
+                    apply_eviction_decision(_decision_s);
+                }
+            }
 
             if on_iteration and iter_count > 1 {
                 ctx = IterationContext(
@@ -2064,8 +2255,19 @@ impl BaseLLM._invoke_streaming(
                     if isinstance(usage, dict)
                     else getattr(usage, "total_tokens", 0)
             );
-            # Threshold-based proactive compaction - identical logic to invoke().
-            just_compacted = self._maybe_compact(mt_run, usage, just_compacted, _cp);
+            # Stage 3 policy dispatch (mirrors invoke()): when a
+            # ContextPolicy is wired, route compaction through it; the
+            # framework's threshold-based path is bypassed for this turn.
+            policy = mt_run.context_policy;
+            graph_for_policy = mt_run.context;
+            if policy is not None and graph_for_policy is not None {
+                if policy.should_compact(graph_for_policy, mt_run) {
+                    policy.compact(graph_for_policy, mt_run);
+                }
+            } else {
+                # Threshold-based proactive compaction - identical logic to invoke().
+                just_compacted = self._maybe_compact(mt_run, usage, just_compacted, _cp);
+            }
 
             # Metrics: emit LLM call duration and completion-token count for this
             # iteration so consumers can show generation speed (tokens/sec).
@@ -2169,7 +2371,19 @@ impl BaseLLM._invoke_streaming(
                             ordered[idx] = r;
                         }
                         for i in range(len(batch)) {
-                            mt_run.add_message(ordered[i][1]);
+                            (btc_m, result_msg_m, _) = ordered[i];
+                            mt_run.add_message(result_msg_m);
+                            graph = mt_run.context;
+                            if graph is not None {
+                                graph.record_tool_result(
+                                    tool_name=btc_m.tool.get_name(),
+                                    args=btc_m.args,
+                                    full_content=str(result_msg_m.content),
+                                    visible_content=str(result_msg_m.content),
+                                    turn=graph.turn_count,
+                                    call_id=btc_m.call_id
+                                );
+                            }
                         }
                     }
                 }

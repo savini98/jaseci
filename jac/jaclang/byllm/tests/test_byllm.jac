@@ -153,6 +153,138 @@ test "streaming with react" {
     assert "Test passed!" in stdout_value;
 }
 
+test "structured streaming basic (typed return + stream, no tools)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("structured_streaming_basic", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "type(result) = StructuredStream" in stdout_value;
+    assert "PASS  parsed.citations matches" in stdout_value;
+}
+
+test "structured streaming with tools" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("structured_streaming_with_tools", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  parsed is StructuredAnswer instance" in stdout_value;
+    assert "PASS  parsed.citations matches" in stdout_value;
+}
+
+test "structured streaming smart default field" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("structured_streaming_smart_default", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert (
+        "PASS  resolver picked 'summary' (first str field, no 'answer' present)"
+        in stdout_value
+    );
+}
+
+test "context primitive populates graph (Stage 2)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("context_basic", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  persist=True reuses the same graph node" in stdout_value;
+    assert "PASS  tool result recorded as ContextToolResult" in stdout_value;
+    assert "PASS  tr_id follows the documented scheme" in stdout_value;
+    assert "PASS  assistant message recorded on call 1" in stdout_value;
+    assert "PASS  persist=False yielded a separate graph node" in stdout_value;
+}
+
+test "context AgePolicy compacts and is no-op without policy (Stage 3)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("context_age_policy", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  AgePolicy created a CompactionSummary node" in stdout_value;
+    assert "PASS  AgePolicy hid older messages/tool results" in stdout_value;
+    assert "PASS  CompactionSummary dropped_*_count is non-zero" in stdout_value;
+    assert (
+        "PASS  no-policy run is unchanged from Stage 2 (no summary, nothing hidden)"
+        in stdout_value
+    );
+}
+
+test "context ReferenceAwarePolicy preserves cited content (Stage 4)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("context_reference_aware", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  should_prune True at fill_ratio above soft threshold" in stdout_value;
+    assert "PASS  unreferenced (low-ref) candidate was evicted first" in stdout_value;
+    assert "PASS  high-ref content preserved through pressure" in stdout_value;
+}
+
+test "context reference detection bumps ref counts (Stage 4)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("context_reference_detection", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  reference_count bumped on the cited tool result" in stdout_value;
+    assert "PASS  ReferencedBy edge created from turn-2 assistant" in stdout_value;
+}
+
+test "context materialize unit (graph -> LLM message list)" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("context_materialize_unit", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  system message emitted first" in stdout_value;
+    assert (
+        "PASS  pruned tool result emits placeholder (LLM no longer sees the value)"
+        in stdout_value
+    );
+}
+
+test "context materialize + pruning integration" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import(
+        "context_materialize_pruning_integration", base_path=FIXTURE_DIR + "/"
+    );
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  materialize was called at least once during turn 1" in stdout_value;
+    assert (
+        "PASS  pruned value did NOT leak into the materialised LLM context"
+        in stdout_value
+    );
+}
+
+test "context typed-slot compaction preserves field values" {
+    captured_output = io.StringIO();
+    sys.stdout = captured_output;
+    jac_import("context_typed_compaction", base_path=FIXTURE_DIR + "/");
+    sys.stdout = sys.__stdout__;
+    stdout_value = captured_output.getvalue();
+    assert "All assertions passed." in stdout_value;
+    assert "PASS  compact returned a ContextCompactionSummary" in stdout_value;
+    assert (
+        "PASS  summary_text contains 'keepalive_seconds = 47' verbatim"
+        in stdout_value
+    );
+}
+
 test "logging stream no tools" {
     captured_output = io.StringIO();
     sys.stdout = captured_output;
@@ -427,16 +559,16 @@ test "streaming visit by routes and streams tokens to handler" {
     assert "VISITED: red" not in stdout_value;
 }
 
-test "structured streaming without a handler is rejected" {
-    # Streaming a non-str return needs a stream_handler to consume the events;
-    # omitting it raises ConfigurationError up front (the guard the visit-by
-    # streaming path relaxes only when a handler is supplied).
+test "structured streaming without a handler returns StructuredStream" {
+    # Streaming a non-str return without a stream_handler is supported: the
+    # call returns a StructuredStream (streamed text field + `.parsed` typed
+    # instance). The handler-driven visit-by path still streams raw tokens.
     captured_output = io.StringIO();
     sys.stdout = captured_output;
     jac_import("streaming_structured_no_handler", base_path=FIXTURE_DIR + "/");
     sys.stdout = sys.__stdout__;
     stdout_value = captured_output.getvalue();
-    assert "STREAMING_GUARD_PASS" in stdout_value;
+    assert "STREAMING_STRUCTURED_NO_HANDLER_PASS" in stdout_value;
 }
 
 test "http client with system prompt override" {

@@ -18,6 +18,7 @@ import from jaclang.byllm.types {
     ToolCallResultMsg
 }
 import from jaclang.byllm.mcp { McpTool }
+import from jaclang.byllm.context { Context, ContextGraph, ContextPolicy }
 
 """Intermediate representation for LLM function calls.
 
@@ -50,6 +51,21 @@ obj MTRuntime {
         # Caller's list bound via `by llm(conversation=<list>)`, written
         # back in place after the ReAct loop. None when not conversational.
         _conversation_list: object = None,
+        # Set by `dispatch_streaming` when streaming a structured (typed)
+        # response. Holds the parsed `resp_type` instance once the stream
+        # completes; surfaced to callers via `StructuredStream.parsed`.
+        streaming_result: object = None,
+        # Per-invocation memory graph. Populated by the factory when the
+        # caller passes `context=Context(...)` to `by llm()`. Tool results
+        # and messages are auto-recorded into this graph as the agent
+        # runs; the caller inspects it via `Context.graph` after the call.
+        # Stays None for callers who don't opt in.
+        context: ContextGraph | None = None,
+        # Strategy interface (Stage 3+) for pruning, compaction, and
+        # materialization. Set from `Context.policy` in the factory.
+        # When non-None, byLLM dispatches to it at iteration boundaries
+        # instead of running its own inline compaction logic.
+        context_policy: ContextPolicy | None = None,
         # Structured final value captured during a streamed ReAct loop so a
         # handler-driven invoke can return the parsed result after the event
         # stream is fully consumed.

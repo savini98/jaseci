@@ -47,8 +47,26 @@ import from jaclang.byllm.parallel {
     _index_by_identity,
     _PARALLEL_TOOL_HINT
 }
-import from jaclang.byllm.schema { inject_schema_hint }
+import from jaclang.byllm.schema { inject_schema_hint, json_to_instance }
 import from jaclang.byllm.tool_protocol { inject_tool_hint, recover_tool_calls }
+import from jaclang.byllm.streaming_parser {
+    StreamingFieldExtractor,
+    StructuredStream,
+    resolve_streaming_text_field
+}
+import from jaclang.byllm.context {
+    Context,
+    ContextGraph,
+    ContextToolResult,
+    ContextMessage,
+    ContextCompactionSummary,
+    ContextPolicy,
+    AgePolicy,
+    ReferenceAwarePolicy,
+    EvictionDecision,
+    apply_eviction_decision,
+    record_references_from_text
+}
 
 # Load configuration purely from jac.toml
 glob _byllm_config = get_byllm_config(),

@@ -1,26 +1,36 @@
-"""Structured streaming is gated on a stream_handler.
+"""Structured streaming without a handler returns a StructuredStream.
 
-Streaming a non-`str` return without a handler to consume the events has no
-well-defined result, so it is rejected up front. With a handler the same call
-is allowed (see streaming_visit_by).
+Streaming a non-`str` return without a stream_handler used to be rejected
+up front; it is now supported: the call returns a StructuredStream whose
+tokens are the designated text field's characters and whose `.parsed`
+carries the fully-typed instance once the stream is consumed. The
+handler-driven path (see streaming_visit_by) is unchanged: with a
+stream_handler the raw structured tokens go to the handler instead.
 """
 import from jaclang.byllm.lib { MockLLM }
-import from jaclang.byllm.exceptions { ConfigurationError }
+import from jaclang.byllm.streaming_parser { StructuredStream }
+
+obj Pick {
+    has answer: str = "";
+    has choices: list[int] = [];
+}
 
 glob llm: MockLLM = MockLLM(
          model_name="mockllm",
-         config={"outputs": ['{"schema_object_wrapper": [1]}']}
+         config={"outputs": ['{"answer": "b", "choices": [1]}']}
      );
 
-def pick(options: str) -> list[int] by llm(stream=True);
+def pick(options: str) -> Pick by llm(stream=True);
 
 with entry {
-    raised = False;
-    try {
-        pick("0=a, 1=b");
-    } except ConfigurationError {
-        raised = True;
-    }
-    assert raised , "structured streaming without a stream_handler must raise ConfigurationError";
-    print("STREAMING_GUARD_PASS");
+    result = pick("0=a, 1=b");
+    assert isinstance(result, StructuredStream) , (
+        f"expected StructuredStream, got {type(result).__name__}"
+    );
+    streamed = "".join([tok for tok in result]);
+    assert streamed == "b" , f"unexpected streamed text: {streamed!r}";
+    parsed = result.parsed;
+    assert isinstance(parsed, Pick) , f"parsed is {type(parsed).__name__}";
+    assert parsed.choices == [1] , f"parsed.choices = {parsed.choices}";
+    print("STREAMING_STRUCTURED_NO_HANDLER_PASS");
 }

@@ -9,6 +9,75 @@ glob SYSTEM_PERSONA = """\
     output. Only use tools.
     """;
 
+
+"""Normalise an assistant message's tool_calls into the
+[{id, name, args}] shape ContextMessage.tool_calls stores.
+
+Handles three observed input shapes:
+  - LiteLLM-style attribute access (msg.tool_calls -> obj.id /
+    obj.function.name / obj.function.arguments as JSON str)
+  - Dict-style fallback (tool_calls is a list of {id, function: {...}})
+  - Missing / None (returns [])
+
+Used by both MTRuntime.factory's bulk-record loop and add_message so
+the graph captures the tool_use_id ↔ tool_name link that
+materialize() relies on to rebuild a valid LLM message list when
+pruning has acted on individual tool results.
+"""
+def _extract_tool_calls(msg: object) -> list {
+    raw = getattr(msg, "tool_calls", None);
+    if raw is None and isinstance(msg, dict) {
+        raw = msg.get("tool_calls");
+    }
+    if not raw {
+        return [];
+    }
+    out: list = [];
+    for tc in raw {
+        tc_id: str = "";
+        tc_name: str = "";
+        tc_args: dict = {};
+        # Attribute style first (LiteLLM / OpenAI client objects).
+        tc_id = str(getattr(tc, "id", "") or "");
+        fn = getattr(tc, "function", None);
+        if fn is not None {
+            tc_name = str(getattr(fn, "name", "") or "");
+            raw_args = getattr(fn, "arguments", None);
+            if isinstance(raw_args, str) and raw_args {
+                try {
+                    tc_args = json.loads(raw_args);
+                } except Exception {
+                    tc_args = {"_raw": raw_args};
+                }
+            } elif isinstance(raw_args, dict) {
+                tc_args = raw_args;
+            }
+        }
+        # Dict-shape fallback if attribute access didn't fill anything.
+        if not tc_id and isinstance(tc, dict) {
+            tc_id = str(tc.get("id", "") or "");
+            fn_dict = tc.get("function") or {};
+            if isinstance(fn_dict, dict) {
+                tc_name = str(fn_dict.get("name", "") or "");
+                raw_args2 = fn_dict.get("arguments");
+                if isinstance(raw_args2, str) and raw_args2 {
+                    try {
+                        tc_args = json.loads(raw_args2);
+                    } except Exception {
+                        tc_args = {"_raw": raw_args2};
+                    }
+                } elif isinstance(raw_args2, dict) {
+                    tc_args = raw_args2;
+                }
+            }
+        }
+        if tc_id {
+            out.append({"id": tc_id, "name": tc_name, "args": tc_args});
+        }
+    }
+    return out;
+}
+
 """Create an MTRuntime instance from a callable and its arguments.
 
 Builds the message history with system persona, user input, and any media.
@@ -196,16 +265,11 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
     # Prepare return type.
     return_type = get_type_hints(caller).get("return");
     is_streaming = bool(call_params.get("stream", False));
-    if is_streaming
-    and return_type is not str
-    and call_params.get("stream_handler") is None {
-        raise ConfigurationError(
-            "Streaming responses are only supported for str return types. "
-            "Pass a stream_handler to receive stream events for a structured "
-            "return type (e.g. `visit [-->] by model(stream=True, "
-            "stream_handler=fn)`)."
-        );
-    }
+    # Typed returns with stream=True are supported: invoke() wraps the
+    # token generator in a StructuredStream (see streaming_parser.jac) so
+    # the caller iterates the designated text field's tokens and retrieves
+    # the fully-parsed instance via `.parsed` once the stream completes.
+    # A stream_handler remains the event-driven alternative for `visit by`.
     if len(tools) > 0 {
         finish_tool = Tool.make_finish_tool(return_type or str);
         tools.append(finish_tool);
@@ -227,12 +291,88 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
         mt_run._conversation_list = conv_list_ref;
     }
 
+    # Context: when the caller passed `context=Context(...)` to `by llm()`,
+    # ask the Context holder for its (possibly persisted) ContextGraph and
+    # attach it to mt_run so downstream auto-recording hooks can find it.
+    context_obj = call_params.get("context");
+    if isinstance(context_obj, Context) {
+        graph: ContextGraph = context_obj.get_or_create_graph();
+        mt_run.context = graph;
+        # Stage 3: propagate the policy from the Context holder onto
+        # mt_run so the loop can dispatch to it without keeping a
+        # reference to the holder itself.
+        mt_run.context_policy = context_obj.policy;
+        # Bump the per-call turn counter on the graph so generated IDs
+        # carry the right turn even when the agent itself hasn't tracked
+        # it (the agent code can override later via its own turn logic).
+        graph.turn_count += 1;
+        current_turn: int = graph.turn_count;
+        # Auto-record the user-side messages already on mt_run.messages
+        # (system + conversation history + new user msg). Keeps the graph
+        # in sync from turn 0 without touching add_message hooks.
+        for m in mt_run.messages {
+            role_str = "";
+            content_str = "";
+            role_attr = getattr(m, "role", None);
+            if role_attr is not None {
+                role_str = str(getattr(role_attr, "value", role_attr));
+            }
+            raw_content = getattr(m, "content", "");
+            if isinstance(raw_content, str) {
+                content_str = raw_content;
+            } else {
+                content_str = str(raw_content);
+            }
+            if role_str {
+                graph.record_message(
+                    role=role_str,
+                    turn=current_turn,
+                    content=content_str,
+                    tool_calls=_extract_tool_calls(m)
+                );
+            }
+        }
+    }
+
     return mt_run;
 }
 
-"""Add a message to the conversation history."""
+"""Add a message to the conversation history.
+
+When the caller opted into the memory layer via `context=Context(...)`,
+also record the message in the ContextGraph as a ContextMessage. We skip
+ToolCallResultMsg here because those are recorded as ContextToolResult
+(richer schema with args, full_content, tr_id) at the dispatch site.
+"""
 impl MTRuntime.add_message(message: MessageType) -> None {
     self.messages.append(message);
+    graph = self.context;
+    if graph is None {
+        return;
+    }
+    if isinstance(message, ToolCallResultMsg) {
+        return;
+    }
+    role_str = "";
+    content_str = "";
+    role_attr = getattr(message, "role", None);
+    if role_attr is not None {
+        role_str = str(getattr(role_attr, "value", role_attr));
+    }
+    raw_content = getattr(message, "content", "");
+    if isinstance(raw_content, str) {
+        content_str = raw_content;
+    } else {
+        content_str = str(raw_content);
+    }
+    if role_str {
+        graph.record_message(
+            role=role_str,
+            turn=graph.turn_count,
+            content=content_str,
+            tool_calls=_extract_tool_calls(message)
+        );
+    }
 }
 
 
@@ -243,8 +383,32 @@ impl MTRuntime.add_scaffolding_message(message: MessageType) -> None {
 
 """Return the messages in a format suitable for LLM API."""
 impl MTRuntime.get_msg_list -> list[dict[str, object] | LiteLLMMessage] {
+    # Context-policy bridge: when the caller wired
+    # `context=Context(policy=...)` and the policy's `materialize()`
+    # returns a non-None list, use that as the source instead of
+    # self.messages. The substitution only affects what gets
+    # serialized to the LLM this call — self.messages itself is
+    # never mutated, so the canonical conversation history (and the
+    # caller's `conversation=` list) stays intact.
+    #
+    # Wrapped in try/except: materialize is opt-in extra logic, never
+    # let a bug there tank the LLM call. Fall back to the canonical
+    # history on any error.
+    source = self.messages;
+    if self.context_policy is not None and self.context is not None {
+        try {
+            mat = self.context_policy.materialize(self.context, self);
+            if mat is not None {
+                source = mat;
+            }
+        } except Exception {
+            # Materialize is opt-in. If a custom policy raises here we
+            # fall back to the canonical history rather than blocking
+            # the LLM call.
+        }
+    }
     return [
-        msg.to_dict() if isinstance(msg, Message) else msg for msg in self.messages
+        msg.to_dict() if isinstance(msg, Message) else msg for msg in source
     ];
 }
 
