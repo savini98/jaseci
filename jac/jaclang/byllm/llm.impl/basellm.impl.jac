@@ -516,23 +516,18 @@ impl BaseLLM.invoke(mt_run: MTRuntime) -> object {
     }
     result = self._invoke_typed_retry(mt_run);
     # Context: capture the assistant's final reply into the graph.
-    # Doing this here (rather than in MockLLM/dispatch_no_streaming)
-    # avoids touching backward-compat assumptions test fixtures make
-    # about MockLLM's message bookkeeping. Skipped when the caller
-    # didn't opt into memory or the result isn't a plain string
-    # (typed returns + streaming both populate streaming_result via
-    # other paths).
+    # Done here (rather than in MockLLM/dispatch_no_streaming) so
+    # subclass dispatch overrides don't each need the hook. Skipped
+    # when the caller didn't opt into a Context or the result isn't a
+    # plain string (typed returns + streaming both populate
+    # streaming_result via other paths).
     graph = mt_run.context;
     if graph is not None and isinstance(result, str) {
-        graph.record_message(
-            role="assistant",
-            turn=graph.turn_count,
-            content=result
-        );
-        # Stage 4 reference detection: scan the assistant text for
-        # identifiers from prior tool results and bump their
-        # ref_count + last_referenced_at. Drives ReferenceAwarePolicy's
-        # eviction order on the next call.
+        graph.record_message(role="assistant", turn=graph.turn_count, content=result);
+        # Reference detection: scan the assistant text for identifiers
+        # from prior tool results and bump their reference_count +
+        # last_referenced_at. Drives ReferenceAwarePolicy's eviction
+        # order on the next call.
         record_references_from_text(graph, result, graph.turn_count);
     }
     return result;
@@ -934,19 +929,19 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
     just_compacted = False;
     while True {
         iter_count += 1;
-        # Stage 4: pre-LLM-call pruning dispatch. When a ContextPolicy is
-        # wired, ask it whether to prune and apply any returned eviction
-        # decisions before the next dispatch. Skipped on iteration 1 (no
-        # prior history to act on) so first-turn behavior matches today's.
-        _mem_policy = mt_run.context_policy;
-        _mem_graph = mt_run.context;
+        # Pre-LLM-call pruning dispatch. When a ContextPolicy is wired,
+        # ask it whether to prune and apply any returned eviction
+        # decisions before the next dispatch. Skipped on iteration 1 —
+        # there is no prior history to act on.
+        _ctx_policy = mt_run.context_policy;
+        _ctx_graph = mt_run.context;
         if (
-            _mem_policy is not None
-            and _mem_graph is not None
+            _ctx_policy is not None
+            and _ctx_graph is not None
             and iter_count > 1
-            and _mem_policy.should_prune(_mem_graph, mt_run)
+            and _ctx_policy.should_prune(_ctx_graph, mt_run)
         ) {
-            for _decision in _mem_policy.select_eviction(_mem_graph, mt_run) {
+            for _decision in _ctx_policy.select_eviction(_ctx_graph, mt_run) {
                 apply_eviction_decision(_decision);
             }
         }
@@ -1003,8 +998,8 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                 if isinstance(usage, dict)
                 else getattr(usage, "total_tokens", 0)
         );
-        # Stage 3: when a ContextPolicy is wired through Context, dispatch
-        # to it for compaction decisions and bypass the framework's
+        # When a ContextPolicy is wired through Context, dispatch to it
+        # for compaction decisions and bypass the framework's
         # threshold-based compaction. The policy mutates the graph
         # itself; we don't need to reach into mt_run.messages here.
         policy = mt_run.context_policy;
@@ -1052,7 +1047,7 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                         last_tool = btc.tool.get_name();
                         last_result = str(result_msg.content)[:500];
                         mt_run.add_message(result_msg);
-                        # Auto-record into the memory graph when the
+                        # Auto-record into the context graph when the
                         # caller opted in via context=Context(...).
                         # call_id carries the tool_use_id forward so
                         # materialize() can pair this tool result back
@@ -1582,8 +1577,7 @@ impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
         or self.call_params.get("streaming_text_field")
     );
     text_field = resolve_streaming_text_field(
-        explicit_field,
-        mt_run.get_output_schema() if is_structured else None
+        explicit_field, mt_run.get_output_schema() if is_structured else None
     );
     extractor: StreamingFieldExtractor | None = None;
 
@@ -1594,9 +1588,7 @@ impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
         # response from scratch, so buffered parser state must not carry
         # over into the retried pass.
         extractor = (
-            StreamingFieldExtractor(field_name=text_field)
-                if is_structured
-                else None
+            StreamingFieldExtractor(field_name=text_field) if is_structured else None
         );
         try {
             response = self.model_call_with_stream(params);
@@ -1640,9 +1632,7 @@ impl BaseLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
         if raw_text and target_type is not None {
             try {
                 parsed_dict = json.loads(raw_text);
-                mt_run.streaming_result = json_to_instance(
-                    parsed_dict, target_type
-                );
+                mt_run.streaming_result = json_to_instance(parsed_dict, target_type);
             } except Exception as e {
                 logger.warning(
                     "byLLM structured streaming: failed to parse final JSON "
@@ -2018,9 +2008,7 @@ impl BaseLLM._stream_final_answer(mt_run: MTRuntime) -> Generator[str, None, Non
             # results whose identifiers appear in the final assistant text.
             graph = mt_run.context;
             if graph is not None {
-                record_references_from_text(
-                    graph, accumulated, graph.turn_count
-                );
+                record_references_from_text(graph, accumulated, graph.turn_count);
             }
         }
     }
@@ -2134,19 +2122,21 @@ impl BaseLLM._invoke_streaming(
         just_compacted = False;
         while True {
             iter_count += 1;
-            # Stage 4 prune dispatch (mirrors _invoke_react_loop). The
-            # streaming variant pays the same policy at the same
-            # boundary so eval results don't depend on whether the
-            # caller asked for `logging=True`.
-            _mem_policy_s = mt_run.context_policy;
-            _mem_graph_s = mt_run.context;
+            # Prune dispatch (mirrors _invoke_react_loop). The streaming
+            # variant pays the same policy at the same boundary so
+            # behavior doesn't depend on whether the caller asked for
+            # `logging=True`.
+            _ctx_policy_s = mt_run.context_policy;
+            _ctx_graph_s = mt_run.context;
             if (
-                _mem_policy_s is not None
-                and _mem_graph_s is not None
+                _ctx_policy_s is not None
+                and _ctx_graph_s is not None
                 and iter_count > 1
-                and _mem_policy_s.should_prune(_mem_graph_s, mt_run)
+                and _ctx_policy_s.should_prune(_ctx_graph_s, mt_run)
             ) {
-                for _decision_s in _mem_policy_s.select_eviction(_mem_graph_s, mt_run) {
+                for _decision_s in _ctx_policy_s.select_eviction(
+                    _ctx_graph_s, mt_run
+                ) {
                     apply_eviction_decision(_decision_s);
                 }
             }
@@ -2255,7 +2245,7 @@ impl BaseLLM._invoke_streaming(
                     if isinstance(usage, dict)
                     else getattr(usage, "total_tokens", 0)
             );
-            # Stage 3 policy dispatch (mirrors invoke()): when a
+            # Policy dispatch (mirrors _invoke_react_loop): when a
             # ContextPolicy is wired, route compaction through it; the
             # framework's threshold-based path is bypassed for this turn.
             policy = mt_run.context_policy;
@@ -2266,7 +2256,9 @@ impl BaseLLM._invoke_streaming(
                 }
             } else {
                 # Threshold-based proactive compaction - identical logic to invoke().
-                just_compacted = self._maybe_compact(mt_run, usage, just_compacted, _cp);
+                just_compacted = self._maybe_compact(
+                    mt_run, usage, just_compacted, _cp
+                );
             }
 
             # Metrics: emit LLM call duration and completion-token count for this

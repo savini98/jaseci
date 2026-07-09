@@ -24,14 +24,14 @@ obj AgentReply {
 
 
 glob llm = Model(
-    model_name="mockllm",
-    config={
-        "outputs": [
-            '{"answer": "the rate limit is 750 req/min", '
-            '"citations": ["tr_2", "tr_5"]}'
-        ]
-    },
-);
+         model_name="mockllm",
+         config={
+             "outputs": [
+                 '{"answer": "the rate limit is 750 req/min", '
+                 '"citations": ["tr_2", "tr_5"]}'
+             ]
+         },
+     );
 
 
 """Answer a question and return both the streamed answer text and the

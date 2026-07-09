@@ -1,11 +1,10 @@
-"""Typed-slot compaction for byLLM memory.
+"""Typed-slot compaction for byLLM context management.
 
-The default AgePolicy collapses older turns into a free-form prose
-summary. byLLM-backed prose summarisers drop specific field-level
-values during paraphrase — that's what direction-1-results-v2.md
-Phase C.3 measured: the proposed-mode 2/2 collapsed to 0/2 when
-compaction was on, because values like `keepalive_seconds=47` did
-not survive the summary.
+The base AgePolicy collapses older turns into a free-form prose
+summary. Prose summarisers tend to drop specific field-level values
+during paraphrase — a value like `keepalive_seconds=47` rarely
+survives the summary verbatim, so later turns that need it back
+cannot recall it.
 
 This module replaces the free-form output with a fixed-shape record
 so the slots can be inspected and re-merged across compaction passes
@@ -13,11 +12,11 @@ without paraphrase loss. Agents that need to recall specific numeric
 values, configuration keys, or identifiers should pick
 TypedSlotCompactionPolicy over the plain AgePolicy.
 
-Layout intentionally separate from `byllm/memory.jac`: the `by llm()`
-decorator on `extract_compaction_slots` would otherwise create a
-circular import (`memory` → `llm` → `memory`). The base memory layer
-stays pure; this module is an opt-in import for agents that want
-typed compaction.
+Kept separate from `context.jac` on purpose: the `by` clause on
+`extract_compaction_slots` would otherwise create a circular import
+(`context` → `llm` → `context`). The base context layer stays free of
+LLM calls; this module is an opt-in import for agents that want typed
+compaction.
 """
 
 import time;
@@ -70,9 +69,9 @@ the summariser paraphrases. `previous_slots` lets the policy merge across
 multiple compaction passes (anchored update).
 """
 def extract_compaction_slots(
-    previous_slots: CompactionSlots | None,
-    items: list[dict]
+    previous_slots: CompactionSlots | None, items: list[dict]
 ) -> CompactionSlots by _resolve_extractor();
+
 sem extract_compaction_slots = """Extract a structured compaction
 summary from the items below. items is a list of {turn, role, content}
 dicts representing older conversation turns being summarised.
@@ -165,11 +164,13 @@ impl TypedSlotCompactionPolicy.compact(
         return None;
     }
     msgs_to_compact = [
-        m for m in [graph -->][?:ContextMessage]
+        m
+        for m in [graph-->][?:ContextMessage]
         if m.visible and m.turn <= cutoff
     ];
     trs_to_compact = [
-        tr for tr in [graph -->][?:ContextToolResult]
+        tr
+        for tr in [graph-->][?:ContextToolResult]
         if tr.visible and tr.produced_at_turn <= cutoff
     ];
     if not msgs_to_compact and not trs_to_compact {
@@ -178,23 +179,23 @@ impl TypedSlotCompactionPolicy.compact(
 
     items: list[dict] = [];
     for m in msgs_to_compact {
-        items.append({
-            "turn": m.turn,
-            "role": m.role,
-            "content": m.content
-        });
+        items.append({"turn": m.turn, "role": m.role, "content": m.content});
     }
     for tr in trs_to_compact {
-        items.append({
-            "turn": tr.produced_at_turn,
-            "role": f"tool:{tr.tool_name}",
-            "content": tr.full_content
-        });
+        items.append(
+            {
+                "turn": tr.produced_at_turn,
+                "role": f"tool:{tr.tool_name}",
+                "content": tr.full_content
+            }
+        );
     }
     items.sort(key=lambda x: dict : x["turn"]);
 
     prior_visible = [
-        s for s in [graph -->][?:ContextCompactionSummary] if s.visible
+        s
+        for s in [graph-->][?:ContextCompactionSummary]
+        if s.visible
     ];
     prior_node: ContextCompactionSummary | None = None;
     if prior_visible {

@@ -78,7 +78,7 @@ with entry {
         call_id="ghost_call_x"
     );
     # Hide the hidden tool result manually (matches the pair).
-    for tr in [graph -->][?:ContextToolResult] {
+    for tr in [graph-->][?:ContextToolResult] {
         if tr.call_id == "ghost_call_x" {
             tr.visible = False;
         }
@@ -113,14 +113,14 @@ with entry {
     graph.record_message(role="assistant", turn=4, content="done.");
 
     # Mock mt_run with one SYSTEM message.
-    mt = MockMtRun(messages=[
-        Message(role=MessageRole.SYSTEM, content="you are a helpful assistant")
-    ]);
+    mt = MockMtRun(
+        messages=[
+            Message(role=MessageRole.SYSTEM, content="you are a helpful assistant")
+        ]
+    );
 
     policy = AgePolicy(
-        usable_budget_tokens=1000,
-        compact_threshold_ratio=0.5,
-        preserve_recent_turns=1
+        usable_budget_tokens=1000, compact_threshold_ratio=0.5, preserve_recent_turns=1
     );
     out = policy.materialize(graph, mt);
     if out is None {
@@ -203,10 +203,7 @@ with entry {
     #    call_prod tool_use block.
     assistant_call_emitted = False;
     for entry in out {
-        if (
-            isinstance(entry, dict)
-            and entry.get("role") == "assistant"
-        ) {
+        if (isinstance(entry, dict) and entry.get("role") == "assistant") {
             for tc in (entry.get("tool_calls") or []) {
                 if isinstance(tc, dict) and tc.get("id") == "call_prod" {
                     assistant_call_emitted = True;

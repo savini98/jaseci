@@ -298,9 +298,9 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
     if isinstance(context_obj, Context) {
         graph: ContextGraph = context_obj.get_or_create_graph();
         mt_run.context = graph;
-        # Stage 3: propagate the policy from the Context holder onto
-        # mt_run so the loop can dispatch to it without keeping a
-        # reference to the holder itself.
+        # Propagate the policy from the Context holder onto mt_run so
+        # the loop can dispatch to it without keeping a reference to
+        # the holder itself.
         mt_run.context_policy = context_obj.policy;
         # Bump the per-call turn counter on the graph so generated IDs
         # carry the right turn even when the agent itself hasn't tracked
@@ -339,7 +339,7 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
 
 """Add a message to the conversation history.
 
-When the caller opted into the memory layer via `context=Context(...)`,
+When the caller opted into context management via `context=Context(...)`,
 also record the message in the ContextGraph as a ContextMessage. We skip
 ToolCallResultMsg here because those are recorded as ContextToolResult
 (richer schema with args, full_content, tr_id) at the dispatch site.
@@ -402,14 +402,12 @@ impl MTRuntime.get_msg_list -> list[dict[str, object] | LiteLLMMessage] {
                 source = mat;
             }
         } except Exception {
-            # Materialize is opt-in. If a custom policy raises here we
-            # fall back to the canonical history rather than blocking
-            # the LLM call.
+        # Materialize is opt-in. If a custom policy raises here we
+        # fall back to the canonical history rather than blocking
+        # the LLM call.
         }
     }
-    return [
-        msg.to_dict() if isinstance(msg, Message) else msg for msg in source
-    ];
+    return [msg.to_dict() if isinstance(msg, Message) else msg for msg in source];
 }
 
 

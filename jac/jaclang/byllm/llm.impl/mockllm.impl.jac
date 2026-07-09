@@ -127,13 +127,10 @@ impl MockLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
         or self.call_params.get("streaming_text_field")
     );
     text_field = resolve_streaming_text_field(
-        explicit_field,
-        mt_run.get_output_schema() if is_structured else None
+        explicit_field, mt_run.get_output_schema() if is_structured else None
     );
     extractor = (
-        StreamingFieldExtractor(field_name=text_field)
-            if is_structured
-            else None
+        StreamingFieldExtractor(field_name=text_field) if is_structured else None
     );
 
     if mt_run.stream {
@@ -161,9 +158,7 @@ impl MockLLM.dispatch_streaming(mt_run: MTRuntime) -> Generator[str, None, None]
         if raw_text and target_type is not None {
             try {
                 parsed_dict = json.loads(raw_text);
-                mt_run.streaming_result = json_to_instance(
-                    parsed_dict, target_type
-                );
+                mt_run.streaming_result = json_to_instance(parsed_dict, target_type);
             } except Exception as e {
                 logger.warning(
                     "MockLLM structured streaming: failed to parse final JSON "

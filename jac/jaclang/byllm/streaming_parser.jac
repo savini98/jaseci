@@ -34,8 +34,7 @@ callers can `json.loads(extractor.raw)` once `is_done()` is true.
 Resolution order:
   1. Explicit `streaming_text_field` in call_params
   2. `"answer"` if the response_format schema has a top-level string property
-     by that name (the convention used by `MemoryAwareReply` and the docs
-     in `byllm-react-implementation-plan.md`)
+     by that name (the conventional name for the user-facing text field)
   3. The first top-level `string` property in the schema
   4. `"answer"` as a last-resort fallback (extractor will simply never
      match and yield nothing — caller still gets `.parsed` after stream
@@ -46,8 +45,7 @@ inner `json_schema.schema`, or whatever shape `mt_run.get_output_schema`
 returns). When it can't be introspected, we fall back to "answer".
 """
 def resolve_streaming_text_field(
-    explicit: str | None,
-    response_schema: dict | None
+    explicit: str | None, response_schema: dict | None
 ) -> str {
     if explicit {
         return explicit;
@@ -64,11 +62,7 @@ def resolve_streaming_text_field(
             schema = inner.get("schema") or schema;
         }
     }
-    props = (
-        schema.get("properties")
-            if isinstance(schema, dict)
-            else None
-    );
+    props = schema.get("properties") if isinstance(schema, dict) else None;
     if not isinstance(props, dict) {
         return "answer";
     }
@@ -102,17 +96,16 @@ obj StreamingFieldExtractor {
         # After streaming completes, ex.raw holds the full JSON text;
         # caller should json.loads(ex.raw) to extract structured fields.
     """
-
     has field_name: str;
 
     # Internal state — do not access directly from outside.
     has _raw: str = "";
-    has _state: str = "scanning";   # scanning | in_value | in_escape | done
-    has _depth: int = 0;            # 0 = outside outer {}, 1 = at top level
-    has _in_string: bool = False;   # are we inside a non-target string?
+    has _state: str = "scanning";  # scanning | in_value | in_escape | done
+    has _depth: int = 0;  # 0 = outside outer {}, 1 = at top level
+    has _in_string: bool = False;  # are we inside a non-target string?
     has _string_escape: bool = False;
-    has _key_buffer: str = "";      # last completed top-level key (when seen)
-    has _matched_key: bool = False; # we matched the target key, awaiting `:`
+    has _key_buffer: str = "";  # last completed top-level key (when seen)
+    has _matched_key: bool = False;  # we matched the target key, awaiting `:`
     has _seeking_value_start: bool = False;  # we're past `:`, awaiting opening `"`
 
     def feed(chunk: str) -> str;
@@ -289,11 +282,11 @@ obj StructuredStream {
     `runtime.streaming_result` on completion, so this wrapper simply
     drains-then-fetches.
     """
-
     has _generator: Iterator[str];
-    has _runtime: object;          # MTRuntime, but typed loosely to avoid cycles
+
+    has _runtime: object;  # MTRuntime, but typed loosely to avoid cycles
     has _exhausted: bool = False;
-    has _drain_count: int = 0;     # debug counter; tokens dropped during drain
+    has _drain_count: int = 0;  # debug counter; tokens dropped during drain
 
     def __iter__() -> Iterator[str] {
         return self;

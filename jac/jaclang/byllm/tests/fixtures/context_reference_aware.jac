@@ -1,4 +1,4 @@
-"""Stage 4 smoke test: ReferenceAwarePolicy preserves high-ref content
+"""Smoke test: ReferenceAwarePolicy preserves high-ref content
 while evicting low-ref content of the same age and size.
 
 Two ContextToolResult nodes are created with identical age and size.
@@ -21,7 +21,7 @@ import from jaclang.byllm.context {
 
 
 with entry {
-    print("=== Stage 4: ReferenceAwarePolicy preserves cited content ===\n");
+    print("=== ReferenceAwarePolicy preserves cited content ===\n");
 
     # Build a graph with two tool results, same age + size.
     g = ContextGraph(session_id="s4", created_at=0.0, turn_count=5);
@@ -70,13 +70,16 @@ with entry {
     print(f"eviction order (lowest score first):");
     for d in decisions {
         print(f"  {d.tool_result.tr_id} ({d.tool_result.tool_name}) kind={d.kind}");
-
     }
     # Apply the decisions and check what survives.
     for d in decisions {
         apply_eviction_decision(d);
     }
-    survivors = [tr.tr_id for tr in [g -->](?:ContextToolResult) if tr.truncation_state != "hard_cleared" and len(tr.visible_content) > 100];
+    survivors = [
+        tr.tr_id
+        for tr in [g-->][?:ContextToolResult]
+        if tr.truncation_state != "hard_cleared" and len(tr.visible_content) > 100
+    ];
     print(f"\nsurvivors (still visible with content): {survivors}");
 
     failures = 0;

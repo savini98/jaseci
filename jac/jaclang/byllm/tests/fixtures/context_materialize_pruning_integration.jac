@@ -15,7 +15,7 @@ the graph and re-runs materialize directly; we verify that the
 original value does NOT appear in the captured material output.
 (MockLLM doesn't reconstruct LiteLLM-shaped assistant messages with
 tool_calls, so the paired ToolCallResultMsg shape isn't exercised
-here — see memory_materialize_unit.jac for that path.)
+here — see context_materialize_unit.jac for that path.)
 """
 
 import time;
@@ -40,15 +40,11 @@ obj CountingPolicy(AgePolicy) {
     has materialize_count: int = 0,
         last_materialized: list = [];
 
-    override def materialize(
-        graph: ContextGraph, mt_run: object
-    ) -> list | None;
+    override def materialize(graph: ContextGraph, mt_run: object) -> list | None;
 }
 
 
-impl CountingPolicy.materialize(
-    graph: ContextGraph, mt_run: object
-) -> list | None {
+impl CountingPolicy.materialize(graph: ContextGraph, mt_run: object) -> list | None {
     self.materialize_count += 1;
     result = super.materialize(graph, mt_run);
     if result is not None {
@@ -59,38 +55,26 @@ impl CountingPolicy.materialize(
 
 
 def fetch_config() -> str {
-    return (
-        "LIGHTHOUSE_PROD_CONFIG\n"
-        "MAX_TOKEN_REFRESH_ATTEMPTS = 73\n"
-    );
+    return ("LIGHTHOUSE_PROD_CONFIG\n" "MAX_TOKEN_REFRESH_ATTEMPTS = 73\n");
 }
 
 
 glob policy = CountingPolicy(
-    usable_budget_tokens=10000,
-    compact_threshold_ratio=10.0,  # effectively disable AgePolicy compaction
-    preserve_recent_turns=1
-);
+         usable_budget_tokens=10000,
+         compact_threshold_ratio=10.0,  # effectively disable AgePolicy compaction
+         preserve_recent_turns=1
+     );
 glob ctx = Context(persist=True, policy=policy);
 
-
 glob llm = Model(
-    model_name="mockllm",
-    config={
-        "outputs": [
-            # Turn 1: tool call returning the planted value, then ack.
-            MockToolCall(tool=fetch_config, args={}),
-            "ok",
-            # Turn 2: ack (no tool call).
-            "all set",
-        ]
-    },
-);
+         model_name="mockllm",
+         config={
+             "outputs": [MockToolCall(tool=fetch_config, args={}), "ok", "all set", ]
+         },
+     );
 
 
-def investigate(query: str) -> str by llm(
-    tools=[fetch_config], context=ctx
-);
+def investigate(query: str) -> str by llm(tools=[fetch_config], context=ctx);
 
 
 def follow_up(query: str) -> str by llm(context=ctx);
@@ -114,7 +98,7 @@ with entry {
         raise AssertionError("graph not initialised");
     }
     target_tr: ContextToolResult | None = None;
-    for tr in [g -->][?:ContextToolResult] {
+    for tr in [g-->][?:ContextToolResult] {
         if tr.tool_name == "fetch_config" {
             target_tr = tr;
         }
@@ -129,10 +113,7 @@ with entry {
     );
     # Apply a hard_clear decision through the public helper so the
     # placeholder string matches what real pruning would write.
-    apply_eviction_decision(EvictionDecision(
-        tool_result=target_tr,
-        kind="hard_clear"
-    ));
+    apply_eviction_decision(EvictionDecision(tool_result=target_tr, kind="hard_clear"));
     print(
         f"post-clear: tr.visible_content[:60]="
         f"{target_tr.visible_content[:60]!r} "
@@ -178,14 +159,10 @@ with entry {
     }
 
     if not leaked {
-        print(
-            "PASS  pruned value did NOT leak into the materialised LLM context"
-        );
+        print("PASS  pruned value did NOT leak into the materialised LLM context");
     } else {
         failures += 1;
-        print(
-            "FAIL  pruned tool result's original value reached the LLM context"
-        );
+        print("FAIL  pruned tool result's original value reached the LLM context");
     }
 
     if failures > 0 {

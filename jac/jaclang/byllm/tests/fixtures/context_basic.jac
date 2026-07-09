@@ -1,4 +1,4 @@
-"""Stage 2 smoke test: context=Context() populates a ContextGraph that's
+"""Smoke test: context=Context() populates a ContextGraph that's
 reachable from the caller after the LLM call.
 
 Validates:
@@ -10,7 +10,12 @@ Validates:
 """
 
 import from jaclang.byllm.lib { Model, MockToolCall }
-import from jaclang.byllm.context { Context, ContextGraph, ContextToolResult, ContextMessage }
+import from jaclang.byllm.context {
+    Context,
+    ContextGraph,
+    ContextToolResult,
+    ContextMessage
+}
 
 
 def fetch_status() -> str {
@@ -19,20 +24,20 @@ def fetch_status() -> str {
 
 
 glob llm = Model(
-    model_name="mockllm",
-    config={
-        "outputs": [
-            # Call 1: tool call then plain-string final
-            MockToolCall(tool=fetch_status, args={}),
-            "service-ok",
-            # Call 2 (persist test): just a plain final
-            "service-ok again",
-            # Call 3 (persist=False fresh-graph test): plain final
-            "fresh response",
-        ]
-    },
-);
+         model_name="mockllm",
+         config={
+             "outputs": [
+                 # Call 1: tool call then plain-string final
+                 MockToolCall(tool=fetch_status, args={}),
+                 "service-ok",
+                 # Call 2 (persist test): just a plain final
+                 "service-ok again",
+                 # Call 3 (persist=False fresh-graph test): plain final
+                 "fresh response",
 
+             ]
+         },
+     );
 
 glob persistent_ctx = Context(persist=True);
 glob fresh_ctx = Context(persist=False);
@@ -42,13 +47,11 @@ def check_status_persistent(query: str) -> str by llm(
     tools=[fetch_status], context=persistent_ctx
 );
 
-def check_status_fresh(query: str) -> str by llm(
-    context=fresh_ctx
-);
+def check_status_fresh(query: str) -> str by llm(context=fresh_ctx);
 
 
 with entry {
-    print("=== Stage 2: context=Context() populates ContextGraph ===\n");
+    print("=== context=Context() populates ContextGraph ===\n");
 
     # ---- First persistent call: tool fires + final answer ----
     r1 = check_status_persistent("status?");
@@ -57,8 +60,8 @@ with entry {
     print(f"call 1 graph turn_count={g1.turn_count}");
 
     # Walk the graph for tool results and messages.
-    tool_results_1 = [tr for tr in [g1 -->](?:ContextToolResult)];
-    messages_1 = [m for m in [g1 -->](?:ContextMessage)];
+    tool_results_1 = [tr for tr in [g1-->][?:ContextToolResult]];
+    messages_1 = [m for m in [g1-->][?:ContextMessage]];
     tool_ids_1 = [tr.tr_id for tr in tool_results_1];
     print(f"call 1 tool_results: {tool_ids_1}");
     print(f"call 1 message count: {len(messages_1)}");
@@ -69,7 +72,7 @@ with entry {
     print(f"\ncall 2 result: {r2!r}");
     print(f"call 2 graph is same object: {g2 is g1}");
     print(f"call 2 graph turn_count={g2.turn_count}");
-    messages_2 = [m for m in [g2 -->](?:ContextMessage)];
+    messages_2 = [m for m in [g2-->][?:ContextMessage]];
     print(f"call 2 cumulative message count: {len(messages_2)}");
 
     # ---- Fresh-mode call: separate graph, NOT same node ----
@@ -98,7 +101,10 @@ with entry {
         failures += 1;
         print(f"FAIL  no tool_result with tool_name 'fetch_status' found");
     }
-    if any(tr.tr_id.startswith("tr_") and "fetch_status" in tr.tr_id for tr in tool_results_1) {
+    if any(
+        tr.tr_id.startswith("tr_") and "fetch_status" in tr.tr_id
+        for tr in tool_results_1
+    ) {
         print("PASS  tr_id follows the documented scheme");
     } else {
         failures += 1;
@@ -121,7 +127,11 @@ with entry {
         print("PASS  call 2 added more messages to the persisted graph");
     } else {
         failures += 1;
-        print(f"FAIL  call 2 didn't grow message count: {len(messages_1)} → {len(messages_2)}");
+        print(
+            f"FAIL  call 2 didn't grow message count: {len(messages_1)} → {len(
+                messages_2
+            )}"
+        );
     }
     if g3 is not None and g3 is not g1 {
         print("PASS  persist=False yielded a separate graph node");

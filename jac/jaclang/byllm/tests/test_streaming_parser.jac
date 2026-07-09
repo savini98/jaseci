@@ -39,11 +39,10 @@ test "StreamingFieldExtractor unit suite" {
 
     # ----- Test 1: simple single-chunk JSON, target field at top level -----
     total += 1;
-    r = run_extractor(
-        ['{"answer": "hello world", "citations": ["tr_2"]}'],
-        "answer"
-    );
-    if r["streamed"] == "hello world" and r["is_done"] and r["parsed"]["citations"] == ["tr_2"] {
+    r = run_extractor(['{"answer": "hello world", "citations": ["tr_2"]}'], "answer");
+    if r["streamed"] == "hello world"
+    and r["is_done"]
+    and r["parsed"]["citations"] == ["tr_2"] {
         print("PASS  test 1 (single chunk)");
     } else {
         failures += 1;
@@ -59,14 +58,17 @@ test "StreamingFieldExtractor unit suite" {
         print("PASS  test 2 (one-char chunks)");
     } else {
         failures += 1;
-        print(f"FAIL  test 2 (one-char chunks): streamed={r['streamed']!r} done={r['is_done']}");
+        print(
+            f"FAIL  test 2 (one-char chunks): streamed={r['streamed']!r} done={r[
+                'is_done'
+            ]}"
+        );
     }
 
     # ----- Test 3: target key appears as substring of another key first -----
     total += 1;
     r = run_extractor(
-        ['{"pre_answer": "decoy", "answer": "real value", "post": "tail"}'],
-        "answer"
+        ['{"pre_answer": "decoy", "answer": "real value", "post": "tail"}'], "answer"
     );
     if r["streamed"] == "real value" and r["is_done"] {
         print("PASS  test 3 (key-substring decoy)");
@@ -78,8 +80,7 @@ test "StreamingFieldExtractor unit suite" {
     # ----- Test 4: target field name appears inside a NESTED object key -----
     total += 1;
     r = run_extractor(
-        ['{"meta": {"answer": "nested decoy"}, "answer": "outer real"}'],
-        "answer"
+        ['{"meta": {"answer": "nested decoy"}, "answer": "outer real"}'], "answer"
     );
     if r["streamed"] == "outer real" and r["is_done"] {
         print("PASS  test 4 (nested decoy)");
@@ -91,36 +92,33 @@ test "StreamingFieldExtractor unit suite" {
     # ----- Test 5: escape sequences inside the value -----
     total += 1;
     r = run_extractor(
-        ['{"answer": "line one\\nline two with \\"quotes\\" and \\\\back"}'],
-        "answer"
+        ['{"answer": "line one\\nline two with \\"quotes\\" and \\\\back"}'], "answer"
     );
     expected = "line one\nline two with \"quotes\" and \\back";
     if r["streamed"] == expected and r["is_done"] {
         print("PASS  test 5 (escapes)");
     } else {
         failures += 1;
-        print(f"FAIL  test 5 (escapes): streamed={r['streamed']!r} expected={expected!r}");
+        print(
+            f"FAIL  test 5 (escapes): streamed={r['streamed']!r} expected={expected!r}"
+        );
     }
 
     # ----- Test 6: escape sequence split across chunk boundary -----
     total += 1;
-    r = run_extractor(
-        ['{"answer": "before\\', 'nafter"}'],
-        "answer"
-    );
+    r = run_extractor(['{"answer": "before\\', 'nafter"}'], "answer");
     if r["streamed"] == "before\nafter" and r["is_done"] {
         print("PASS  test 6 (escape across chunk boundary)");
     } else {
         failures += 1;
-        print(f"FAIL  test 6 (escape across chunk boundary): streamed={r['streamed']!r}");
+        print(
+            f"FAIL  test 6 (escape across chunk boundary): streamed={r['streamed']!r}"
+        );
     }
 
     # ----- Test 7: target key split across chunk boundary -----
     total += 1;
-    r = run_extractor(
-        ['{"ans', 'wer": "key cut"}'],
-        "answer"
-    );
+    r = run_extractor(['{"ans', 'wer": "key cut"}'], "answer");
     if r["streamed"] == "key cut" and r["is_done"] {
         print("PASS  test 7 (key across chunk boundary)");
     } else {
@@ -131,10 +129,11 @@ test "StreamingFieldExtractor unit suite" {
     # ----- Test 8: citations field comes BEFORE the answer field -----
     total += 1;
     r = run_extractor(
-        ['{"citations": ["tr_2", "tr_5"], "answer": "after array"}'],
-        "answer"
+        ['{"citations": ["tr_2", "tr_5"], "answer": "after array"}'], "answer"
     );
-    if r["streamed"] == "after array" and r["is_done"] and r["parsed"]["citations"] == ["tr_2", "tr_5"] {
+    if r["streamed"] == "after array"
+    and r["is_done"]
+    and r["parsed"]["citations"] == ["tr_2", "tr_5"] {
         print("PASS  test 8 (array before target)");
     } else {
         failures += 1;
@@ -143,10 +142,7 @@ test "StreamingFieldExtractor unit suite" {
 
     # ----- Test 9: opaque whitespace and formatting -----
     total += 1;
-    r = run_extractor(
-        ['{\n  "answer"  :  "spaced out"  ,\n  "n": 1\n}'],
-        "answer"
-    );
+    r = run_extractor(['{\n  "answer"  :  "spaced out"  ,\n  "n": 1\n}'], "answer");
     if r["streamed"] == "spaced out" and r["is_done"] {
         print("PASS  test 9 (whitespace tolerant)");
     } else {

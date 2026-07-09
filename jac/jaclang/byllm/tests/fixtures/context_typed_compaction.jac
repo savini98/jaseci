@@ -1,9 +1,8 @@
 """Typed-slot compaction smoke test.
 
 Validates that `TypedSlotCompactionPolicy.compact` produces a structured
-summary that preserves verbatim numeric values — the failure mode that
-direction-1-results-v2.md Phase C.3 measured against the free-form
-AgePolicy.
+summary that preserves verbatim numeric values — the detail that
+free-form prose summaries tend to paraphrase away.
 
 The fixture builds a ContextGraph by hand (skipping the ReAct loop) so
 the call to `policy.compact(graph, None)` is deterministic and the
@@ -35,27 +34,27 @@ import from jaclang.byllm.typed_compaction {
 
 # MockLLM returns a CompactionSlots when extract_compaction_slots fires.
 # The slots contain the planted value 'keepalive_seconds = 47
-# (config/prod.yaml)' verbatim — the byLLM Phase-C.3 free-form summary
-# dropped exactly this kind of detail. Injected into the policy via
+# (config/prod.yaml)' verbatim — exactly the kind of detail a free-form
+# prose summary tends to drop. Injected into the policy via
 # extractor_model (the extractor's `by` clause resolves the builtin llm
 # otherwise, which would hit a real provider).
 glob mock_extractor = Model(
-    model_name="mockllm",
-    config={
-        "outputs": [
-            CompactionSlots(
-                files_read=["config/prod.yaml", "services/api.py"],
-                key_observations=[
-                    "keepalive_seconds = 47 (config/prod.yaml)",
-                    "RATE_LIMIT_BURST_CAPACITY = 83 (services/api.py)"
-                ],
-                commands_run=["ls -la fixtures/project/"],
-                decisions=["proceed with rate-limit defaults"],
-                unresolved_questions=[]
-            )
-        ]
-    },
-);
+         model_name="mockllm",
+         config={
+             "outputs": [
+                 CompactionSlots(
+                     files_read=["config/prod.yaml", "services/api.py"],
+                     key_observations=[
+                         "keepalive_seconds = 47 (config/prod.yaml)",
+                         "RATE_LIMIT_BURST_CAPACITY = 83 (services/api.py)"
+                     ],
+                     commands_run=["ls -la fixtures/project/"],
+                     decisions=["proceed with rate-limit defaults"],
+                     unresolved_questions=[]
+                 )
+             ]
+         },
+     );
 
 
 with entry {
@@ -66,7 +65,7 @@ with entry {
     # turn_count - 1 is eligible.
     graph = ContextGraph(session_id="t1", created_at=time.time());
     root() ++> graph;
-    graph.turn_count = 3;   # so turns 1 and 2 are eligible
+    graph.turn_count = 3;  # so turns 1 and 2 are eligible
 
     # Older message + tool result the extractor will summarise.
     graph.record_message(role="user", turn=1, content="check the config");
@@ -90,15 +89,16 @@ with entry {
 
     # Sanity: before compaction, originals are visible.
     pre_visible_msgs = [
-        m for m in [graph -->][?:ContextMessage] if m.visible
+        m
+        for m in [graph-->][?:ContextMessage]
+        if m.visible
     ];
     pre_visible_trs = [
-        tr for tr in [graph -->][?:ContextToolResult] if tr.visible
+        tr
+        for tr in [graph-->][?:ContextToolResult]
+        if tr.visible
     ];
-    print(
-        f"pre: visible msgs={len(pre_visible_msgs)} "
-        f"trs={len(pre_visible_trs)}"
-    );
+    print(f"pre: visible msgs={len(pre_visible_msgs)} " f"trs={len(pre_visible_trs)}");
 
     # Run typed-slot compaction. mt_run is unused inside compact for
     # this policy, so passing None is fine.
@@ -118,14 +118,16 @@ with entry {
 
     # Re-check graph state.
     post_visible_msgs = [
-        m for m in [graph -->][?:ContextMessage] if m.visible
+        m
+        for m in [graph-->][?:ContextMessage]
+        if m.visible
     ];
     post_visible_trs = [
-        tr for tr in [graph -->][?:ContextToolResult] if tr.visible
+        tr
+        for tr in [graph-->][?:ContextToolResult]
+        if tr.visible
     ];
-    summary_nodes = [
-        s for s in [graph -->][?:ContextCompactionSummary]
-    ];
+    summary_nodes = [s for s in [graph-->][?:ContextCompactionSummary]];
     print(
         f"post: visible msgs={len(post_visible_msgs)} "
         f"trs={len(post_visible_trs)} summaries={len(summary_nodes)}"
@@ -140,31 +142,22 @@ with entry {
         print("FAIL  compact returned None");
     }
 
-    if (
-        summary is not None
-        and "keepalive_seconds = 47" in summary.summary_text
-    ) {
+    if (summary is not None and "keepalive_seconds = 47" in summary.summary_text) {
         print("PASS  summary_text contains 'keepalive_seconds = 47' verbatim");
     } else {
         failures += 1;
-        print(
-            "FAIL  summary_text missing the keepalive_seconds=47 marker"
-        );
+        print("FAIL  summary_text missing the keepalive_seconds=47 marker");
     }
 
     if (
-        summary is not None
-        and "RATE_LIMIT_BURST_CAPACITY = 83" in summary.summary_text
+        summary is not None and "RATE_LIMIT_BURST_CAPACITY = 83" in summary.summary_text
     ) {
         print(
-            "PASS  summary_text contains "
-            "'RATE_LIMIT_BURST_CAPACITY = 83' verbatim"
+            "PASS  summary_text contains " "'RATE_LIMIT_BURST_CAPACITY = 83' verbatim"
         );
     } else {
         failures += 1;
-        print(
-            "FAIL  summary_text missing the burst_capacity=83 marker"
-        );
+        print("FAIL  summary_text missing the burst_capacity=83 marker");
     }
 
     if len(post_visible_msgs) < len(pre_visible_msgs) {
@@ -191,9 +184,7 @@ with entry {
         print("PASS  exactly one ContextCompactionSummary node attached");
     } else {
         failures += 1;
-        print(
-            f"FAIL  expected 1 summary node, got {len(summary_nodes)}"
-        );
+        print(f"FAIL  expected 1 summary node, got {len(summary_nodes)}");
     }
 
     if failures > 0 {

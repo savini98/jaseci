@@ -1,6 +1,6 @@
 """Reference-detection smoke test.
 
-Validates the post-Stage-3 fixes:
+Validates:
 
 - After an assistant turn, `record_references_from_text` bumps
   `reference_count` and `last_referenced_at` on prior tool results whose
@@ -43,33 +43,31 @@ def fetch_settings() -> str {
 
 glob ctx = Context(persist=True);
 
-
 glob llm = Model(
-    model_name="mockllm",
-    config={
-        "outputs": [
-            # Turn 1: tool call then a generic acknowledgement.
-            # Importantly, the turn-1 final answer mentions NO identifiers
-            # from fetch_settings — the same-turn citation guard would
-            # skip them even if it did, so we save the actual citation
-            # for turn 2.
-            MockToolCall(tool=fetch_settings, args={}),
-            "Looked it up.",
-            # Turn 2: no tool call. Assistant echoes identifiers from
-            # turn-1's tool result. This is the cross-turn citation that
-            # record_references_from_text must detect.
-            "Found MAX_TOKEN_REFRESH_ATTEMPTS — looks reasonable.",
-            # Turn 3: control. Assistant says something unrelated; the
-            # turn-1 tool result's reference signal must NOT advance.
-            "All checks completed, nothing else to report.",
-        ]
-    },
-);
+         model_name="mockllm",
+         config={
+             "outputs": [
+                 # Turn 1: tool call then a generic acknowledgement.
+                 # Importantly, the turn-1 final answer mentions NO identifiers
+                 # from fetch_settings — the same-turn citation guard would
+                 # skip them even if it did, so we save the actual citation
+                 # for turn 2.
+                 MockToolCall(tool=fetch_settings, args={}),
+                 "Looked it up.",
+                 # Turn 2: no tool call. Assistant echoes identifiers from
+                 # turn-1's tool result. This is the cross-turn citation that
+                 # record_references_from_text must detect.
+                 "Found MAX_TOKEN_REFRESH_ATTEMPTS — looks reasonable.",
+                 # Turn 3: control. Assistant says something unrelated; the
+                 # turn-1 tool result's reference signal must NOT advance.
+                 "All checks completed, nothing else to report.",
+
+             ]
+         },
+     );
 
 
-def investigate(query: str) -> str by llm(
-    tools=[fetch_settings], context=ctx
-);
+def investigate(query: str) -> str by llm(tools=[fetch_settings], context=ctx);
 
 
 def follow_up(query: str) -> str by llm(context=ctx);
@@ -86,7 +84,7 @@ with entry {
     }
 
     settings_tr: ContextToolResult | None = None;
-    for tr in [g -->][?:ContextToolResult] {
+    for tr in [g-->][?:ContextToolResult] {
         if tr.tool_name == "fetch_settings" {
             settings_tr = tr;
         }
@@ -109,14 +107,14 @@ with entry {
 
     # Locate the assistant message that did the citing (turn == 2).
     turn2_asst: ContextMessage | None = None;
-    for m in [g -->][?:ContextMessage] {
+    for m in [g-->][?:ContextMessage] {
         if m.role == "assistant" and m.turn == 2 {
             turn2_asst = m;
         }
     }
     edge_targets_t2: list[ContextToolResult] = [];
     if turn2_asst is not None {
-        for tr in [turn2_asst ->:ReferencedBy:->][?:ContextToolResult] {
+        for tr in [turn2_asst->:ReferencedBy:->][?:ContextToolResult] {
             edge_targets_t2.append(tr);
         }
     }
@@ -139,8 +137,7 @@ with entry {
     } else {
         failures += 1;
         print(
-            f"FAIL  reference_count not bumped "
-            f"(got {settings_tr.reference_count})"
+            f"FAIL  reference_count not bumped " f"(got {settings_tr.reference_count})"
         );
     }
 

@@ -2,8 +2,8 @@
 
 The harder case: the agent uses tools (the model calls read_file once),
 then produces a final structured response. The streaming + structured
-return + tools combination is what the research vision requires —
-"answer + citations in the same call" alongside genuine tool use.
+return + tools combination delivers "answer + citations in the same
+call" alongside genuine tool use.
 
 Validates:
 - The agent can declare `def f(...) -> SomeObj by llm(tools=[...], stream=True)`
@@ -37,27 +37,26 @@ obj StructuredAnswer {
 
 
 glob llm = Model(
-    model_name="mockllm",
-    config={
-        "outputs": [
-            # Iteration 1: model decides to call fetch_doc
-            MockToolCall(tool=fetch_doc, args={"doc_id": "tr_2"}),
-            # Iteration 2: model decides it's done; calls finish_tool
-            MockToolCall(
-                tool=finish_tool,
-                args={
-                    "answer": "the rate limit is 750 req/min",
-                    "citations": ["tr_2"]
-                }
-            ),
-            # _stream_final_answer's streaming follow-up: typed mode strips
-            # tools and re-prompts, MockLLM emits the structured JSON which
-            # gets extracted by StreamingFieldExtractor.
-            '{"answer": "the rate limit is 750 req/min", '
-            '"citations": ["tr_2"]}'
-        ]
-    },
-);
+         model_name="mockllm",
+         config={
+             "outputs": [
+                 # Iteration 1: model decides to call fetch_doc
+                 MockToolCall(tool=fetch_doc, args={"doc_id": "tr_2"}),
+                 # Iteration 2: model decides it's done; calls finish_tool
+                 MockToolCall(
+                     tool=finish_tool,
+                     args={
+                         "answer": "the rate limit is 750 req/min",
+                         "citations": ["tr_2"]
+                     }
+                 ),
+                 # _stream_final_answer's streaming follow-up: typed mode strips
+                 # tools and re-prompts, MockLLM emits the structured JSON which
+                 # gets extracted by StreamingFieldExtractor.
+                 '{"answer": "the rate limit is 750 req/min", ' '"citations": ["tr_2"]}'
+             ]
+         },
+     );
 
 
 """Investigate and produce a structured answer with citations."""

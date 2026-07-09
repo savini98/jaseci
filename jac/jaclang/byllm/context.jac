@@ -1,28 +1,28 @@
 """Context primitives for byLLM agents.
 
-This module is the foundation of byLLM's built-in memory layer. The agent
-author opts in by passing `context=Context(...)` to a `by llm()` declaration.
-byLLM then auto-records tool results and messages into a per-agent
-`ContextGraph` and exposes the graph back to the caller for inspection.
+This module is the foundation of byLLM's built-in context management
+layer. The agent author opts in by passing `context=Context(...)` to a
+`by llm()` call. byLLM then auto-records tool results and messages into a
+per-agent `ContextGraph` and exposes the graph back to the caller for
+inspection. An optional `ContextPolicy` (age-based, reference-aware, or
+caller-defined) acts on that graph at iteration boundaries: pruning old
+tool results, compacting old turns into summaries, and rebuilding the
+LLM message list from the graph.
 
-Stage 2 deliberately stops at observability: the graph is populated, but
-no pruning or compaction policy acts on it. Subsequent stages add the
-`ContextPolicy` interface and built-in policies (age-based,
-reference-aware, typed-slot compaction) that operate on the same graph.
-
-Layout:
-
+Design:
   - `Context`              — public config object passed at the call site.
-                            Holds the live `ContextGraph` after first call.
-  - `ContextGraph`         — node attached to `root()` (or standalone when
-                            persist=False). Owns the per-session state.
+                             Holds the live `ContextGraph` after first call.
+  - `ContextGraph`         — node attached to `root()`. Owns the
+                             per-session state.
   - `ContextToolResult`    — one node per tool execution. Carries
-                            full_content (never truncated) and
-                            visible_content (what the LLM sees).
+                             full_content (never truncated) and
+                             visible_content (what the LLM sees).
   - `ContextMessage`       — one node per user/assistant/tool message.
-  - `ContextCompactionSummary` — placeholder for Stage 3+ summarisation.
-  - `ReferencedBy`        — edge from ContextMessage to ContextToolResult,
-                            written by Stage 5's citation channel.
+  - `ContextCompactionSummary` — one node per compaction pass; replaces
+                             the turns it covers in the materialized list.
+  - `ReferencedBy`         — edge from ContextMessage to ContextToolResult,
+                             written by reference detection when an
+                             assistant reply cites a tool result.
 
 ID scheme: `tr_<turn>_<tool_name>_<seq>` for tool results,
 `msg_<turn>_<role>_<seq>` for messages. Stable within a session.
@@ -43,7 +43,7 @@ node ContextGraph {
         _tr_seq: int = 0,
         _msg_seq: int = 0,
         # Free-form stats bag for telemetry/analysis (token counts,
-        # eviction history, etc.). Stage 3+ policies populate this.
+        # eviction history, etc.). Policies populate this.
         stats: dict = {};
 
     def mint_tool_result_id(turn: int, tool_name: str) -> str;
@@ -57,6 +57,7 @@ node ContextGraph {
         truncation_state: str = "full",
         call_id: str = ""
     ) -> object;
+
     def record_message(
         role: str,
         turn: int,
@@ -143,7 +144,9 @@ def apply_eviction_decision(decision: object) -> int {
     }
     before = len(getattr(tr, "visible_content", "")) // 4;
     if kind == "hard_clear" {
-        tr.visible_content = getattr(decision, "placeholder", "[Old tool result content cleared]");
+        tr.visible_content = getattr(
+            decision, "placeholder", "[Old tool result content cleared]"
+        );
         tr.truncation_state = "hard_cleared";
     } elif kind == "soft_trim" {
         head = int(getattr(decision, "head_chars", 1500));
@@ -171,14 +174,14 @@ trivial for subclassing policies.
 """
 obj EvictionDecision {
     has tool_result: ContextToolResult,
-        kind: str = "skip",       # skip | soft_trim | hard_clear
+        kind: str = "skip",  # skip | soft_trim | hard_clear
         head_chars: int = 1500,
         tail_chars: int = 1500,
         placeholder: str = "[Old tool result content cleared]";
 }
 
 
-"""Strategy interface for memory pruning, compaction, and materialization.
+"""Strategy interface for context pruning, compaction, and materialization.
 
 Concrete policies subclass this. The default methods are no-ops so a
 caller-supplied policy can override only what it needs (e.g. only the
@@ -203,13 +206,12 @@ into the policy at well-defined boundaries:
 """
 obj ContextPolicy {
     def should_prune(graph: ContextGraph, mt_run: object) -> bool;
-    def select_eviction(
-        graph: ContextGraph, mt_run: object
-    ) -> list[EvictionDecision];
+    def select_eviction(graph: ContextGraph, mt_run: object) -> list[EvictionDecision];
     def should_compact(graph: ContextGraph, mt_run: object) -> bool;
     def compact(
         graph: ContextGraph, mt_run: object
     ) -> ContextCompactionSummary | None;
+
     def materialize(graph: ContextGraph, mt_run: object) -> list | None;
 }
 
@@ -234,27 +236,24 @@ impl ContextPolicy.compact(
     return None;
 }
 
-impl ContextPolicy.materialize(
-    graph: ContextGraph, mt_run: object
-) -> list | None {
+impl ContextPolicy.materialize(graph: ContextGraph, mt_run: object) -> list | None {
     return None;
 }
 
 
-"""Age-based memory policy — the framework default.
+"""Age-based context policy — the simplest built-in.
 
-Compaction-only for now. Fires `should_compact` when the visible
-memory-resident token estimate (sum of ContextMessage.token_estimate +
-estimated tokens of visible ContextToolResult.visible_content) crosses a
-configurable threshold against `usable_budget_tokens`. Compaction picks
-the oldest items beyond a `preserve_recent_turns` window and replaces
-them with a synthetic placeholder summary.
+Compaction-only: `should_compact` fires when the visible token estimate
+(sum of ContextMessage.token_estimate + estimated tokens of visible
+ContextToolResult.visible_content) crosses a configurable threshold
+against `usable_budget_tokens`. Compaction picks the oldest items beyond
+a `preserve_recent_turns` window and replaces them with a synthetic
+placeholder summary built from the eligible content's first lines.
 
-This is a deliberately simple default. A future ReferenceAwarePolicy
-(Stage 4) will subclass it and replace `select_eviction` /
-`compact` with its score-based variants. A LLM-backed compactor will
-override `compact` to call out to byLLM; this base version returns a
-free-form text summary built from the eligible content's first lines.
+Serves as the base for richer policies: `ReferenceAwarePolicy` (below)
+adds score-based eviction, and `TypedSlotCompactionPolicy`
+(typed_compaction.jac) replaces the free-form summary with an LLM-backed
+structured extraction.
 
 Configurable parameters:
   - `usable_budget_tokens`     : the token budget the policy aims to stay under
@@ -270,9 +269,8 @@ obj AgePolicy(ContextPolicy) {
     override def compact(
         graph: ContextGraph, mt_run: object
     ) -> ContextCompactionSummary | None;
-    override def materialize(
-        graph: ContextGraph, mt_run: object
-    ) -> list | None;
+
+    override def materialize(graph: ContextGraph, mt_run: object) -> list | None;
 }
 
 
@@ -281,18 +279,18 @@ impl AgePolicy.should_compact(graph: ContextGraph, mt_run: object) -> bool {
         return False;
     }
     total_tokens = 0;
-    for m in [graph -->](?:ContextMessage) {
+    for m in [graph-->][?:ContextMessage] {
         if m.visible {
             total_tokens += m.token_estimate;
         }
     }
-    for tr in [graph -->](?:ContextToolResult) {
+    for tr in [graph-->][?:ContextToolResult] {
         if tr.visible {
-            # Approximate tokens at chars/4 — matches research-agent default.
+            # Approximate tokens at chars/4.
             total_tokens += len(tr.visible_content) // 4;
         }
     }
-    for s in [graph -->](?:ContextCompactionSummary) {
+    for s in [graph-->][?:ContextCompactionSummary] {
         if s.visible {
             total_tokens += s.token_estimate;
         }
@@ -310,18 +308,21 @@ impl AgePolicy.compact(
         return None;
     }
     msgs_to_compact = [
-        m for m in [graph -->](?:ContextMessage)
+        m
+        for m in [graph-->][?:ContextMessage]
         if m.visible and m.turn <= cutoff
     ];
     trs_to_compact = [
-        tr for tr in [graph -->](?:ContextToolResult)
+        tr
+        for tr in [graph-->][?:ContextToolResult]
         if tr.visible and tr.produced_at_turn <= cutoff
     ];
     if not msgs_to_compact and not trs_to_compact {
         return None;
     }
     # Build a minimal free-form summary from the eligible content's first
-    # lines. A future LLM-backed AgePolicy variant overrides this method.
+    # lines. LLM-backed variants (e.g. TypedSlotCompactionPolicy) override
+    # this method.
     snippets = [];
     for m in msgs_to_compact {
         head = m.content.split("\n")[0][:120];
@@ -391,12 +392,10 @@ Invariants this design relies on:
   together (both selected by `turn <= cutoff`). So compaction also
   preserves pair-matching: both absent.
 
-This is why no "drop orphaned tool_use" logic is needed in v0 — the
-graph's own consistency guarantees the materialized list is valid.
+This is why no "drop orphaned tool_use" logic is needed — the graph's
+own consistency guarantees the materialized list is valid.
 """
-impl AgePolicy.materialize(
-    graph: ContextGraph, mt_run: object
-) -> list | None {
+impl AgePolicy.materialize(graph: ContextGraph, mt_run: object) -> list | None {
     out: list = [];
 
     # 1. System messages from mt_run.messages — these live outside the
@@ -415,24 +414,28 @@ impl AgePolicy.materialize(
 
     # 2. Visible compaction summaries inline.
     summaries: list = [
-        s for s in [graph -->][?:ContextCompactionSummary] if s.visible
+        s
+        for s in [graph-->][?:ContextCompactionSummary]
+        if s.visible
     ];
     summaries.sort(key=lambda s: ContextCompactionSummary : s.covers_turn_end);
     for s in summaries {
-        out.append(Message(
-            role=MessageRole.USER,
-            content=(
-                f"[Summary of turns {s.covers_turn_start}-"
-                f"{s.covers_turn_end}]\n{s.summary_text}"
+        out.append(
+            Message(
+                role=MessageRole.USER,
+                content=(
+                    f"[Summary of turns {s.covers_turn_start}-"
+                    f"{s.covers_turn_end}]\n{s.summary_text}"
+                )
             )
-        ));
+        );
     }
 
     # 3. Build a fast lookup from call_id → ContextToolResult so we can
     # pair each tool_use block back to its result in O(1) instead of
     # scanning the graph per tool call.
     tr_by_call_id: dict = {};
-    for tr in [graph -->][?:ContextToolResult] {
+    for tr in [graph-->][?:ContextToolResult] {
         if tr.visible and tr.call_id {
             tr_by_call_id[tr.call_id] = tr;
         }
@@ -441,7 +444,9 @@ impl AgePolicy.materialize(
     # 4. Visible ContextMessages in turn order, with their tool results
     # spliced in immediately after each assistant tool_calls turn.
     msgs: list = [
-        m for m in [graph -->][?:ContextMessage] if m.visible
+        m
+        for m in [graph-->][?:ContextMessage]
+        if m.visible
     ];
     msgs.sort(key=lambda m: ContextMessage : m.turn);
     for m in msgs {
@@ -468,20 +473,24 @@ impl AgePolicy.materialize(
                     tc_id_s: str = str(tc.get("id", ""));
                     tc_name_s: str = str(tc.get("name", ""));
                     tc_args_obj = tc.get("args", {});
-                    tcs_serialized.append({
-                        "id": tc_id_s,
-                        "type": "function",
-                        "function": {
-                            "name": tc_name_s,
-                            "arguments": json.dumps(tc_args_obj)
+                    tcs_serialized.append(
+                        {
+                            "id": tc_id_s,
+                            "type": "function",
+                            "function": {
+                                "name": tc_name_s,
+                                "arguments": json.dumps(tc_args_obj)
+                            }
                         }
-                    });
+                    );
                 }
-                out.append({
-                    "role": "assistant",
-                    "content": str(m.content),
-                    "tool_calls": tcs_serialized
-                });
+                out.append(
+                    {
+                        "role": "assistant",
+                        "content": str(m.content),
+                        "tool_calls": tcs_serialized
+                    }
+                );
                 # Emit each matching tool result. visible_content
                 # carries whatever pruning decided — placeholder if
                 # hard_cleared, head+tail if soft_trimmed, full
@@ -494,20 +503,24 @@ impl AgePolicy.materialize(
                     tc_name_s2: str = str(tc.get("name", "")) or "unknown";
                     tr = tr_by_call_id.get(tc_id_s2);
                     if tr is not None {
-                        out.append(ToolCallResultMsg(
-                            content=str(tr.visible_content),
-                            tool_call_id=tc_id_s2,
-                            name=str(tr.tool_name)
-                        ));
+                        out.append(
+                            ToolCallResultMsg(
+                                content=str(tr.visible_content),
+                                tool_call_id=tc_id_s2,
+                                name=str(tr.tool_name)
+                            )
+                        );
                     } else {
                         # Defensive stub: keeps tool_use_id matched
                         # when no ContextToolResult was recorded.
                         # Shouldn't happen in practice.
-                        out.append(ToolCallResultMsg(
-                            content="[tool result not recorded]",
-                            tool_call_id=tc_id_s2,
-                            name=tc_name_s2
-                        ));
+                        out.append(
+                            ToolCallResultMsg(
+                                content="[tool result not recorded]",
+                                tool_call_id=tc_id_s2,
+                                name=tc_name_s2
+                            )
+                        );
                     }
                 }
             } else {
@@ -526,14 +539,10 @@ reference detection. Two patterns chosen to over-index on content
 identifiers and under-index on prose: snake/camel identifiers ≥ 6 chars
 and ALL-CAPS tokens. Path-like matches (containing a slash) are
 deliberately excluded — generic project paths appear in many tool
-outputs and inflate ref counts spuriously (verified empirically in
-direction-1-results.md round 5).
+outputs and inflate reference counts spuriously.
 """
 def extract_identifiers(text: str, min_len: int = 6) -> list[str] {
-    idents = re.findall(
-        r"[A-Za-z_][A-Za-z0-9_]{" + str(min_len - 1) + r",}",
-        text
-    );
+    idents = re.findall(r"[A-Za-z_][A-Za-z0-9_]{" + str(min_len - 1) + r",}", text);
     caps = re.findall(r"\b[A-Z][A-Z0-9_]{3,}\b", text);
     seen: dict = {};
     out: list[str] = [];
@@ -572,14 +581,14 @@ def record_references_from_text(
     # The append-only graph means "the most recent assistant message at
     # current_turn" is the one record_message just produced.
     cite_source: ContextMessage | None = None;
-    for m in [graph -->][?:ContextMessage] {
+    for m in [graph-->][?:ContextMessage] {
         if m.role == "assistant" and m.turn == current_turn {
             cite_source = m;
         }
     }
 
     detections = 0;
-    for tr in [graph -->](?:ContextToolResult) {
+    for tr in [graph-->][?:ContextToolResult] {
         if tr.produced_at_turn >= current_turn {
             continue;
         }
@@ -604,17 +613,15 @@ def record_references_from_text(
 }
 
 
-"""Reference-aware memory policy.
+"""Reference-aware context policy.
 
 Inherits AgePolicy's compaction behavior. Overrides `should_prune` and
 `select_eviction` to score visible ContextToolResults on
 (reference_count, recency, age, size) and pick eviction order from
-lowest-score upward. Stops eviction as soon as the visible tool-result
-fill drops below `target_ratio * usable_budget_tokens` — the
-`<=` early-stop variant proven in direction-1-results.md round 6.
-
-Calibrated weights and behavior match the research-agent baseline that
-produced 0/3 → 3/3 recall improvement at OVERFLOW_USABLE_TOKENS=3000.
+lowest-score upward: content the assistant has actually cited is
+preserved through pressure while unreferenced results are evicted
+first. Stops evicting as soon as the visible tool-result fill drops to
+`target_ratio * usable_budget_tokens`.
 """
 obj ReferenceAwarePolicy(AgePolicy) {
     has weight_ref_count: float = 10.0,
@@ -642,12 +649,12 @@ impl ReferenceAwarePolicy.should_prune(graph: ContextGraph, mt_run: object) -> b
         return False;
     }
     total_tokens = 0;
-    for m in [graph -->](?:ContextMessage) {
+    for m in [graph-->][?:ContextMessage] {
         if m.visible {
             total_tokens += m.token_estimate;
         }
     }
-    for tr in [graph -->](?:ContextToolResult) {
+    for tr in [graph-->][?:ContextToolResult] {
         if tr.visible {
             total_tokens += len(tr.visible_content) // 4;
         }
@@ -657,17 +664,14 @@ impl ReferenceAwarePolicy.should_prune(graph: ContextGraph, mt_run: object) -> b
 }
 
 
-impl ReferenceAwarePolicy._score(
-    tr: ContextToolResult, current_turn: int
-) -> float {
+impl ReferenceAwarePolicy._score(tr: ContextToolResult, current_turn: int) -> float {
     age = float(current_turn - tr.produced_at_turn);
     size_tokens = float(len(tr.visible_content) // 4);
     recency = 1.0 if tr.last_referenced_at > 0.0 else 0.0;
     return (
-        self.weight_ref_count * float(tr.reference_count)
-        + self.weight_recency * recency
-        + self.weight_age * age
-        + self.weight_size * (size_tokens / 1000.0)
+        self.weight_ref_count * float(tr.reference_count) + self.weight_recency * recency + self.weight_age * age + self.weight_size * (
+            size_tokens / 1000.0
+        )
     );
 }
 
@@ -677,27 +681,26 @@ impl ReferenceAwarePolicy.select_eviction(
 ) -> list[EvictionDecision] {
     keep_floor = graph.turn_count - self.keep_last_turns;
     candidates = [
-        tr for tr in [graph -->](?:ContextToolResult)
+        tr
+        for tr in [graph-->][?:ContextToolResult]
         if tr.visible
-            and tr.truncation_state != "hard_cleared"
-            and tr.produced_at_turn <= keep_floor
+        and tr.truncation_state != "hard_cleared"
+        and tr.produced_at_turn <= keep_floor
     ];
     current_turn = graph.turn_count;
-    candidates.sort(
-        key=lambda tr: ContextToolResult : self._score(tr, current_turn)
-    );
+    candidates.sort(key=lambda tr: ContextToolResult : self._score(tr, current_turn));
 
     # Compute starting tool-result token total and evict-mode threshold.
     running_tool_tokens = 0;
     total_tokens = 0;
-    for tr_all in [graph -->](?:ContextToolResult) {
+    for tr_all in [graph-->][?:ContextToolResult] {
         if tr_all.visible {
             tk = len(tr_all.visible_content) // 4;
             running_tool_tokens += tk;
             total_tokens += tk;
         }
     }
-    for m in [graph -->](?:ContextMessage) {
+    for m in [graph-->][?:ContextMessage] {
         if m.visible {
             total_tokens += m.token_estimate;
         }
@@ -713,18 +716,21 @@ impl ReferenceAwarePolicy.select_eviction(
     decisions: list[EvictionDecision] = [];
     for tr in candidates {
         # Early-stop: stop evicting once tool-result fill is at or below
-        # target. The `<=` (not `<`) is load-bearing — round 6 finding.
+        # target. `<=` (not `<`) so hitting the target exactly does not
+        # evict one extra candidate.
         if running_tool_tokens <= target {
             break;
         }
         before = len(tr.visible_content) // 4;
         kind = "hard_clear" if hard_mode else "soft_trim";
-        decisions.append(EvictionDecision(
-            tool_result=tr,
-            kind=kind,
-            head_chars=self.soft_head_chars,
-            tail_chars=self.soft_tail_chars
-        ));
+        decisions.append(
+            EvictionDecision(
+                tool_result=tr,
+                kind=kind,
+                head_chars=self.soft_head_chars,
+                tail_chars=self.soft_tail_chars
+            )
+        );
         # Estimate post-decision visible tokens (placeholder ≈ 8 tokens
         # for hard, head+tail+marker ≈ before for tiny soft trims).
         if kind == "hard_clear" {
@@ -742,7 +748,7 @@ impl ReferenceAwarePolicy.select_eviction(
 }
 
 
-"""Public memory config. Pass to `by llm(context=...)` to opt in.
+"""Public context config. Pass to `by llm(context=...)` to opt in.
 
 Holds the live `ContextGraph` after the first call so the caller can
 inspect it. With `persist=True` the same graph is reused across
@@ -751,10 +757,10 @@ invocations of the decorated function (within the same process). With
 discarding the previous one.
 
 Optional `policy` is the strategy interface for pruning/compaction/
-materialization. When None (default for Stage 2), byLLM records into
-the graph but doesn't act on it. When set, byLLM dispatches to the
-policy's hooks at iteration boundaries, replacing the framework's
-inline compaction code path.
+materialization. When None (the default), byLLM records into the graph
+but doesn't act on it. When set, byLLM dispatches to the policy's hooks
+at iteration boundaries, replacing the framework's inline compaction
+code path.
 """
 obj Context {
     has persist: bool = True,
@@ -831,12 +837,9 @@ impl Context.get_or_create_graph() -> ContextGraph {
     if self.graph is not None and self.persist {
         return self.graph;
     }
-    new_graph = ContextGraph(
-        session_id=self.session_id,
-        created_at=time.time()
-    );
+    new_graph = ContextGraph(session_id=self.session_id, created_at=time.time());
     # Attach to the Jac root so the graph is part of the persistent
-    # graph layer. Caller can also reach it via `mem.graph` directly.
+    # graph layer. Caller can also reach it via `Context.graph` directly.
     root() ++> new_graph;
     self.graph = new_graph;
     return new_graph;

@@ -16,8 +16,7 @@ obj Pick {
 }
 
 glob llm: MockLLM = MockLLM(
-         model_name="mockllm",
-         config={"outputs": ['{"answer": "b", "choices": [1]}']}
+         model_name="mockllm", config={"outputs": ['{"answer": "b", "choices": [1]}']}
      );
 
 def pick(options: str) -> Pick by llm(stream=True);

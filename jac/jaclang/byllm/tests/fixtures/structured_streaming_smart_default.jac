@@ -20,14 +20,14 @@ obj BriefingReply {
 
 
 glob llm = Model(
-    model_name="mockllm",
-    config={
-        "outputs": [
-            '{"summary": "rate limit raised to 750 req/min for prod", '
-            '"key_points": ["750 req/min cap", "rolled out 2026-Q1"]}'
-        ]
-    },
-);
+         model_name="mockllm",
+         config={
+             "outputs": [
+                 '{"summary": "rate limit raised to 750 req/min for prod", '
+                 '"key_points": ["750 req/min cap", "rolled out 2026-Q1"]}'
+             ]
+         },
+     );
 
 
 def brief(topic: str) -> BriefingReply by llm(stream=True);
