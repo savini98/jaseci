@@ -418,7 +418,7 @@ impl AgePolicy.materialize(graph: ContextGraph, mt_run: object) -> list | None {
         for s in [graph-->][?:ContextCompactionSummary]
         if s.visible
     ];
-    summaries.sort(key=lambda s: ContextCompactionSummary : s.covers_turn_end);
+    summaries.sort(key=lambda (s: ContextCompactionSummary) { s.covers_turn_end; });
     for s in summaries {
         out.append(
             Message(
@@ -448,7 +448,7 @@ impl AgePolicy.materialize(graph: ContextGraph, mt_run: object) -> list | None {
         for m in [graph-->][?:ContextMessage]
         if m.visible
     ];
-    msgs.sort(key=lambda m: ContextMessage : m.turn);
+    msgs.sort(key=lambda (m: ContextMessage) { m.turn; });
     for m in msgs {
         if m.role == "system" {
             # Already emitted from mt_run above; skip.
@@ -688,7 +688,7 @@ impl ReferenceAwarePolicy.select_eviction(
         and tr.produced_at_turn <= keep_floor
     ];
     current_turn = graph.turn_count;
-    candidates.sort(key=lambda tr: ContextToolResult : self._score(tr, current_turn));
+    candidates.sort(key=lambda (tr: ContextToolResult) { self._score(tr, current_turn); });
 
     # Compute starting tool-result token total and evict-mode threshold.
     running_tool_tokens = 0;

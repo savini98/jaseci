@@ -190,7 +190,7 @@ impl TypedSlotCompactionPolicy.compact(
             }
         );
     }
-    items.sort(key=lambda x: dict : x["turn"]);
+    items.sort(key=lambda (x: dict) { x["turn"]; });
 
     prior_visible = [
         s
