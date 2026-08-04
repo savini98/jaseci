@@ -158,6 +158,38 @@ Legend: `[≡]` = value-equivalence of a lowered check.
                           ✅ TRANSFORM
 ```
 
+#### 4.1.1 Why both `torch.where` and `torch.cond`, and when each fires
+
+`torch.where` is an ordinary Python call, so **both** operands are evaluated
+before it dispatches:
+
+```python
+torch.where(c, f(x), g(x))     # runs f AND g, whichever way c goes
+```
+
+For a symmetric pair (bare names, pure arithmetic) that is harmless and is what
+the rule emits. For an *asymmetric call* pair -- `x = f(a)` versus `x = g(b)` --
+it would execute the untaken branch's call, which is not merely wasteful: it
+violates INV2 whenever that call is only valid under its own predicate. So the
+`torch.cond` form is a **soundness** mechanism for that shape, not a performance
+preference, and removing it would make those rewrites unsafe rather than slower.
+
+This is worth stating precisely because the two are easy to conflate.
+`torch.cond` is the worse choice *on the merits it is usually compared on*: in
+the standard TorchInductor path it introduces CPU-GPU synchronization for branch
+dispatch and disables CUDA Graph capture for the containing region, which is why
+`torch.where` is the default wherever it is legal. The selection is therefore
+ordered by legality first and cost second: `where` unless a branch value contains
+a call, `cond` when it does.
+
+**Measured frequency.** Across the shared top-level `transformers.modeling_*`
+modules and ten model packages, exactly one branch rewrite occurs in the paper's
+benchmark code (Phi-4's `longrope_frequency_update`) and it takes the `where`
+path. `_use_cond` fires **zero** times on the suite, so no reported speedup
+depends on the `cond` form. The path is exercised by the `cond_assign.jac`
+fixture and pinned by
+`test_asymmetric_call_branches_become_torch_cond_runs_one_branch`.
+
 ### 4.2 Deferred Side Effects (`print / logger.* → buffer/slot + epilogue flush`)
 
 ```

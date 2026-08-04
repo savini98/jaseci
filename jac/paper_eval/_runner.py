@@ -49,8 +49,18 @@ def main(key: str, mode: str) -> None:
     if t is None and isinstance(out, (tuple, list)):
         t = out[0]
     h = hashlib.sha256(t.detach().float().cpu().numpy().tobytes()).hexdigest()[:16] if t is not None else None
+    # Report the input shape actually used. The paper states that the original
+    # and transformed runs share a batch size and identical inputs; emitting the
+    # shape per mode makes that checkable from the artifact rather than asserted,
+    # and the off/on rows must agree.
+    shape = None
+    for v in inputs.values():
+        if hasattr(v, "shape"):
+            shape = list(v.shape)
+            break
     print(json.dumps({"key": key, "mode": mode, "graphs": len(graphs),
-                      "breaks": max(0, len(graphs) - 1), "out_hash": h, "error": None}))
+                      "breaks": max(0, len(graphs) - 1), "out_hash": h,
+                      "in_shape": shape, "error": None}))
 
 
 if __name__ == "__main__":

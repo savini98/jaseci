@@ -41,14 +41,22 @@ def main(keys):
         fixed = b0 - b1
         pct = f"{100*fixed//b0 if b0 else 100}%"
         correct = "yes" if off["out_hash"] == on["out_hash"] else "NO"
+        # The off/on runs must use identical inputs for the comparison to mean
+        # anything; show the shape and flag a mismatch rather than trusting it.
+        s0, s1 = off.get("in_shape"), on.get("in_shape")
+        shape = "x".join(str(d) for d in (s0 or [])) or "-"
+        if s0 != s1:
+            shape += " MISMATCH"
         tot_before += b0; tot_after += b1
-        rows.append((key, b0, b1, pct, correct))
+        rows.append((key, b0, b1, pct, correct, shape))
 
-    print(f"\n{'model':28} {'breaks_before':>13} {'breaks_after':>12} {'fixed':>6} {'output_ok':>9}")
-    print("-" * 72)
+    print(f"\n{'model':28} {'breaks_before':>13} {'breaks_after':>12} "
+          f"{'fixed':>6} {'output_ok':>9} {'input':>12}")
+    print("-" * 85)
     for r in rows:
-        print(f"{r[0]:28} {str(r[1]):>13} {str(r[2]):>12} {str(r[3]):>6} {str(r[4]):>9}")
-    print("-" * 72)
+        print(f"{r[0]:28} {str(r[1]):>13} {str(r[2]):>12} "
+              f"{str(r[3]):>6} {str(r[4]):>9} {str(r[5] if len(r) > 5 else '-'):>12}")
+    print("-" * 85)
     if tot_before:
         print(f"{'TOTAL':28} {tot_before:>13} {tot_after:>12} "
               f"{100*(tot_before-tot_after)//tot_before:>5}% (eliminated {tot_before-tot_after}/{tot_before})")
