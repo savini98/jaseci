@@ -216,8 +216,12 @@ obj PredicateCtrlFlowPass(UniPass) {
                 return False;
             }
             if self._writes_attr(st, recv, key) {
-                # G2 -- the memoizing write; its value may contain the
-                # initializer call.
+                # G2 -- the memoizing write. Its value may contain the
+                # initializer call, but that call must itself be safe to
+                # speculate (G5).
+                if not self._init_value_safe(st.value) {
+                    return False;
+                }
                 memoized = True;
                 continue;
             }
@@ -230,6 +234,211 @@ obj PredicateCtrlFlowPass(UniPass) {
             return False;
         }
         return self._attr_confined(region, key);
+    }
+
+    """G5 -- every call in the memoizing initializer is safe to speculate.
+
+    Hoisting runs the initializer on executions where the original never would,
+    so it must be deterministic and non-raising there (the requirement stated for
+    this rule in the paper's semantics-preservation discussion). A call is
+    accepted only when its callee resolves in this module to inspectable code
+    that `_body_pure_nonraising` clears; an unresolvable callee is declined.
+    """
+    def _init_value_safe(v: (uni.Expr | None)) -> bool {
+        if v is None {
+            return False;
+        }
+        calls = [v] if isinstance(v, uni.FuncCall) else [];
+        calls = calls + list(v.get_all_sub_nodes(uni.FuncCall));
+        for c in calls {
+            if not self._call_speculatable(c) {
+                return False;
+            }
+        }
+        return True;
+    }
+
+    """True if `c`'s callee resolves in-module and its body is pure/non-raising.
+
+    Two callee shapes resolve. A bare `f(...)` resolves to a module-level `f`.
+    An attribute callee `self.f(...)` cannot be resolved from a single module --
+    the binding usually lives in whichever subclass module assigned it -- but the
+    common dispatch-table form is still decidable: when this module defines
+    exactly one module-level dict whose values are all local function names, the
+    callee can only be one of those, so ALL of them are checked and the call is
+    accepted only if every candidate clears. Anything else is declined.
+    """
+    def _call_speculatable(c: uni.FuncCall) -> bool {
+        mod = c.find_parent_of_type(uni.Module);
+        if mod is None {
+            return False;
+        }
+        t = c.target;
+        if isinstance(t, uni.Name) {
+            fn = self._module_fn(mod, t.value);
+            return (fn is not None) and self._body_pure_nonraising(fn, c);
+        }
+        if isinstance(t, uni.AtomTrailer) and isinstance(t.right, uni.Name) {
+            # Candidate set: every function reachable through any module-level
+            # dispatch table, narrowed to those that could actually accept THIS
+            # call. A function the call would raise TypeError on cannot be the
+            # callee, so excluding it is sound -- and it is what separates an
+            # init table from a same-shaped validation table whose entries take
+            # different parameters.
+            cands = [
+                fn
+                for fn in self._dispatch_table_fns(mod)
+                if self._signature_accepts(fn, c)
+            ];
+            if not cands {
+                return False;
+            }
+            for fn in cands {
+                if not self._body_pure_nonraising(fn, c) {
+                    return False;
+                }
+            }
+            return True;
+        }
+        return False;
+    }
+
+    """True if `fn` could accept the arguments `c` actually passes.
+
+    Sound narrowing of an unresolvable attribute callee: a function that the call
+    would fail on with TypeError is not the function being called. Checks the two
+    conditions a mismatched table entry trips -- too many positional arguments,
+    and a keyword the function neither names nor absorbs via `**kwargs`.
+    """
+    def _signature_accepts(fn: uni.Ability, c: uni.FuncCall) -> bool {
+        sig = fn.signature;
+        if (sig is None) or (not isinstance(sig, uni.FuncSignature)) {
+            return False;
+        }
+        named = set();
+        for p in (sig.get_parameters() or []) {
+            if p?.name is not None {
+                named.add(p.name.value);
+            }
+        }
+        n_pos = 0;
+        for prm in (c.params or []) {
+            if isinstance(prm, uni.KWPair) and (prm.key is not None) {
+                if (prm.key.value not in named) and (self._varkw_name(fn) is None) {
+                    return False;
+                }
+            } else {
+                n_pos += 1;
+            }
+        }
+        # `self` is not in the call's positional list for an attribute callee.
+        capacity = len(named) + (1 if sig.varargs is not None else 0);
+        return n_pos <= capacity;
+    }
+
+    """Find a module-level function named `name`."""
+    def _module_fn(mod: uni.Module, name: str) -> (uni.Ability | None) {
+        for ab in mod.get_all_sub_nodes(uni.Ability) {
+            if ab?.sym_name == name {
+                return ab;
+            }
+        }
+        return None;
+    }
+
+    """Every function reachable through a module-level dispatch table.
+
+    A dispatch table is a module-level dict literal whose values are all names of
+    functions defined in this module. The UNION across all such tables is
+    returned: which table an attribute callee was bound from is not knowable
+    module-locally, so every entry has to be considered a candidate. The caller
+    then narrows by signature compatibility.
+    """
+    def _dispatch_table_fns(mod: uni.Module) -> list {
+        out = [];
+        for a in mod.get_all_sub_nodes(uni.Assignment) {
+            d = a.value;
+            if not isinstance(d, uni.DictVal) {
+                continue;
+            }
+            fns = [];
+            ok = len(d.kv_pairs or []) > 0;
+            for kv in (d.kv_pairs or []) {
+                val = kv.value;
+                fn = self._module_fn(mod, val.value)
+                    if isinstance(val, uni.Name)
+                    else None;
+                if fn is None {
+                    ok = False;
+                    break;
+                }
+                fns.append(fn);
+            }
+            if ok {
+                out.extend(fns);
+            }
+        }
+        return out;
+    }
+
+    """True if `fn`'s body performs no observable effect and cannot raise at `c`.
+
+    Effects: any call whose callee is not itself a resolvable pure function is
+    treated as opaque and rejected, except calls on `torch`/`math` (pure tensor
+    and numeric construction).
+
+    Raises: a `raise` is permitted only when provably unreachable from THIS call
+    site. The accepted form is the standard varkwargs-validation idiom -- a raise
+    guarded by `len(<varkw>) > 0` / `<varkw>` where `<varkw>` is the callee's
+    `**kwargs` parameter -- which cannot fire when the call passes no keyword
+    outside the callee's named parameters.
+    """
+    def _body_pure_nonraising(
+        fn: uni.Ability, c: uni.FuncCall, seen: (set | None) = None
+    ) -> bool {
+        # Purity is transitive, so this recurses into locally-defined helpers.
+        # `seen` bounds mutual recursion; a function already being proved is
+        # treated as clean, which is the standard greatest-fixpoint reading.
+        marks = seen if seen is not None else set();
+        if id(fn) in marks {
+            return True;
+        }
+        marks.add(id(fn));
+        varkw = self._varkw_name(fn);
+        extra_kw = self._passes_extra_kwargs(fn, c);
+        raise_calls = set();
+        for r in fn.get_all_sub_nodes(uni.RaiseStmt) {
+            if (varkw is None)
+                or extra_kw
+                or (not self._guarded_by_varkw(r, varkw, fn)) {
+                return False;
+            }
+            for rc in r.get_all_sub_nodes(uni.FuncCall) {
+                raise_calls.add(id(rc));
+            }
+        }
+        mod = fn.find_parent_of_type(uni.Module);
+        for call in fn.get_all_sub_nodes(uni.FuncCall) {
+            # The exception constructor inside a raise we just proved unreachable
+            # is unreachable too, so it does not constrain purity.
+            if id(call) in raise_calls {
+                continue;
+            }
+            if self._pure_callee(call.target) {
+                continue;
+            }
+            # A call to another function in this module is fine when that
+            # function is itself pure and non-raising for its own arguments.
+            t = call.target;
+            local = self._module_fn(mod, t.value)
+                if (isinstance(t, uni.Name) and (mod is not None))
+                else None;
+            if (local is None)
+                or (not self._body_pure_nonraising(local, call, marks)) {
+                return False;
+            }
+        }
+        return True;
     }
 
     """Return `(receiver_text, key)` for `not hasattr(<recv>, "<literal>")`."""
@@ -317,6 +526,123 @@ obj PredicateCtrlFlowPass(UniPass) {
                 return True;
             }
             cur = cur.parent;
+        }
+        return False;
+    }
+
+    """Name of `fn`'s `**kwargs` parameter, or None if it has none."""
+    def _varkw_name(fn: uni.Ability) -> (str | None) {
+        sig = fn.signature;
+        if (sig is None) or (not isinstance(sig, uni.FuncSignature)) {
+            return None;
+        }
+        kw = sig.kwargs;
+        return kw.name.value if (kw is not None) and (kw.name is not None) else None;
+    }
+
+    """True if `c` passes a keyword the callee does not name -- i.e. something
+    that would actually land in `**kwargs` and make the validation raise fire."""
+    def _passes_extra_kwargs(fn: uni.Ability, c: uni.FuncCall) -> bool {
+        sig = fn.signature;
+        if (sig is None) or (not isinstance(sig, uni.FuncSignature)) {
+            return True;
+        }
+        named = set();
+        for p in (sig.get_parameters() or []) {
+            if p?.name is not None {
+                named.add(p.name.value);
+            }
+        }
+        for prm in (c.params or []) {
+            if isinstance(prm, uni.KWPair) and (prm.key is not None) {
+                if prm.key.value not in named {
+                    return True;
+                }
+            }
+        }
+        return False;
+    }
+
+    """True if `r` sits under an `if` whose condition tests the varkwargs param.
+
+    Matches `len(<varkw>) > 0` and a bare `<varkw>` truthiness test, including as
+    one conjunct of an `and`. Such a guard is false whenever the call passes no
+    keyword outside the callee's named parameters, so the raise cannot fire.
+    """
+    def _guarded_by_varkw(r: uni.RaiseStmt, varkw: str, fn: uni.Ability) -> bool {
+        cur = r.parent;
+        while (cur is not None) and (cur is not fn) {
+            if isinstance(cur, uni.IfStmt) {
+                if self._mentions_name(cur.condition, varkw) {
+                    return True;
+                }
+            }
+            cur = cur.parent;
+        }
+        return False;
+    }
+
+    """True if expression `e` references bare name `nm`."""
+    def _mentions_name(e: (uni.Expr | None), nm: str) -> bool {
+        if e is None {
+            return False;
+        }
+        if isinstance(e, uni.Name) and (e.value == nm) {
+            return True;
+        }
+        for n in e.get_all_sub_nodes(uni.Name) {
+            if n.value == nm {
+                return True;
+            }
+        }
+        return False;
+    }
+
+    """True if a callee expression is a known-pure builtin/library entry point.
+
+    Deliberately narrow: `torch.*` and `math.*` (pure tensor/numeric
+    construction) plus a small set of pure builtins. Anything else -- including
+    any unresolvable call -- is treated as opaque and blocks the hoist.
+    """
+    def _pure_callee(t: (uni.Expr | None)) -> bool {
+        if t is None {
+            return False;
+        }
+        if isinstance(t, uni.Name) {
+            # Pure builtins only. `getattr`/`hasattr` are reads: they can invoke a
+            # user __getattr__, but so does every attribute access already inside
+            # the hoisted region, so they add no new exposure.
+            return t.value
+                in {
+                    'len',
+                    'float',
+                    'int',
+                    'bool',
+                    'str',
+                    'max',
+                    'min',
+                    'abs',
+                    'sum',
+                    'list',
+                    'tuple',
+                    'range',
+                    'getattr',
+                    'hasattr'
+                };
+        }
+        if isinstance(t, uni.AtomTrailer) {
+            base = t.target;
+            while isinstance(base, uni.AtomTrailer) {
+                base = base.target;
+            }
+            if isinstance(base, uni.Name) and (base.value in {'torch', 'math'}) {
+                return True;
+            }
+            # tensor methods on a local value (e.g. `.to(...)`, `.float()`)
+            return isinstance(t.right, uni.Name)
+                and (
+                    t.right.value in {'to', 'float', 'double', 'clone', 'detach', 'get'}
+                );
         }
         return False;
     }

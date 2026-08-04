@@ -329,6 +329,17 @@ ExistenceGuardedInit(s) ≡                            // s: ‹if ¬hasattr(X,"
  ∧ ∃ b ∈ B : Writes(b, X.k)                          // G2 the guard closes ⇒ replay is a no-op
  ∧ ∀ b ∈ B : Writes(b, X.k) ∨ PureLocalWrite(b) ∨ DeviceMove(b)   // G3 only the init may call
  ∧ Confined(X.k, region)                             // G4 no read of X.k outside the region
+ ∧ ∀ call ∈ init : Speculatable(call)                // G5 the initializer is safe to run early
+
+Speculatable(c) ≡                                    // callee resolved over this module
+   Resolve(c) ≠ ⊥ ∧ ∀ f ∈ Resolve(c) : Pure(f) ∧ ¬Raises(f, c)
+Resolve(c)     ≡ { module-level f }                  if callee(c) is a bare name
+                 { f ∈ ⋃ dispatch tables | Accepts(f, c) }  if callee(c) is an attribute
+                 ⊥                                   otherwise
+Pure(f)        ≡ every call in f is a pure builtin, a torch/math call, or a
+                 local g with Pure(g) ∧ ¬Raises(g, ·)      // transitive, greatest fixpoint
+Raises(f, c)   ≡ ∃ raise in f not proven unreachable from c
+Accepts(f, c)  ≡ f's signature admits c's actual arguments  // a TypeError callee is not the callee
 14  p ← fresh();  emit  p ← c                                        // hoist predicate
 15  emit Hoist(ST); emit Hoist(SF)
 16  if HasCall(vT) ∨ HasCall(vF) then  sel ← cond(p, λ.vT, λ.vF, ()) // run only taken path
@@ -465,14 +476,26 @@ rather than proved:
    a subclass in another file can still observe the attribute existing early.
    For a memoization slot (not a registered buffer or parameter) this is
    invisible to normal model use, but it is not a proof.
-2. **Initializer purity.** The initializer call in the memoizing write is not
-   resolved and validated -- unlike calls in the *branch value*, which Alg. 2
-   requires to resolve through UniiR. If it performs I/O, consumes RNG, or
-   mutates global state, speculation makes that happen on runs `P` avoided.
-   Resolving the callee and requiring purity is the natural way to close this;
-   until then it is a licensed-form assumption, and the honest phrasing of the
-   guarantee is *equivalence modulo private memoization state*, not
-   unconditional equivalence.
+2. **Initializer purity -- now checked (G5), with one narrow residual.** The
+   initializer call in the memoizing write is resolved and validated: it must be
+   pure (transitively -- local helpers are recursed into) and must not raise on
+   the arguments this call site passes. A `raise` counts as unreachable only in
+   the varkwargs-validation form (`if len(**kw) > 0: raise ...`), which cannot
+   fire when the call passes no keyword outside the callee's named parameters.
+
+   An *attribute* callee such as `self.rope_init_fn` cannot be resolved from one
+   module -- the binding lives in whichever subclass module assigned it. It is
+   handled soundly rather than assumed: the candidate set is every function
+   reachable through any module-level dispatch table, narrowed by signature
+   compatibility (a function the call would `TypeError` on cannot be the
+   callee), and **all** surviving candidates must clear the check. This is what
+   separates an init table from a same-shaped validation table.
+
+   Residual: that the attribute is bound from a dispatch table *in this module*
+   at all. A binding to some unrelated callable defined elsewhere would not be
+   seen. That is a far narrower assumption than the previous unconditional one,
+   but it is still an assumption, so the honest phrasing of the guarantee
+   remains *equivalence modulo private memoization state*.
 
 ---
 

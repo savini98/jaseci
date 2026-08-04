@@ -140,6 +140,15 @@ test "hasattr-initialized attribute read outside the region is declined" {
     assert "if seq_len > 8:" in src;
 }
 
+test "existence-guarded init with an impure initializer is declined" {
+    src = _pysrc("guard_impure_init.jac", True);
+    # The attribute callee cannot be pinned to one table entry, so every
+    # signature-compatible candidate must be pure; `_compute_dirty` prints, so
+    # speculating the init could emit output on runs the original never made.
+    assert "torch.where(" not in src;
+    assert "if seq_len > 8:" in src;
+}
+
 test "nested guard in a data-dependent branch composes trap + predication" {
     src = _pysrc("nested_guard_in_branch.jac", True);
     # the data-dependent outer branch is predicated...
