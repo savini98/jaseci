@@ -244,7 +244,15 @@ obj DeferSideEffectPass(UniPass) {
         );
     }
 
-    """Build `<name>.register_forward_hook(__jac_log_flush_hook__)` statement."""
+    """Build `<name>.register_forward_hook(__jac_log_flush_hook__, always_call=True)`.
+
+    `always_call=True` is what makes the logger deferral correct on an
+    exceptional exit. A plain forward hook runs only after `forward` RETURNS, so
+    a raising forward would drop every buffered logger call; with always_call the
+    hook still runs and replays them in FIFO order before the exception
+    propagates. This is the hook-path counterpart to the `try`/`finally` that
+    `exit_ability` wraps around the buffered (print) path.
+    """
     def _hook_register_stmt(at: uni.UniNode, name: str) -> uni.ExprStmt {
         recv = self._gen_name(at, name, False);
         meth = self._gen_name(at, 'register_forward_hook', False);
@@ -252,8 +260,12 @@ obj DeferSideEffectPass(UniPass) {
             target=recv, right=meth, is_attr=True, is_null_ok=False, kid=[recv, meth]
         );
         hook = self._gen_name(at, '__jac_log_flush_hook__', False);
+        kw_key = self._gen_name(at, 'always_call', False);
+        kw_val = self._gen_name(at, 'True', False);
+        always = uni.KWPair(key=kw_key, value=kw_val, kid=[kw_key, kw_val]);
+        params = [hook, always];
         call = uni.FuncCall(
-            target=target, params=[hook], genai_call=None, kid=[target, hook]
+            target=target, params=params, genai_call=None, kid=[target] + params
         );
         return uni.ExprStmt(expr=call, in_fstring=False, kid=[call]);
     }
@@ -290,7 +302,23 @@ obj DeferSideEffectPass(UniPass) {
         self._insert_before(nd, self._flush_stmt(nd));
     }
 
-    """Initialize the buffer and add a trailing flush for a buffering function."""
+    """Initialize the buffer and add a trailing flush for a buffering function.
+
+    NOTE on exceptional exits: the obvious fix -- wrapping the body in
+    `try { ... } finally { flush(...) }` -- is NOT usable here. The flush is
+    deliberately untraceable (it performs the real I/O), and TorchDynamo 2.12
+    responds to an untraceable call inside a `finally` by abandoning the whole
+    frame: the function compiles to ZERO FX graphs instead of one, i.e. full
+    eager fallback. That trades the graph break we are removing for something
+    strictly worse. Verified on torch 2.12; see the exceptional-exit tests.
+
+    The buffered (print) path therefore still flushes only on normal exits. The
+    logger path IS correct on exceptional exits -- see `_hook_register_stmt`,
+    where `always_call=True` makes the forward hook fire even when `forward`
+    raises. Closing the same gap here needs the buffer to outlive the frame (a
+    module-global buffer plus an eager boundary guard, as `[Trap]` does with
+    `__jac_trap_guard__`), not a `finally` inside the compiled region.
+    """
     def exit_ability(nd: uni.Ability) -> None {
         if not self._enabled {
             return;

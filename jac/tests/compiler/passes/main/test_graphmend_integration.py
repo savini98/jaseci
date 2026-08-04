@@ -340,3 +340,71 @@ def test_scoped_import_transforms_imported_model(tmp_path: Path) -> None:
         sys.path.remove(str(tmp_path))
         sys.modules.pop("scopedmodel", None)
         sys.modules.pop("scopedmodel.net", None)
+
+
+def _run_raising_model_fixture(graphmend: bool) -> tuple[list, object]:
+    """Run the raising-forward fixture; return (captured log messages, exc)."""
+    src = _compile_src("logger_forward_hook_raises.py", graphmend)
+    ns: dict = {}
+    orig_compile = torch.compile
+    torch.compile = lambda *a, **k: a[0] if a else (lambda f: f)
+    try:
+        exec(compile(src, "logger_forward_hook_raises.py", "exec"), ns)
+    finally:
+        torch.compile = orig_compile
+
+    messages: list = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: object) -> None:
+            messages.append(record.getMessage())  # type: ignore[attr-defined]
+
+    handler = _Capture()
+    logging.getLogger("gm_forward_hook_raises").addHandler(handler)
+    caught: object = None
+    try:
+        torch._dynamo.reset()
+        try:
+            torch.compile(ns["model"], backend="eager")(torch.tensor([1.0, 2.0]))
+        except Exception as exc:  # noqa: BLE001 - the fixture raises on purpose
+            caught = exc
+    finally:
+        logging.getLogger("gm_forward_hook_raises").removeHandler(handler)
+    return messages, caught
+
+
+def test_deferred_logger_flushes_on_exceptional_exit() -> None:
+    """[Defer] must not swallow log output when the forward raises.
+
+    The transformed forward buffers the logger call instead of performing it, so
+    a plain forward hook (which only runs on a successful return) would drop it.
+    GraphMend registers the flush hook with ``always_call=True``; this asserts
+    that the log still reaches the handler and the original exception still
+    propagates unchanged.
+    """
+    orig_msgs, orig_exc = _run_raising_model_fixture(False)
+    fixed_msgs, fixed_exc = _run_raising_model_fixture(True)
+
+    # Baseline: untransformed code logs, then raises.
+    assert "GM-RAISING-FORWARD-LOG" in orig_msgs
+    assert isinstance(orig_exc, ValueError) and "GM-BOOM" in str(orig_exc)
+
+    # The exception is preserved in type and message...
+    assert isinstance(fixed_exc, ValueError), f"expected ValueError, got {fixed_exc!r}"
+    assert "GM-BOOM" in str(fixed_exc)
+    # ...and the deferred log is still emitted rather than silently dropped.
+    assert "GM-RAISING-FORWARD-LOG" in fixed_msgs, (
+        "deferred logger output was lost on the exceptional exit -- the flush "
+        "hook must be registered with always_call=True"
+    )
+
+
+def test_flush_hook_registered_with_always_call() -> None:
+    """The generated hook registration must pass always_call=True.
+
+    Without it the flush runs only on a successful forward, so a raising forward
+    drops every buffered logger call. Asserted on the generated source so the
+    guarantee is visible even where torch's hook semantics are not exercised.
+    """
+    src = _compile_src("logger_forward_hook.py", True)
+    assert "register_forward_hook(__jac_log_flush_hook__, always_call=True)" in src
