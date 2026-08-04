@@ -112,6 +112,34 @@ test "non-idempotent observable setup write is declined (soundness)" {
     assert "self_obj.calls = self_obj.calls + 1" in src;
 }
 
+test "hasattr guard whose key is not the memoized attribute is declined" {
+    src = _pysrc("guard_key_mismatch.jac", True);
+    # The `hasattr` header does not close over `counter`/`long_inv_freq`, so the
+    # body is not idempotent: matching the guard *shape* alone would hoist a
+    # non-idempotent write onto the untaken path. Must decline.
+    assert "torch.where(" not in src;
+    assert "if seq_len > 8:" in src;
+    assert "self_obj.counter = self_obj.counter + 1" in src;
+}
+
+test "hasattr guard body with extra observable effects is declined" {
+    src = _pysrc("guard_body_effects.jac", True);
+    # Key matches the memoized write, but the body also mutates `self_obj.log`;
+    # that effect would fire on runs the original never took. Must decline.
+    assert "torch.where(" not in src;
+    assert "if seq_len > 8:" in src;
+    assert "self_obj.log.append('init')" in src;
+}
+
+test "hasattr-initialized attribute read outside the region is declined" {
+    src = _pysrc("guard_attr_escapes.jac", True);
+    # Hoisting creates `long_inv_freq` earlier than the original would; another
+    # reader in the module can observe that, so the state change is not
+    # confined and the hoist is declined.
+    assert "torch.where(" not in src;
+    assert "if seq_len > 8:" in src;
+}
+
 test "nested guard in a data-dependent branch composes trap + predication" {
     src = _pysrc("nested_guard_in_branch.jac", True);
     # the data-dependent outer branch is predicated...

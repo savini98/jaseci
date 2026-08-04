@@ -30,10 +30,17 @@ non-tensor (e.g. `None`), no transform applies and the break is left intact.
 
 Multi-statement branches sharing a trailing call hoist their setups to run
 unconditionally, but only when each setup is provably effect-neutral on the
-untaken path (pure-local write, idempotent `.to()` device move, `hasattr`-guarded
-init, or a re-gated lowered assert) -- see `_setups_safe`/`_effect_neutral`. A
-non-idempotent observable write (e.g. `self.counter += 1`) is declined, leaving
-the break intact rather than hoisting it unsoundly.
+untaken path (pure-local write, idempotent `.to()` device move, licensed
+`hasattr`-guarded init, or a re-gated lowered assert) -- see
+`_setups_safe`/`_effect_neutral`. A non-idempotent observable write (e.g.
+`self.counter += 1`) is declined, leaving the break intact rather than hoisting
+it unsoundly.
+
+The `hasattr`-guarded init is the one licensed hoist that creates state earlier
+than the original would; the `hasattr` *shape* alone does not make it safe. See
+`_is_existence_guard` for the four conditions (memoizing write, neutral body,
+module-scope confinement) and SEMANTIC_SAFETY.md §6.1 for what remains an
+assumption.
 
 Anything more complex (differing targets, deeper multi-statement branches, elif
 chains) is left untouched. Gated by --graphmend.
@@ -103,7 +110,7 @@ obj PredicateCtrlFlowPass(UniPass) {
         a_last = tb[-1];
         b_last = fb[-1];
         if isinstance(a_last, uni.ExprStmt) and isinstance(b_last, uni.ExprStmt) {
-            if self._setups_safe(tb[:-1]) and self._setups_safe(fb[:-1]) {
+            if self._setups_safe(tb[:-1], nd) and self._setups_safe(fb[:-1], nd) {
                 self._merge_common_call(nd, a_last.expr, b_last.expr, tb[:-1], fb[:-1]);
             }
         }
@@ -122,7 +129,7 @@ obj PredicateCtrlFlowPass(UniPass) {
          observable writes (e.g. `self.counter += 1`) that the old control-only
          check would have hoisted unsoundly.
     """
-    def _setups_safe(setups: list) -> bool {
+    def _setups_safe(setups: list, region: uni.IfStmt) -> bool {
         for s in setups {
             if isinstance(s, (uni.ReturnStmt, uni.RaiseStmt, uni.CtrlStmt)) {
                 return False;
@@ -136,7 +143,7 @@ obj PredicateCtrlFlowPass(UniPass) {
             if s.get_all_sub_nodes(uni.CtrlStmt) {
                 return False;
             }
-            if not self._effect_neutral(s) {
+            if not self._effect_neutral(s, region) {
                 return False;
             }
         }
@@ -154,11 +161,11 @@ obj PredicateCtrlFlowPass(UniPass) {
         recomputed, not an escaping effect) or an idempotent device move
         `x = x.to(...)` (writing a tensor back to itself).
     """
-    def _effect_neutral(s: uni.UniNode) -> bool {
+    def _effect_neutral(s: uni.UniNode, region: uni.IfStmt) -> bool {
         if self._is_assert_async(s) {
             return True;
         }
-        if self._is_existence_guard(s) {
+        if self._is_existence_guard(s, region) {
             return True;
         }
         if isinstance(s, uni.Assignment) {
@@ -167,22 +174,151 @@ obj PredicateCtrlFlowPass(UniPass) {
         return False;
     }
 
-    """True if `s` is `if not hasattr(X, "..."): ...` -- an existence guard whose
-    body initializes once and is a no-op on re-execution."""
-    def _is_existence_guard(s: uni.UniNode) -> bool {
+    """True if `s` is a *licensed* existence-guarded initialization.
+
+    The `hasattr` shape alone is NOT sufficient. Speculating the guard body makes
+    the initialized state exist on runs where the original program never created
+    it, so four conditions must hold for that state change to be unobservable:
+
+      G1. shape -- `if not hasattr(<recv>, "<literal>")` with no `else` branch;
+      G2. memoization -- the body definitely assigns `<recv>.<literal>`, so the
+          guard flips to true and re-execution is a genuine no-op. Without this
+          the guard never closes and the body re-runs on every call;
+      G3. body neutrality -- every other statement in the body is itself
+          effect-neutral. Only the memoizing assignment may contain a call (the
+          initializer), matching the paper's "initialization guarded by its own
+          existence check" license. Arbitrary I/O or escaping writes smuggled in
+          under a `hasattr` header are declined;
+      G4. confinement -- the initialized attribute is read nowhere in the module
+          outside this branch region (`_attr_confined`), so its earlier existence
+          cannot be observed by any other code we compile.
+
+    G4 is a module-scope check: state escaping to *other* modules (an external
+    `hasattr`, `__dict__`/`state_dict` inspection, a subclass) is outside what
+    this analysis can see, and is the residual assumption behind the hoist.
+    """
+    def _is_existence_guard(s: uni.UniNode, region: uni.IfStmt) -> bool {
         if not isinstance(s, uni.IfStmt) {
             return False;
         }
-        c = s.condition;
-        if (not isinstance(c, uni.UnaryExpr)) or (c.op is None) or (c.op.value != 'not') {
+        # G1 -- an init guard has no alternative path.
+        if s.else_body is not None {
             return False;
         }
+        keyed = self._hasattr_key(s.condition);
+        if keyed is None {
+            return False;
+        }
+        (recv, key) = keyed;
+        memoized = False;
+        for st in (s.body or []) {
+            if not isinstance(st, uni.Assignment) {
+                return False;
+            }
+            if self._writes_attr(st, recv, key) {
+                # G2 -- the memoizing write; its value may contain the
+                # initializer call.
+                memoized = True;
+                continue;
+            }
+            # G3 -- anything else in the body must stand on its own.
+            if not self._assignment_neutral(st) {
+                return False;
+            }
+        }
+        if not memoized {
+            return False;
+        }
+        return self._attr_confined(region, key);
+    }
+
+    """Return `(receiver_text, key)` for `not hasattr(<recv>, "<literal>")`."""
+    def _hasattr_key(c: uni.Expr) -> (tuple | None) {
+        if (not isinstance(c, uni.UnaryExpr))
+        or (c.op is None)
+        or (c.op.value != 'not') {
+            return None;
+        }
         inner = c.operand;
-        return (
+        if not (
             isinstance(inner, uni.FuncCall)
             and isinstance(inner.target, uni.Name)
             and (inner.target.value == 'hasattr')
-        );
+        ) {
+            return None;
+        }
+        params = list(inner.params or []);
+        if len(params) != 2 {
+            return None;
+        }
+        (recv, key) = (params[0], params[1]);
+        # a string literal surfaces as `String` or `MultiString`; both expose
+        # the unquoted text via `lit_value`.
+        if isinstance(recv, uni.KWPair)
+        or (not isinstance(key, (uni.String, uni.MultiString))) {
+            return None;
+        }
+        return (recv.unparse().replace(' ', ''), key.lit_value);
+    }
+
+    """True if assignment `s` writes `<recv>.<key>` (possibly in a tuple target)."""
+    def _writes_attr(s: uni.Assignment, recv: str, key: str) -> bool {
+        for t in (s.target or []) {
+            targets = list(t.values) if isinstance(t, uni.TupleVal) else [t];
+            for tg in targets {
+                if (
+                    isinstance(tg, uni.AtomTrailer)
+                    and isinstance(tg.right, uni.Name)
+                    and (tg.right.value == key)
+                    and (tg.target.unparse().replace(' ', '') == recv)
+                ) {
+                    return True;
+                }
+            }
+        }
+        return False;
+    }
+
+    """True if attribute `key` is referenced nowhere in the module outside `region`.
+
+    Any `<expr>.key` access or any string literal equal to `key` (which could feed
+    `hasattr`/`getattr`/`setattr`) found outside the branch being rewritten means
+    the early creation of the attribute is observable, so the hoist is declined.
+    """
+    def _attr_confined(region: uni.IfStmt, key: str) -> bool {
+        mod = region.find_parent_of_type(uni.Module);
+        if mod is None {
+            return False;
+        }
+        for at in mod.get_all_sub_nodes(uni.AtomTrailer) {
+            if (
+                isinstance(at.right, uni.Name)
+                and (at.right.value == key)
+                and (not self._within(at, region))
+            ) {
+                return False;
+            }
+        }
+        for typ in [uni.String, uni.MultiString] {
+            for st in mod.get_all_sub_nodes(typ) {
+                if (st.lit_value == key) and (not self._within(st, region)) {
+                    return False;
+                }
+            }
+        }
+        return True;
+    }
+
+    """True if `nd` sits inside `anc` in the tree."""
+    def _within(nd: uni.UniNode, anc: uni.UniNode) -> bool {
+        cur = nd;
+        while cur is not None {
+            if cur is anc {
+                return True;
+            }
+            cur = cur.parent;
+        }
+        return False;
     }
 
     """True if assignment `s` is neutral to hoist: an idempotent device move, or a
@@ -215,8 +351,7 @@ obj PredicateCtrlFlowPass(UniPass) {
         }
         recv = v.target.target;
         return (
-            recv.unparse().replace(' ', '')
-            == s.target[0].unparse().replace(' ', '')
+            recv.unparse().replace(' ', '') == s.target[0].unparse().replace(' ', '')
         );
     }
 

@@ -89,6 +89,10 @@ BindingStable(c)  ≡ callee(c) resolves in ST to the intended builtin/lib symbo
                     (not user-rebound)
 Independent(s,R)  ≡ inputs(s) ∩ writes(R) = ∅ ∧ writes(s) ∩ inputs(R) = ∅
 HasCall(e)        ≡ e contains a FuncCall
+Writes(s, X.k)    ≡ s assigns attribute k of X (incl. as a tuple-target element)
+Confined(X.k, R)  ≡ no reference to attribute `k` -- an `_.k` access, or a string
+                    literal `"k"` that hasattr/getattr/setattr could consume --
+                    occurs in the module outside region R  (module-scope must-check)
 TensorBool(e)     ≡ e is a call returning a tensor bool (.all/.any/.allclose)
 ```
 
@@ -131,8 +135,9 @@ Legend: `[≡]` = value-equivalence of a lowered check.
                               │ Yes
             ┌─────────────────▼─────────────────┐  No (escaping
             │ Hoisted setups effect-neutral?     ├─non-idemp. ► ⛔ DECLINE
-            │ pure-local / idemp. .to() / hasattr│  write)
-            │ init / lowered assert       [INV3] │
+            │ pure-local / idemp. .to() /        │  write)
+            │ *licensed* hasattr init (G1-G4) /  │
+            │ lowered assert              [INV3] │
             └─────────────────┬─────────────────┘
                               │ Yes
             ┌─────────────────▼─────────────────┐ Yes
@@ -265,8 +270,14 @@ Input : IfStmt n tagged dyn_ctrl_fl;  Output: predicated dataflow, or ⊥
 EffectNeutral(s) ≡                                   // licensed-safe hoist forms only
    PureLocalWrite(s)            // s: ‹x̄ ← e›, x̄ all bare locals, ¬HasCall(e)
  ∨ DeviceMove(s)               // s: ‹x ← r.to(..)›, x ≡ r  (idempotent self-write)
- ∨ ExistenceGuardedInit(s)     // s: ‹if ¬hasattr(X,k): …›  (init once, no-op on replay)
+ ∨ ExistenceGuardedInit(s)     // see below -- the `hasattr` *shape* alone is NOT enough
    // everything else (escaping attr/subscript writes, unresolved calls) ⇒ false
+
+ExistenceGuardedInit(s) ≡                            // s: ‹if ¬hasattr(X,"k"): B›
+   NoElse(s)                                         // G1 shape: an init guard has no alternative
+ ∧ ∃ b ∈ B : Writes(b, X.k)                          // G2 the guard closes ⇒ replay is a no-op
+ ∧ ∀ b ∈ B : Writes(b, X.k) ∨ PureLocalWrite(b) ∨ DeviceMove(b)   // G3 only the init may call
+ ∧ Confined(X.k, region)                             // G4 no read of X.k outside the region
 14  p ← fresh();  emit  p ← c                                        // hoist predicate
 15  emit Hoist(ST); emit Hoist(SF)
 16  if HasCall(vT) ∨ HasCall(vF) then  sel ← cond(p, λ.vT, λ.vF, ()) // run only taken path
@@ -362,6 +373,12 @@ predicate-safely. Post-order resolves inner regions before their enclosers.
 > outputs, identical observable effects in original program order, and an
 > assertion fires in `P'` iff the original guard would fire in `P`.
 >
+> **Observability domain.** "Observable" here means: values returned, effects
+> performed (I/O, log output, non-idempotent state writes), exceptions raised,
+> and any state read *by code within the compiled module*. It does **not** cover
+> an external observer reading the object's attribute dictionary directly --
+> see the memoization caveat in §6.1.
+>
 > **Argument.** Each algorithm reaches its `emit` only after discharging the
 > invariants that establish this equality for its rewrite (INV1 predicate
 > well-formedness, INV2 path totality + re-gating, INV3 effect recoverability +
@@ -369,6 +386,42 @@ predicate-safely. Post-order resolves inner regions before their enclosers.
 > must-predicate, so no path to `emit` rests on an unproven property. Otherwise
 > the algorithm returns `⊥` and the region is left identical to `P`, where
 > equivalence holds trivially. ∎
+
+### 6.1 Caveat -- speculated memoization is a state change, not a no-op
+
+`ExistenceGuardedInit` is the one licensed hoist that **creates state earlier
+than `P` would**. In the Phi-4 case (Fig. 3), predication runs
+`if not hasattr(self,'long_inv_freq'): self.long_inv_freq = rope_init_fn(...)`
+unconditionally, so on an execution where the original predicate is always false
+`P` never creates `long_inv_freq` and `P'` always does. Calling this hoist
+"idempotent" is precise about *replay* (running it twice equals running it once)
+but not about *speculation* (running it at all). The two are different
+obligations, and only the first follows from the `hasattr` guard.
+
+What makes the hoist legal is therefore not idempotency but **confinement**
+(G4): the attribute is a private memoization slot whose existence no other code
+in the module can test or read, so no observer inside the observability domain
+can distinguish "cached now" from "cached on a later call". G2 and G3 then
+ensure the slot is genuinely closed by the write and that nothing else rides
+along in the guard body. When G4 fails -- another method reads the attribute, or
+a `hasattr`/`getattr` elsewhere names it -- the rewrite is declined.
+
+Two assumptions remain outside what the analysis can discharge, and are stated
+rather than proved:
+
+1. **Cross-module observers.** Confinement is checked over the compiled module.
+   An external `hasattr`, a `__dict__`/`state_dict()`/`named_buffers()` walk, or
+   a subclass in another file can still observe the attribute existing early.
+   For a memoization slot (not a registered buffer or parameter) this is
+   invisible to normal model use, but it is not a proof.
+2. **Initializer purity.** The initializer call in the memoizing write is not
+   resolved and validated -- unlike calls in the *branch value*, which Alg. 2
+   requires to resolve through UniiR. If it performs I/O, consumes RNG, or
+   mutates global state, speculation makes that happen on runs `P` avoided.
+   Resolving the callee and requiring purity is the natural way to close this;
+   until then it is a licensed-form assumption, and the honest phrasing of the
+   guarantee is *equivalence modulo private memoization state*, not
+   unconditional equivalence.
 
 ---
 
@@ -393,7 +446,7 @@ predicate-safely. Post-order resolves inner regions before their enclosers.
 
 ### Known limitations (honest scope)
 
-- **Exception type — restored within scope.** The original exception type and
+- **Exception type -- restored within scope.** The original exception type and
   message are restored when the guard sits in a `@torch.compile`-decorated
   function and the message is a string literal: the type is folded into a marker
   and an eager `@__jac_trap_guard__` boundary decorator re-raises it. Out of
@@ -409,11 +462,15 @@ predicate-safely. Post-order resolves inner regions before their enclosers.
 - **Multi-statement same-LHS assignment** branches: predication's multi-statement
   path currently handles only a shared *trailing call* (`Reconcile` call case), so
   compound fixtures must end in a shared `ExprStmt` call.
+- **Speculated memoization creates private state early.** The one hoist that is
+  not effect-free in the strict sense; legal by confinement, not by idempotency.
+  See §6.1 for the two residual assumptions (cross-module observers, initializer
+  purity).
 - **Hoist effect-neutrality is conservative.** Setups are hoisted only when proven
   neutral by the licensed forms in `EffectNeutral` (pure-local write, idempotent
   `.to()` device move, `hasattr`-guarded init, re-gated lowered assert). A setup
   with an escaping attribute/subscript write, or a call we do not resolve, is
-  declined even if it would in fact be safe — coverage is traded for soundness,
+  declined even if it would in fact be safe -- coverage is traded for soundness,
   so an unsafe non-idempotent write (e.g. `self.counter += 1`) is never hoisted.
 
 ```
