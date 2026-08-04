@@ -147,6 +147,77 @@ sys.modules["jaclang.jac0core.modresolver"] = _modresolver
 get_jac_search_paths = _modresolver.get_jac_search_paths
 
 
+def _graphmend_scope_for(fullname: str, path: str) -> bool:
+    """True if `--graphmend-scope` claims this .py file. Module-level twin of
+    ``JacMetaImporter._graphmend_scoped_py``, usable without a finder instance."""
+    try:
+        from jaclang.jac0core.runtime import JacRuntime as Jac
+
+        program = Jac.get_program()
+        if not getattr(program, "_graphmend_enabled", False):
+            return False
+        scope = getattr(program, "_graphmend_scope", None) or []
+    except Exception:
+        return False
+    if not scope:
+        return False
+    top = fullname.split(".")[0]
+    if top in ("torch", "jaclang"):
+        return False
+    return any(
+        fullname == prefix or fullname.startswith(prefix + ".") for prefix in scope
+    ) and os.path.isfile(path)
+
+
+def install_graphmend_loader_hook() -> None:
+    """Route in-scope .py files through GraphMend even when the import bypasses us.
+
+    ``sys.meta_path`` is not the only way a module gets loaded. Code that builds
+    a spec directly -- most notably Hugging Face ``trust_remote_code`` models,
+    which transformers loads with ``spec_from_file_location`` +
+    ``exec_module`` -- never consults a meta-path finder, so ``JacMetaImporter``
+    never sees it and ``--graphmend-scope`` silently transforms nothing.
+
+    Every such path still goes through ``SourceFileLoader.get_code``, so that is
+    hooked instead. Compiling from source there also sidesteps ``__pycache__``:
+    a ``.pyc`` written by an earlier non-GraphMend run must never be served to a
+    ``--graphmend`` run, the same variant-collision the JIR cache avoids by
+    keying on 'gm'/'gm-scope'.
+
+    Idempotent, and a no-op unless --graphmend is active with a scope that names
+    the module, so a normal run pays one attribute lookup per source import.
+    """
+    loader = importlib.machinery.SourceFileLoader
+    if getattr(loader, "_jac_graphmend_hooked", False):
+        return
+    original = loader.get_code
+
+    def get_code(self: object, fullname: str) -> object:
+        path = getattr(self, "path", "") or ""
+        if path.endswith(".py") and _graphmend_scope_for(fullname, path):
+            try:
+                from jaclang.jac0core.runtime import JacRuntime as Jac
+
+                program = Jac.get_program()
+                program._graphmend_scoped_compile = True
+                try:
+                    codeobj = Jac.get_compiler().get_bytecode(
+                        full_target=path, target_program=program
+                    )
+                finally:
+                    program._graphmend_scoped_compile = False
+                if codeobj is not None:
+                    return codeobj
+            except Exception:
+                # Never break an import because GraphMend could not transform it;
+                # fall through to the stock loader and run untransformed.
+                pass
+        return original(self, fullname)
+
+    loader.get_code = get_code  # type: ignore[method-assign]
+    loader._jac_graphmend_hooked = True  # type: ignore[attr-defined]
+
+
 class JacMetaImporter(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     """Meta path importer to load .jac modules via Python's import system."""
 

@@ -130,13 +130,12 @@ MODELS = {
                             "scope": ["transformers.models.phi3",
                                       "transformers.modeling_rope_utils"]},
     # [Trap]. Opt-in: needs network + trust_remote_code, so it is excluded from
-    # the default run (see NETWORK_MODELS). `remote_code` tells the runner to
-    # transform the module source directly -- transformers loads Hub code via
-    # spec_from_file_location, which bypasses sys.meta_path, so --graphmend-scope
-    # cannot intercept it the way it does for in-package modules.
+    # the default run (see NETWORK_MODELS). Hub remote code lands under the
+    # `transformers_modules.*` namespace; scoping it works because jaclang hooks
+    # the source loader as well as sys.meta_path (transformers builds the spec
+    # directly, so a meta-path finder alone never sees these modules).
     "MoLFormer-XL-both10pct": {"build": _molformer,
-                               "scope": [],
-                               "remote_code": "modeling_molformer"},
+                               "scope": ["transformers_modules"]},
 }
 
 # Models the default `python -m paper_eval.run_eval` skips: they download code or
