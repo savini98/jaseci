@@ -550,30 +550,34 @@ rather than proved:
   `test_nested_guard_preserves_conditional_assert_semantics` (untaken-branch guard
   stays dormant).
 
-### Claims that overstate the implementation
+### Audit of the paper and rebuttal against this code
 
-Found by an end-to-end audit of the paper and rebuttal against this code. These
-are documentation defects, not code defects: the implementation is sound, but
-the prose describes something stronger than what it does.
+An end-to-end pass over every checkable claim. One was a real soundness bug in
+the code (a call paired with a literal branch value, now declined -- see
+`_unfixable_call_literal`). One was an implementation gap that has since been
+closed (A1). One remains a prose defect where the paper describes something
+stronger than what the code does, and should be reworded rather than
+implemented.
 
-- **A1: deferral is per-function, not to the compiled-region exit.** The
-  rebuttal states that GraphMend defers print/logger calls "until the end of the
-  compiled forward-pass computation, rather than merely until the end of the
-  inner function in which they appear," and that this "allows the entire
-  computation to remain within a single FX graph." The flush is emitted at the
-  end of the function *containing* the call. For a `print` inside a helper that
-  a `@torch.compile` function calls, the flush lands at the helper's return, and
-  since Dynamo inlines the helper that flush splits the graph from inside.
-  Measured on such a case: 2 breaks -> 1, not 2 -> 0.
+- **A1: RESOLVED.** This entry previously recorded that deferral reached only
+  the end of the function containing the call, so a `print` in a helper inlined
+  into a compiled function split the graph from the inside (measured 2 breaks ->
+  1). Deferral now reaches the compiled-region exit: an inlined helper emits no
+  flush at all, and the enclosing region's boundary drains the buffer. Same case
+  now measures **2 breaks -> 0** with the output preserved.
 
-  The claim is achievable now that `_gm_se_buffer` is process-global and
-  `__jac_se_guard__` flushes at the compiled boundary: an inner function could
-  append without flushing and let the entry's guard drain it. Doing so safely
-  needs call-graph reachability, though -- suppressing the inner flush for a
-  helper that is *not* reached from a guarded entry would leave its output
-  buffered indefinitely. Until that analysis exists, the honest phrasing is
-  "deferred to the end of the enclosing function, and to the compiled-region
-  exit when the call is directly in a compiled entry or an `nn.Module.forward`."
+  What makes it safe is the region depth (`_gm_se_depth`). `se_emit` defers only
+  while a region is open; called outside one it performs the call immediately,
+  so a helper reached from ordinary Python emits at its original point instead of
+  sitting buffered until something else flushes. That removes the need for the
+  call-graph reachability analysis this entry used to call for. The guard is
+  attached to every compiled entry in a deferring module, not only entries that
+  contain a deferred call, since the caller is what opens the region.
+
+  Scope note: this is a whole-region property, so it applies under
+  `--graphmend-scope` (how model code is processed). In entry-file mode the
+  detect pass only tags calls inside the `torch.compile` entry itself, so a
+  helper's `print` is not a candidate to begin with.
 
 - **Table 1 `[Where]`: the stated legality condition is not the one enforced.**
   The row requires that "every function call in the region resolves through

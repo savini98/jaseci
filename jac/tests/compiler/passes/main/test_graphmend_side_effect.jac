@@ -39,6 +39,19 @@ def _pysrc(name: str, gm: bool) -> str {
     return ast.unparse(mod_ast);
 }
 
+"""Compile a fixture as a whole compiled region (--graphmend-scope semantics)."""
+def _pysrc_scoped(name: str) -> str {
+    prog = JacProgram();
+    prog._graphmend_scoped_compile = True;
+    mod = prog.compile(
+        file_path=os.path.join(FIXTURES, name),
+        options=CompileOptions(graphmend=True, type_check=False)
+    );
+    pa = mod.gen.py_ast;
+    mod_ast = pa[0] if isinstance(pa, list) else pa;
+    return ast.unparse(mod_ast);
+}
+
 test "print is buffered and flushed via the runtime helper" {
     src = _pysrc("side_effect.jac", True);
     # The mutable positional arg is snapshotted: hoisted to a temp and cloned (if
@@ -76,6 +89,21 @@ test "logger call is buffered the same way as print" {
     src = _pysrc("side_effect_logger.jac", True);
     assert "__jac_se_emit__(log.warning, ('deprecated path',), {})" in src;
     assert "__jac_se_flush__()" in src;
+}
+
+test "a helper defers to the caller's region instead of flushing itself" {
+    # Scoped compile: cross-function deferral is a whole-module-region property.
+    # In entry-file mode the detect pass only tags calls inside the torch.compile
+    # entry, so a helper's print is not a candidate in the first place.
+    src = _pysrc_scoped("se_in_helper.jac");
+    # the helper buffers...
+    assert "__jac_se_emit__(print," in src;
+    # ...but emits NO flush of its own -- that would split the caller's graph
+    assert "__jac_se_flush__()" not in src;
+    # ...and the compiled entry carries the guard that drains it, even though
+    # the entry holds no side-effect call itself.
+    assert "@__jac_se_guard__" in src;
+    assert src.index("@__jac_se_guard__") < src.index("@torch.compile");
 }
 
 test "no buffering when graphmend disabled" {

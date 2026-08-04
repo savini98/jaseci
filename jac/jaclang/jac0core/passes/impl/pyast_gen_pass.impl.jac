@@ -878,6 +878,7 @@ impl PyastGenPass.exit_module(nd: uni.Module) -> None {
     }
     if getattr(nd, '_gm_needs_log_flush', False) {
         self.jaclib_obj('__jac_log_flush_hook__');
+        self.jaclib_obj('__jac_se_region_open__');
     }
     is_builtin_module = (
         nd.loc.mod_path.endswith(('builtin.jac', 'builtin.py'))

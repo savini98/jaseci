@@ -175,7 +175,26 @@ obj DeferSideEffectPass(UniPass) {
     class that holds its forward (so the slot binds before forward runs), or at
     module end as a fallback. Flush-hook injection is per-assignment elsewhere."""
     def exit_module(nd: uni.Module) -> None {
-        if (not self._enabled) or (not self._pending_regs) {
+        if not self._enabled {
+            return;
+        }
+        # Guard every compiled entry in a module that defers anything, not just
+        # entries that contain a deferred call themselves. A `print` inside a
+        # helper is buffered while the caller's region is open, so the CALLER is
+        # what must open it -- and the caller may hold no side effect of its own.
+        # Without this the depth stays 0, `se_emit` takes its eager-call branch,
+        # and that untraceable call splits the very graph deferral exists to keep
+        # whole. Run at module exit so it does not depend on traversal order.
+        if getattr(nd, '_gm_needs_se_emit', False) {
+            for ab in nd.get_all_sub_nodes(uni.Ability) {
+                if self._has_torch_compile_decorator(ab)
+                    and (not getattr(ab, '_gm_se_guarded', False)) {
+                    self._attach_se_guard(ab);
+                    nd._gm_needs_se_guard = True;
+                }
+            }
+        }
+        if not self._pending_regs {
             return;
         }
         nd._gm_needs_log_register = True;
@@ -222,11 +241,30 @@ obj DeferSideEffectPass(UniPass) {
         if not isinstance(tgt, uni.Name) {
             return;
         }
+        # Pre-hook first so the region is open for the whole forward: helpers
+        # inlined into it then buffer rather than emitting mid-graph. The
+        # always_call post-hook closes it and flushes, on normal and raising
+        # exits alike.
         self._insert_after(nd, self._hook_register_stmt(nd, tgt.value));
+        self._insert_after(nd, self._pre_hook_register_stmt(nd, tgt.value));
         mod = nd.find_parent_of_type(uni.Module);
         if mod is not None {
             mod._gm_needs_log_flush = True;
         }
+    }
+
+    """Build `<name>.register_forward_pre_hook(__jac_se_region_open__)`."""
+    def _pre_hook_register_stmt(at: uni.UniNode, name: str) -> uni.ExprStmt {
+        recv = self._gen_name(at, name, False);
+        meth = self._gen_name(at, 'register_forward_pre_hook', False);
+        target = uni.AtomTrailer(
+            target=recv, right=meth, is_attr=True, is_null_ok=False, kid=[recv, meth]
+        );
+        hook = self._gen_name(at, '__jac_se_region_open__', False);
+        call = uni.FuncCall(
+            target=target, params=[hook], genai_call=None, kid=[target, hook]
+        );
+        return uni.ExprStmt(expr=call, in_fstring=False, kid=[call]);
     }
 
     """True if `e` is a structural `torch.compile(...)` call."""
@@ -285,6 +323,14 @@ obj DeferSideEffectPass(UniPass) {
         if (ability is None) or (not getattr(ability, '_gm_needs_se', False)) {
             return;
         }
+        # Only a compiled entry flushes. An inlined helper leaves its effects
+        # buffered for the enclosing region's exit; a flush here would split the
+        # caller's graph, which is the whole thing deferral is avoiding. The
+        # return-value hoist exists solely to order the flush after the compute,
+        # so it is unnecessary too.
+        if not self._is_compiled_entry(ability) {
+            return;
+        }
         if nd.expr is None {
             self._insert_before(nd, self._flush_stmt(nd));
             return;
@@ -334,6 +380,16 @@ obj DeferSideEffectPass(UniPass) {
         if mod is not None {
             mod._gm_needs_se_emit = True;
         }
+        # A function that is NOT itself a compiled entry emits no flush of its
+        # own. Dynamo inlines such a helper into its caller's graph, so a flush
+        # here would split that graph from the inside -- the effect is buffered
+        # and drained at the enclosing region's exit instead, which is what lets
+        # deferral reach the end of the whole compiled computation rather than
+        # the end of the inner function. When no region is active `se_emit`
+        # performs the call immediately, so nothing is left buffered.
+        if not self._is_compiled_entry(nd) {
+            return;
+        }
         # If control can fall off the end, flush there too (returns are handled
         # in exit_return_stmt; se_flush drains, so double-flush is safe).
         tail = nd.body[-1];
@@ -349,14 +405,26 @@ obj DeferSideEffectPass(UniPass) {
         # abandon the frame. Those flush via the always_call forward hook
         # instead (see _hook_register_stmt).
         if self._has_torch_compile_decorator(nd) {
-            guard = self._gen_name(nd, '__jac_se_guard__', False);
-            nd.decorators = [guard] + list(nd.decorators or []);
-            nd.set_kids([guard] + list(nd.kid));
-            guard.parent = nd;
+            self._attach_se_guard(nd);
             if mod is not None {
                 mod._gm_needs_se_guard = True;
             }
         }
+    }
+
+    """Prepend `@__jac_se_guard__` so it wraps the compiled callable from eager.
+
+    Idempotent: `_gm_se_guarded` marks an ability already handled, since
+    exit_ability and the module-level sweep can both reach the same entry."""
+    def _attach_se_guard(nd: uni.Ability) -> None {
+        if getattr(nd, '_gm_se_guarded', False) {
+            return;
+        }
+        guard = self._gen_name(nd, '__jac_se_guard__', False);
+        nd.decorators = [guard] + list(nd.decorators or []);
+        nd.set_kids([guard] + list(nd.kid));
+        guard.parent = nd;
+        nd._gm_se_guarded = True;
     }
 
     # ---- node construction helpers ----
@@ -517,6 +585,17 @@ obj DeferSideEffectPass(UniPass) {
         helper = self._gen_name(at, '__jac_se_flush__', False);
         call = uni.FuncCall(target=helper, params=[], genai_call=None, kid=[helper]);
         return uni.ExprStmt(expr=call, in_fstring=False, kid=[call]);
+    }
+
+    """True if `nd` is the entry of a compiled region rather than an inlined helper.
+
+    Two shapes qualify: a function carrying `@torch.compile` (guarded by the
+    prepended `__jac_se_guard__`), and an `nn.Module.forward` (bracketed by the
+    injected forward pre/post hooks). Anything else is a helper that Dynamo
+    inlines, and it must not flush.
+    """
+    def _is_compiled_entry(nd: uni.Ability) -> bool {
+        return self._has_torch_compile_decorator(nd) or (nd?.sym_name == 'forward');
     }
 
     """True if `nd` carries a `@torch.compile` / `@torch.compile(...)` decorator."""

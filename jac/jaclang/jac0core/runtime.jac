@@ -158,6 +158,19 @@ which no in-frame flush and no forward hook can run. A global list append traces
 identically to a local one (no extra graph break)."""
 glob _gm_se_buffer: list = [];
 
+"""GraphMend compiled-region depth (process-global).
+
+Incremented by `se_guard` on entry to a compiled callable and by the forward
+pre-hook on an nn.Module, decremented on exit. `se_emit` consults it to decide
+whether an effect must be deferred at all: inside a region it is buffered (so no
+untraceable call splits the graph), outside one it is performed immediately.
+
+That is what lets a helper called from a compiled function omit its own flush --
+the enclosing region's exit drains the buffer -- while the same helper called
+from ordinary Python still emits at its original point rather than sitting
+buffered until something else happens to flush."""
+glob _gm_se_depth: list = [0];
+
 class JacClassReferences {
     with entry {
         TYPE_CHECKING: bool = TYPE_CHECKING;
@@ -500,6 +513,20 @@ class JacBuiltin {
     it idempotent: a second flush on the same path is a no-op, which is what lets
     the normal-path flush and the `se_guard` boundary coexist."""
     static def se_flush -> None;
+
+    """GraphMend: mark entry to / exit from a compiled region.
+
+    `se_emit` defers only while the depth is non-zero. Paired by `se_guard` for a
+    decorated callable and by the forward pre/post hooks for an nn.Module."""
+    static def se_region_enter -> None;
+
+    static def se_region_exit -> None;
+    """GraphMend: forward PRE-hook that opens the compiled region.
+
+    Registered next to the flush hook on a torch.compile'd nn.Module so effects
+    inside inlined helpers are buffered for the whole forward rather than
+    emitted mid-graph. Returns None, leaving the inputs untouched."""
+    static def se_region_open(module: any, inputs: any) -> any;
 
     """GraphMend: eager boundary guard that flushes deferred effects on EVERY exit.
 

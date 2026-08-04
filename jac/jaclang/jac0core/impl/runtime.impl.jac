@@ -889,7 +889,29 @@ impl JacBuiltin.flush_se_buffer(buf: list) -> None {
 }
 
 impl JacBuiltin.se_emit(callee: any, args: tuple, kwargs: dict) -> None {
-    _gm_se_buffer.append((callee, args, kwargs));
+    # Deferral only exists to keep an untraceable call out of a compiled region.
+    # Outside one there is no graph to protect, so emitting now preserves the
+    # original program order exactly and leaves nothing buffered.
+    if _gm_se_depth[0] > 0 {
+        _gm_se_buffer.append((callee, args, kwargs));
+    } else {
+        callee(*args, **kwargs);
+    }
+}
+
+impl JacBuiltin.se_region_enter -> None {
+    _gm_se_depth[0] += 1;
+}
+
+impl JacBuiltin.se_region_open(module: any, inputs: any) -> any {
+    JacBuiltin.se_region_enter();
+    return None;
+}
+
+impl JacBuiltin.se_region_exit -> None {
+    if _gm_se_depth[0] > 0 {
+        _gm_se_depth[0] -= 1;
+    }
 }
 
 impl JacBuiltin.se_flush -> None {
@@ -908,12 +930,16 @@ impl JacBuiltin.se_guard(fn: any) -> any {
     import functools;
     @functools.wraps(fn)
     def _gm_se_wrapper(*args: any, **kwargs: any) -> any {
+        JacBuiltin.se_region_enter();
         try {
             return fn(*args, **kwargs);
         } finally {
-            # Runs on normal AND exceptional exits. On the normal path the
-            # in-frame flush already drained the buffer, so this is a no-op; on
-            # the exceptional path it is the only flush that runs.
+            # Leave the region BEFORE flushing, so replayed calls are performed
+            # rather than re-buffered.
+            JacBuiltin.se_region_exit();
+            # Runs on normal AND exceptional exits. Drains anything the compiled
+            # region buffered, including from inlined helpers that emit no flush
+            # of their own.
             JacBuiltin.se_flush();
         }
     }
@@ -967,6 +993,11 @@ impl JacBuiltin.log_emit(slot: int, args: tuple, kwargs: dict) -> None {
 }
 
 impl JacBuiltin.log_flush_hook(module: any, inputs: any, output: any) -> any {
+    # Close the region opened by se_region_open before replaying, so replayed
+    # calls are performed rather than re-buffered, then drain the side-effect
+    # buffer that inlined helpers filled during this forward.
+    JacBuiltin.se_region_exit();
+    JacBuiltin.se_flush();
     for entry in _gm_log_buffer {
         (slot, args, kwargs) = entry;
         _gm_log_registry[slot](*args, **kwargs);
