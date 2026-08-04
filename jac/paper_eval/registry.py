@@ -63,10 +63,42 @@ def _pegasus_causal():
     return m, {"input_ids": torch.randint(0, 128, (1, 8))}
 
 
+def _phi3_longrope():
+    """Phi-4-mini's LongRoPE path -- the paper's Figure 3 worked example.
+
+    `rope_scaling.type = "longrope"` is what routes the forward through
+    `longrope_frequency_update`, whose `seq_len > original_max_position_embeddings`
+    test is the data-dependent branch [Where] rewrites. Without longrope the
+    model takes the default rope path and exhibits no DC break at all.
+
+    short/long_factor must each have length (hidden_size // num_attention_heads) // 2.
+    """
+    from transformers import Phi3Config, Phi3ForCausalLM
+    hidden, heads = 64, 2
+    n = (hidden // heads) // 2
+    cfg = Phi3Config(
+        vocab_size=128, hidden_size=hidden, intermediate_size=128, pad_token_id=0,
+        num_hidden_layers=2, num_attention_heads=heads, num_key_value_heads=heads,
+        max_position_embeddings=64, original_max_position_embeddings=16,
+        rope_scaling={"type": "longrope",
+                      "short_factor": [1.0] * n,
+                      "long_factor": [2.0] * n},
+    )
+    m = Phi3ForCausalLM(cfg)
+    return m, {"input_ids": torch.randint(0, 128, (1, 8))}
+
+
 MODELS = {
     "t5-small":       {"build": _t5,         "scope": ["transformers.models.t5"]},
     "biogpt":         {"build": _biogpt,     "scope": ["transformers.models.biogpt"]},
     "blenderbot-400M-distill": {"build": _blenderbot, "scope": ["transformers.models.blenderbot"]},
     "opus-mt-fr-en":  {"build": _marian,        "scope": ["transformers.models.marian"]},
     "PegasusForCausalLM": {"build": _pegasus_causal, "scope": ["transformers.models.pegasus"]},
+    # Phi-4-mini exercises [Where]. Its break site is `longrope_frequency_update`
+    # in the SHARED top-level `transformers.modeling_rope_utils`, not under
+    # `transformers.models.phi3` -- scoping only the model package silently
+    # misses it and the model appears to be fixed by [Defer] alone.
+    "Phi-4-mini-instruct": {"build": _phi3_longrope,
+                            "scope": ["transformers.models.phi3",
+                                      "transformers.modeling_rope_utils"]},
 }
