@@ -88,6 +88,34 @@ def _phi3_longrope():
     return m, {"input_ids": torch.randint(0, 128, (1, 8))}
 
 
+def _molformer():
+    """MoLFormer-XL: the paper's [Trap] / validation-guard model (Table 2, VG 5).
+
+    Its `MolformerSelfAttention.forward` holds the Figure 5 pattern verbatim --
+    `if not torch.equal(attention_mask, ...): raise ValueError(...)`.
+
+    Two things make this entry unlike the others. It is Hub REMOTE CODE, so it
+    needs network access; and the revision is pinned, because the 2026-07
+    "Fix deprecated code" commit retargeted the model at a newer transformers
+    (it imports `transformers.masking_utils`, absent in the paper's pinned
+    4.52.4). `7b12d946c181` is the last revision contemporary with the paper.
+    """
+    from transformers import AutoConfig
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    repo, rev = "ibm/MoLFormer-XL-both-10pct", "7b12d946c181"
+    cfg = AutoConfig.from_pretrained(repo, trust_remote_code=True, revision=rev)
+    for k, v in [("hidden_size", 64), ("num_hidden_layers", 2),
+                 ("num_attention_heads", 2), ("intermediate_size", 128),
+                 ("max_position_embeddings", 64)]:
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+    cls = get_class_from_dynamic_module(
+        "modeling_molformer.MolformerModel", repo, revision=rev)
+    m = cls(cfg)
+    return m, {"input_ids": torch.randint(0, 32, (1, 8)),
+               "attention_mask": torch.ones(1, 8, dtype=torch.long)}
+
+
 MODELS = {
     "t5-small":       {"build": _t5,         "scope": ["transformers.models.t5"]},
     "biogpt":         {"build": _biogpt,     "scope": ["transformers.models.biogpt"]},
@@ -101,4 +129,16 @@ MODELS = {
     "Phi-4-mini-instruct": {"build": _phi3_longrope,
                             "scope": ["transformers.models.phi3",
                                       "transformers.modeling_rope_utils"]},
+    # [Trap]. Opt-in: needs network + trust_remote_code, so it is excluded from
+    # the default run (see NETWORK_MODELS). `remote_code` tells the runner to
+    # transform the module source directly -- transformers loads Hub code via
+    # spec_from_file_location, which bypasses sys.meta_path, so --graphmend-scope
+    # cannot intercept it the way it does for in-package modules.
+    "MoLFormer-XL-both10pct": {"build": _molformer,
+                               "scope": [],
+                               "remote_code": "modeling_molformer"},
 }
+
+# Models the default `python -m paper_eval.run_eval` skips: they download code or
+# weights, which the rest of the harness deliberately avoids. Run them by name.
+NETWORK_MODELS = {"MoLFormer-XL-both10pct"}

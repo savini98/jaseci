@@ -18,8 +18,48 @@ import torch
 from paper_eval.registry import MODELS  # noqa: E402
 
 
+def _transform_remote_module(mod_name: str) -> None:
+    """Apply GraphMend to an already-imported Hub remote-code module, in place.
+
+    `--graphmend-scope` cannot reach Hub remote code: transformers loads it with
+    `spec_from_file_location` + `exec_module`, which bypasses `sys.meta_path`
+    entirely, so jaclang's importer never sees the module. The transformation
+    itself applies fine -- only the delivery path differs -- so compile the
+    module's source through the same pipeline and re-exec the result over it.
+    """
+    import ast, types
+    from jaclang.jac0core.program import JacProgram
+    from jaclang.jac0core.compile_options import CompileOptions
+
+    target = next((n for n in sys.modules if n.endswith(mod_name)), None)
+    if target is None:
+        raise RuntimeError(f"remote module {mod_name!r} not imported")
+    orig = sys.modules[target]
+    src_file = orig.__file__
+    prog = JacProgram()
+    prog._graphmend_enabled = True
+    prog._graphmend_scoped_compile = True
+    compiled = prog.compile(
+        file_path=src_file,
+        options=CompileOptions(graphmend=True, type_check=False),
+    )
+    pa = compiled.gen.py_ast
+    src = ast.unparse(pa[0] if isinstance(pa, list) else pa)
+    if "__jac_tensor_eq_assert__" not in src:
+        raise RuntimeError(f"{mod_name}: GraphMend produced no [Trap] lowering")
+    ns = types.ModuleType(target)
+    ns.__file__ = src_file
+    # Carry the hash transformers stamps on a loaded remote module. Without it
+    # the next get_class_in_module sees a mismatch and re-execs the ORIGINAL
+    # file over this namespace, silently undoing the transformation.
+    ns.__transformers_module_hash__ = getattr(orig, "__transformers_module_hash__", "")
+    sys.modules[target] = ns
+    exec(compile(src, src_file, "exec"), ns.__dict__)  # noqa: S102
+
+
 def main(key: str, mode: str) -> None:
     spec = MODELS[key]
+    remote = spec.get("remote_code")
     if mode == "on":
         from jaclang.jac0core.runtime import JacRuntime as Jac
         prog = Jac.get_program()
@@ -27,6 +67,12 @@ def main(key: str, mode: str) -> None:
         prog._graphmend_scope = list(spec["scope"])
 
     torch.manual_seed(0)
+    if mode == "on" and remote:
+        # Build once so the remote source is resolved and imported, transform it,
+        # then rebuild so the model is constructed from the transformed classes.
+        spec["build"]()
+        _transform_remote_module(remote)
+        torch.manual_seed(0)
     model, inputs = spec["build"]()
     model.eval()
 

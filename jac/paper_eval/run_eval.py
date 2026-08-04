@@ -12,7 +12,7 @@ are out of scope here. Run with the repo jaclang on PYTHONPATH:
 """
 import sys, os, json, subprocess
 
-from paper_eval.registry import MODELS
+from paper_eval.registry import MODELS, NETWORK_MODELS
 
 
 def _run(key: str, mode: str) -> dict:
@@ -55,4 +55,13 @@ def main(keys):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:] or list(MODELS))
+    # Named models run as asked; a bare run skips the ones needing network so the
+    # default stays offline and download-free.
+    args = sys.argv[1:]
+    if not args:
+        args = [k for k in MODELS if k not in NETWORK_MODELS]
+        skipped = sorted(NETWORK_MODELS)
+        if skipped:
+            print(f"(skipping network models: {', '.join(skipped)} -- "
+                  f"run by name to include)", file=sys.stderr)
+    main(args)
