@@ -537,7 +537,7 @@ rather than proved:
 |---------|-------|
 | Detection / tagging (Alg. 1) | `graph_break_detect_pass.jac` |
 | Alg. 2 (predicate ctrl-flow) | `predicate_ctrl_flow_pass.jac` -- `_setups_safe` (INV2 control + INV3 effect), `_effect_neutral`/`_is_existence_guard`/`_is_device_move`/`_all_local_targets` (idempotent-write licensing & escape), `_has_none` (INV4), `Reconcile` ≈ `_same_lhs`/`_merge_common_call`, `_use_cond` (where vs cond), `_gate_asserts`/`Regate` (INV2 compose), `_is_eq_assert` bail |
-| Alg. 3 (defer side effects) | `defer_side_effect_pass.jac` -- `_is_user_defined` (INV3 binding), `_buffer_entry`/`_clone_guard` (snapshot: hoist + clone-if-tensor), forward-hook slot mechanism, return-value hoist |
+| Alg. 3 (defer side effects) | `graph_break_detect_pass.jac` -- `_is_user_defined` (INV3 binding, gates the `side_effect` tag); `defer_side_effect_pass.jac` -- `_buffer_entry`/`_clone_guard` (snapshot: hoist + clone-if-tensor), forward-hook slot mechanism, return-value hoist |
 | Alg. 4 (trap lowering) | `trap_lowering_pass.jac` -- `if not C: raise` match, `torch.equal` → `__jac_tensor_eq_assert__` with shape/dtype guard, tensor-bool direct; `_marked_message` (fold exception type into a literal marker), `_enclosing_compiled_fn`/`exit_ability` (prepend `@__jac_trap_guard__`); `runtime.impl.jac` `trap_guard` (boundary restore) |
 | Alg. 5 (scheduling) | `jac0core/compiler.jac` `get_py_code_gen` -- order: Detect → Trap → Predicate → DeferSideEffect |
 
@@ -549,6 +549,42 @@ rather than proved:
   `test_nested_guard_in_branch_defragmented` (graph 1) and
   `test_nested_guard_preserves_conditional_assert_semantics` (untaken-branch guard
   stays dormant).
+
+### Claims that overstate the implementation
+
+Found by an end-to-end audit of the paper and rebuttal against this code. These
+are documentation defects, not code defects: the implementation is sound, but
+the prose describes something stronger than what it does.
+
+- **A1: deferral is per-function, not to the compiled-region exit.** The
+  rebuttal states that GraphMend defers print/logger calls "until the end of the
+  compiled forward-pass computation, rather than merely until the end of the
+  inner function in which they appear," and that this "allows the entire
+  computation to remain within a single FX graph." The flush is emitted at the
+  end of the function *containing* the call. For a `print` inside a helper that
+  a `@torch.compile` function calls, the flush lands at the helper's return, and
+  since Dynamo inlines the helper that flush splits the graph from inside.
+  Measured on such a case: 2 breaks -> 1, not 2 -> 0.
+
+  The claim is achievable now that `_gm_se_buffer` is process-global and
+  `__jac_se_guard__` flushes at the compiled boundary: an inner function could
+  append without flushing and let the entry's guard drain it. Doing so safely
+  needs call-graph reachability, though -- suppressing the inner flush for a
+  helper that is *not* reached from a guarded entry would leave its output
+  buffered indefinitely. Until that analysis exists, the honest phrasing is
+  "deferred to the end of the enclosing function, and to the compiled-region
+  exit when the call is directly in a compiled entry or an `nn.Module.forward`."
+
+- **Table 1 `[Where]`: the stated legality condition is not the one enforced.**
+  The row requires that "every function call in the region resolves through
+  UniiR to inspectable code that the analysis validates as free of observable
+  side effects, exceptions, and graph-break inducers." No such whole-region call
+  validation exists. What the implementation actually guarantees is narrower and
+  differently structured: hoisted *setups* are effect-neutral (G1-G5, 4.3), a
+  branch *value* containing a call is routed to `torch.cond` so the untaken call
+  never runs (4.1.1), and the combination neither rewrite can handle is
+  declined. That is sound, but Table 1 should describe it rather than a
+  validation pass that is not there.
 
 ### Known limitations (honest scope)
 

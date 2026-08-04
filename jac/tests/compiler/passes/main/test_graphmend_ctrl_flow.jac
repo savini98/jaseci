@@ -140,6 +140,16 @@ test "hasattr-initialized attribute read outside the region is declined" {
     assert "if seq_len > 8:" in src;
 }
 
+test "a call paired with a literal branch value is declined" {
+    src = _pysrc("call_vs_literal.jac", True);
+    # torch.where would speculate the call onto the untaken path; torch.cond
+    # cannot return the float. Neither is sound, so the branch stays.
+    assert "torch.where(" not in src;
+    assert "torch.cond(" not in src;
+    assert "if x.sum() > 0:" in src;
+    assert "__gm_true_0 = side_effecting" not in src;
+}
+
 test "existence-guarded init with an impure initializer is declined" {
     src = _pysrc("guard_impure_init.jac", True);
     # The attribute callee cannot be pinned to one table entry, so every

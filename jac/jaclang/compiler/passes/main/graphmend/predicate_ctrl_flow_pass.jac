@@ -779,6 +779,9 @@ obj PredicateCtrlFlowPass(UniPass) {
     def _rewrite_assignment(
         nd: uni.IfStmt, lhs: uni.Name, true_e: uni.Expr, false_e: uni.Expr
     ) {
+        if self._unfixable_call_literal(true_e, false_e) {
+            return;
+        }
         if self._use_cond(true_e, false_e) {
             (stmts, c_ref) = self._hoist_cond(nd, nd.condition);
             cond_call = self._make_cond(nd, c_ref, true_e, false_e);
@@ -793,6 +796,9 @@ obj PredicateCtrlFlowPass(UniPass) {
 
     """Rewrite same-shape return branches into a torch.where / torch.cond return."""
     def _rewrite_return(nd: uni.IfStmt, true_e: uni.Expr, false_e: uni.Expr) {
+        if self._unfixable_call_literal(true_e, false_e) {
+            return;
+        }
         if self._use_cond(true_e, false_e) {
             (stmts, c_ref) = self._hoist_cond(nd, nd.condition);
             cond_call = self._make_cond(nd, c_ref, true_e, false_e);
@@ -817,6 +823,19 @@ obj PredicateCtrlFlowPass(UniPass) {
             return False;
         }
         return self._has_call(true_e) or self._has_call(false_e);
+    }
+
+    """True if neither form is legal, so the branch must be left alone.
+
+    A call paired with a literal is the gap between the two rewrites:
+    `torch.where` would evaluate the call on the untaken path (an observable
+    effect the original never performed -- INV2), and `torch.cond` cannot be
+    used because its branches must return tensors, not a Python literal. Neither
+    is sound, so the conditional is preserved and the break is left in place.
+    """
+    def _unfixable_call_literal(true_e: uni.Expr, false_e: uni.Expr) -> bool {
+        has_lit = isinstance(true_e, uni.Literal) or isinstance(false_e, uni.Literal);
+        return has_lit and (self._has_call(true_e) or self._has_call(false_e));
     }
 
     """True if `e` is or contains a function call."""
