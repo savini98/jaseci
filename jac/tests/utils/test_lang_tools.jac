@@ -6,12 +6,11 @@ table output, and uninode autodoc.
 """
 
 import os;
-import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import from jaclang.utils.lang_tools { AstTool }
 
-glob JAC_ROOT = str(Path(jaclang.__file__).parent.parent),
-     LANG_FIXTURES = os.path.join(JAC_ROOT, "tests", "language", "fixtures");
+glob LANG_FIXTURES = os.path.join(JAC_ROOT, "tests", "language", "fixtures");
 
 test "pass template" {
     tool = AstTool();
@@ -65,7 +64,8 @@ test "sym sym dot" {
     jac_file = os.path.join(LANG_FIXTURES, "hello.jac");
     out = tool.ir(["sym", jac_file]);
     assert (
-        "\n|   +-- ConnectionAbortedError\n|   |   +-- public var\n|   +-- ConnectionError\n|" not in out
+        "\n|   +-- ConnectionAbortedError\n|   |   +-- public var\n|   +-- ConnectionError\n|"
+        not in out
     );
     check_list = ["######", "# hello #", "######", "SymTable::Module(hello)"];
     for i in check_list {
@@ -79,6 +79,7 @@ test "uninode doc" {
     tool = AstTool();
     auto_uni = tool.autodoc_uninode();
     assert (
-        "## LambdaExpr\n```mermaid\nflowchart LR\nLambdaExpr -->|Expr , CodeBlockStmt| body" in auto_uni
+        "## LambdaExpr\n```mermaid\nflowchart LR\nLambdaExpr -->|Expr , CodeBlockStmt| body"
+        in auto_uni
     );
 }

@@ -3,11 +3,8 @@ server endpoint. The endpoints are reached only through the client's
 `sv import`, so they exercise Path B (whole-program cross-boundary detection).
 """
 
-to cl:
-
 import from .crossbound_frontend { Panel as ClientPanel }
 
 def:pub app -> JsxElement {
-    return
-        <ClientPanel/>;
+    <ClientPanel/>
 }

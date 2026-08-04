@@ -1,13 +1,12 @@
 """TypeVar validation tests for the type checker."""
 
 import os;
-import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import from jaclang.compiler.passes.main.type_checker_pass { TypeCheckPass }
 import from jaclang.jac0core.program { JacProgram }
 
-glob JAC_ROOT = str(Path(jaclang.__file__).parent.parent),
-     CHECKER_FIXTURES = os.path.join(
+glob CHECKER_FIXTURES = os.path.join(
          JAC_ROOT, "tests", "compiler", "passes", "main", "fixtures", "checker"
      ),
      TYPEVAR_FIXTURES = os.path.join(
@@ -104,11 +103,11 @@ test "typevar5_unbounded_operations" {
 
     # Binary operator errors
     assert 'Operator "__add__' in all_errors
-    and 'not supported for type' in all_errors , "Expected binary op error for a + 1";
+        and 'not supported for type' in all_errors , "Expected binary op error for a + 1";
 
     # Unary operator errors
     assert 'Operator "__neg__' in all_errors
-    and 'not supported for type' in all_errors , "Expected unary op error for -a";
+        and 'not supported for type' in all_errors , "Expected unary op error for -a";
 
     # Await errors
     assert 'Type "_T1" is not awaitable' in all_errors , "Expected await error for await a";

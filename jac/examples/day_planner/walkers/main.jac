@@ -1,14 +1,10 @@
 """AI Day Planner -- walker-based version with OSP."""
 
-to cl:
-
 import from frontend { app as ClientApp }
 
 def:pub app -> JsxElement {
-    return <ClientApp/>;
+    <ClientApp/>
 }
-
-to sv:
 
 enum Category { WORK, PERSONAL, SHOPPING, HEALTH, FITNESS, OTHER }
 
@@ -52,7 +48,7 @@ walker:priv AddTask {
     can create with Root entry {
         category = str(categorize(self.title)).split(".")[-1].lower();
         new_task = here ++> Task(title=self.title, category=category);
-        report new_task[0];
+        report new_task;
     }
 }
 

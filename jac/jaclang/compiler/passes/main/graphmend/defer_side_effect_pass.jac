@@ -320,7 +320,7 @@ obj DeferSideEffectPass(UniPass) {
     def _gen_name(at: uni.UniNode, value: str, store: bool) -> uni.Name {
         nm = uni.Name.gen_stub_from_node(at, value);
         if store {
-            nm.py_ctx_func = ast3.Store;
+            nm.expr_ctx = uni.ExprCtx.STORE;
         }
         return nm;
     }

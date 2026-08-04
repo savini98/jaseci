@@ -1,15 +1,20 @@
-"""Code location info for AST nodes."""
-import ast as ast3;
+import hashlib;
+import re;
 import from collections.abc { Sequence }
+import from contextvars { ContextVar }
 import from dataclasses { field }
 import from typing { Any }
 import type from jaclang.compiler.passes.ecmascript.estree { IndexInfo, SliceInfo }
 import type from jaclang.compiler.passes.ecmascript.estree { Node as EsNode }
+import type from jaclang.jac0core.unitree { CommentToken }
 import type from jaclang.compiler.passes.tool.doc_ir { Doc }
 import type from jaclang.jac0core.unitree { Source, Token }
-import type from llvmlite.binding { ModuleRef, ExecutionEngine }
+import type from jaclang.jac0core.osp_model { OspModel }
+import type from jaclang.compiler.passes.native.llvm.binding {
+    ModuleRef,
+    ExecutionEngine
+}
 
-"""Client-side rendering manifest metadata."""
 obj ClientManifest {
     has exports: list = [],
         globals: list = [],
@@ -19,20 +24,13 @@ obj ClientManifest {
         imports: dict[(str, str)] = field(default_factory=`dict),
         endpoint_effects: dict[(str, dict)] = field(default_factory=`dict),
         tests: list[dict[(str, str)]] = field(default_factory=`list),
-        # Absolute paths of server (`sv import`) modules this client file binds
-        # to. A full-stack cl test boots these directly instead of guessing the
-        # backend by filename.
-        server_imports: list[str] = field(default_factory=`list);
+        server_imports: list[str] = field(default_factory=`list),
+        page_export: (str | None) = None,
+        layout_export: (str | None) = None;
 }
 
-"""Codespace context for interop bindings."""
-enum InteropContext {
-    SERVER = 'server',
-    NATIVE = 'native',
-    CLIENT = 'client'
-}
+enum InteropContext { SERVER = 'server', NATIVE = 'native', CLIENT = 'client' }
 
-"""Metadata for an exported native function."""
 obj NativeFunctionInfo {
     has name: str,
         ret_type: str = 'int',
@@ -40,7 +38,6 @@ obj NativeFunctionInfo {
         param_names: list = [];
 }
 
-"""Metadata for a compiled .na.jac module."""
 obj NativeModuleInfo {
     has mod_path: str,
         llvm_module: (ModuleRef | None) = None,
@@ -50,7 +47,6 @@ obj NativeModuleInfo {
         );
 }
 
-"""Layout info for a single struct field (for native ctypes marshalling)."""
 obj NativeFieldInfo {
     has name: str,
         llvm_type: str,
@@ -61,28 +57,24 @@ obj NativeFieldInfo {
         func_ret_type: (str | None) = None;
 }
 
-"""Layout info for a native struct (for ctypes auto-generation)."""
 obj NativeStructLayout {
     has name: str,
         fields: list[NativeFieldInfo] = field(default_factory=`list),
         has_vtable: bool = False;
 }
 
-"""Layout info for a native enum."""
 obj NativeEnumLayout {
     has name: str,
         is_string_valued: bool = False,
         members: list = field(default_factory=`list);
 }
 
-"""Layout info for a native tuple return type."""
 obj NativeTupleLayout {
     has key: str,
         element_types: list[str] = field(default_factory=`list),
         element_struct_hints: list = field(default_factory=`list);
 }
 
-"""Layout info for a native function."""
 obj NativeFuncLayout {
     has name: str,
         param_types: list[str] = field(default_factory=`list),
@@ -90,18 +82,10 @@ obj NativeFuncLayout {
         ret_type: str = "i64",
         ret_struct_name: (str | None) = None,
         ret_tuple_layout: (NativeTupleLayout | None) = None,
-        # Enum type name when the function returns an enum (lowered to i64), so
-        # the marshaller can map the ordinal back to the Python enum member
-        # instead of leaking a raw int to Python callers.
-        ret_enum_type: (str | None) = None;
+        ret_enum_type: (str | None) = None,
+        ret_elem_keys: (list | None) = None;
 }
 
-"""Layout info for a native test block.
-
-A `test` block in native context lowers to a zero-argument native function
-returning `i8*`: null means the test passed, a non-null pointer is a static
-failure message (the uncaught exception's message).
-"""
 obj NativeTestLayout {
     has name: str,
         symbol: str,
@@ -109,58 +93,247 @@ obj NativeTestLayout {
         line: int = 0;
 }
 
-"""Native symbol name for a test block.
-
-Single naming contract shared by NaIRGenPass (which defines the function)
-and PyastGenPass (whose host-side shim looks the address up by name). The
-line number keeps symbols unique when two descriptions derive the same
-identifier.
-"""
 def native_test_symbol(name: str, line: int) -> str {
     return f"__jac_test_{name}_{line}";
 }
 
-"""Resolve a module name to a .na.jac file path.
+def native_safe_sym(src: str) -> str {
+    if src in ("osp_kernel", "fmt_kernel") {
+        return src;
+    }
+    safe = re.sub(r'[^a-zA-Z0-9_]', '_', src);
+    return f"{safe}_{hashlib.sha1(src.encode()).hexdigest()[:8]}";
+}
 
-Shared resolver used by both BoundaryAnalysisPass and NaIRGenPass to
-ensure consistent native module path resolution across the compiler.
+glob NATIVE_SUPPORTED_STDLIB: set[str] = {
+         "sys",
+         "math",
+         "time",
+         "os",
+         "random",
+         "struct"
+     },
+     _effective_codespace_ctx: ContextVar[str] = ContextVar(
+         "jac_effective_default_codespace", default=""
+     ),
+     _closure_cap_ctx: ContextVar[int] = ContextVar(
+         "jac_native_closure_cap", default=0
+     );
 
-Returns (source_module_str, full_path) or (None, None) if not found.
-source_module_str mirrors the value stored in InteropBinding.source_module.
-"""
+def set_effective_default_codespace(value: str) {
+    _effective_codespace_ctx.set(value);
+}
+
+def get_effective_default_codespace_override -> str {
+    return _effective_codespace_ctx.get();
+}
+
+def effective_default_codespace -> str {
+    cur = _effective_codespace_ctx.get();
+    if cur {
+        return cur;
+    }
+    try {
+        import from jaclang.project.config { get_config, BuildConfig }
+        cfg = get_config();
+        if cfg is not None {
+            return cfg.build.default_codespace;
+        }
+        return BuildConfig().default_codespace;
+    } except Exception {
+        return "server";
+    }
+}
+
+def set_native_closure_cap(value: int) {
+    _closure_cap_ctx.set(value);
+}
+
+def get_native_closure_cap_override -> int {
+    return _closure_cap_ctx.get();
+}
+
+def effective_native_closure_cap -> int {
+    cur = _closure_cap_ctx.get();
+    if cur > 0 {
+        return cur;
+    }
+    try {
+        import from jaclang.project.config { get_config, BuildConfig }
+        cfg = get_config();
+        if cfg is not None {
+            return cfg.build.native_closure_cap;
+        }
+        return BuildConfig().native_closure_cap;
+    } except Exception {
+        return 256;
+    }
+}
+
+def native_stdlib_root -> (str | None) {
+    import os;
+    import jaclang;
+    if not jaclang?.__file__ {
+        return None;
+    }
+    root = os.path.join(os.path.dirname(jaclang.__file__), "runtimelib", "na_stdlib");
+    return root if os.path.isdir(root) else None;
+}
+
+def is_native_by_location(file_path: str) -> bool {
+    import os;
+    import jaclang;
+    if not file_path or not jaclang?.__file__ {
+        return False;
+    }
+    ap = os.path.abspath(file_path);
+    pkg = os.path.dirname(os.path.abspath(str(jaclang.__file__)));
+    return ap.startswith(os.path.join(pkg, "runtimelib", "na_stdlib") + os.sep);
+}
+
+glob CLIENT_RUNTIME_SOURCE_PATHS: tuple = (
+         ("runtimelib", "client_runtime.jac"),
+         ("runtimelib", "client_runtime_core.jac"),
+         ("runtimelib", "solid_runtime.jac"),
+         ("runtimelib", "pwa_runtime.jac"),
+         ("runtimelib", "wasm_host.jac"),
+         ("runtimelib", "client", "client_mobui.jac"),
+         ("runtimelib", "client", "client_runtime_core.jac"),
+         ("runtimelib", "client", "client_runtime_native.jac"),
+         ("runtimelib", "client", "targets", "desktop", "plugin", "desktop_api.jac"),
+
+     );
+
+
+def is_client_by_location(file_path: str) -> bool {
+    import os;
+    import jaclang;
+    if not file_path or not jaclang?.__file__ {
+        return False;
+    }
+    ap = os.path.abspath(file_path);
+    pkg = os.path.dirname(os.path.abspath(str(jaclang.__file__)));
+    for parts in CLIENT_RUNTIME_SOURCE_PATHS {
+        if ap == os.path.join(pkg, *parts) {
+            return True;
+        }
+    }
+    return False;
+}
+
+def is_bundled_native_module(module_name: str) -> bool {
+    import os;
+    root = native_stdlib_root();
+    if root is None or not module_name {
+        return False;
+    }
+    path_name = module_name.lstrip('.').replace('.', os.sep);
+    return _native_variant_path(os.path.join(root, path_name)) is not None;
+}
+
+def native_target_os -> str {
+    import os;
+    import platform;
+    _t = os.environ.get("JAC_NATIVE_TARGET", "");
+    if _t {
+        if ("darwin" in _t) or ("apple" in _t) {
+            return "darwin";
+        }
+        if ("windows" in _t) or ("msvc" in _t) {
+            return "windows";
+        }
+        return "linux";
+    }
+    _s = platform.system();
+    if _s == "Darwin" {
+        return "darwin";
+    }
+    if _s == "Windows" {
+        return "windows";
+    }
+    return "linux";
+}
+
+def _native_variant_path(base_no_ext: str) -> (str | None) {
+    import os;
+    _osv = os.path.join(f"{base_no_ext}.{native_target_os()}.jac");
+    if os.path.exists(_osv) {
+        return _osv;
+    }
+    _plain = f"{base_no_ext}.jac";
+    if os.path.exists(_plain) {
+        return _plain;
+    }
+    return None;
+}
+
+def _inferred_native_path(candidate: (str | None)) -> (str | None) {
+    if candidate is None {
+        return None;
+    }
+    import from jaclang.jac0core.placement_solver { native_default_path_ok }
+    return candidate if native_default_path_ok(candidate) else None;
+}
+
 def resolve_native_module(
-    module_name: str, base_dir: str
+    module_name: str, base_dir: str, allow_inferred: bool = True
 ) -> tuple[(str | None, str | None)] {
     import os;
     clean = module_name.lstrip('.');
-    # Fast path: flat filename (e.g. 'tokens' → 'tokens.na.jac')
-    na_jac = os.path.join(base_dir, f"{clean}.na.jac");
-    if os.path.exists(na_jac) {
-        return (f"{clean}.na", na_jac);
-    }
-    # Slow path: dotted name → directory hierarchy, walk up to project root.
     path_name = clean.replace('.', os.sep);
-    if path_name != clean {
-        search = os.path.abspath(base_dir);
-        while True {
-            cand = os.path.join(search, f"{path_name}.na.jac");
-            if os.path.exists(cand) {
-                rel = os.path.relpath(cand[:-4], os.path.abspath(base_dir));
-                return (rel, cand);
+
+    if allow_inferred {
+        local = _inferred_native_path(
+            _native_variant_path(os.path.join(base_dir, clean))
+        );
+        if local is not None {
+            return (f"{clean}.jac", local);
+        }
+        if path_name != clean {
+            search = os.path.abspath(base_dir);
+            while True {
+                cand = _inferred_native_path(
+                    _native_variant_path(os.path.join(search, path_name))
+                );
+                if cand is not None {
+                    rel = os.path.relpath(cand, os.path.abspath(base_dir));
+                    return (rel, cand);
+                }
+                parent = os.path.dirname(search);
+                if parent == search {
+                    break;
+                }
+                search = parent;
             }
-            parent = os.path.dirname(search);
-            if parent == search {
-                break;
-            }
-            search = parent;
+        }
+    }
+
+    bundled_root = native_stdlib_root();
+    if bundled_root is not None {
+        bundled = _native_variant_path(os.path.join(bundled_root, path_name));
+        if bundled is not None {
+            return (path_name, bundled);
         }
     }
     return (None, None);
 }
 
-"""Complete layout metadata for a native module (auto-generated by NaIRGenPass)."""
+def native_wasm_stem(path: str) -> str {
+    import os;
+    stem = os.path.splitext(os.path.basename(path))[0];
+    for marker in ('.cl', ) {
+        if stem.endswith(marker) {
+            stem = stem[0:-len(marker)];
+        }
+    }
+    return stem;
+}
+
+glob NATIVE_ABI_VERSION: int = 1;
+
 obj NativeModuleLayout {
-    has structs: dict[(str, NativeStructLayout)] = field(default_factory=`dict),
+    has abi_version: int = NATIVE_ABI_VERSION,
+        structs: dict[(str, NativeStructLayout)] = field(default_factory=`dict),
         enums: dict[(str, NativeEnumLayout)] = field(default_factory=`dict),
         functions: dict[(str, NativeFuncLayout)] = field(default_factory=`dict),
         methods: dict[(str, NativeFuncLayout)] = field(default_factory=`dict),
@@ -169,24 +342,83 @@ obj NativeModuleLayout {
         tests: list[NativeTestLayout] = field(default_factory=`list);
 }
 
-"""Metadata for a type (obj, node, enum) that crosses a codespace boundary.
+def _tuple_layout_to_dict(t: (NativeTupleLayout | None)) -> (dict | None) {
+    if t is None {
+        return None;
+    }
+    return {
+        "key": t.key,
+        "element_types": list(t.element_types),
+        "element_struct_hints": list(t.element_struct_hints)
+    };
+}
 
-    Collected by BoundaryAnalysisPass, consumed by EsastGenPass to emit
-    JS class stubs with __from_wire/__to_wire methods.
-    """
+def _func_layout_to_dict(f: NativeFuncLayout) -> dict {
+    return {
+        "name": f.name,
+        "param_types": list(f.param_types),
+        "param_names": list(f.param_names),
+        "ret_type": f.ret_type,
+        "ret_struct_name": f.ret_struct_name,
+        "ret_tuple_layout": _tuple_layout_to_dict(f.ret_tuple_layout),
+        "ret_enum_type": f.ret_enum_type,
+        "ret_elem_keys": (
+            list(f.ret_elem_keys) if f.ret_elem_keys is not None else None
+        )
+    };
+}
+
+def native_layout_to_dict(layout: NativeModuleLayout) -> dict {
+    return {
+        "abi_version": layout.abi_version,
+        "structs": {
+            name: {
+                "name": s.name,
+                "has_vtable": s.has_vtable,
+                "fields": [
+                    {
+                        "name": fld.name,
+                        "llvm_type": fld.llvm_type,
+                        "index": fld.index,
+                        "enum_type": fld.enum_type,
+                        "is_func_ptr": fld.is_func_ptr,
+                        "func_param_types": (
+                            list(fld.func_param_types)
+                                if fld.func_param_types is not None
+                                else None
+                        ),
+                        "func_ret_type": fld.func_ret_type
+                    } for fld in s.fields
+                ]
+            } for (name, s) in layout.structs.items()
+        },
+        "enums": {
+            name: {
+                "name": e.name,
+                "is_string_valued": e.is_string_valued,
+                "members": list(e.members)
+            } for (name, e) in layout.enums.items()
+        },
+        "functions": {
+            name: _func_layout_to_dict(f) for (name, f) in layout.functions.items()
+        },
+        "methods": {
+            name: _func_layout_to_dict(f) for (name, f) in layout.methods.items()
+        },
+        "list_elem_types": dict(layout.list_elem_types),
+        "tuples": {key: _tuple_layout_to_dict(t) for (key, t) in layout.tuples.items()}
+    };
+}
+
 obj BoundaryTypeInfo {
     has name: str,
-        kind: str,  # "obj", "node", "walker", "enum"
+        kind: str,
         fields: list[tuple[(str, str)]] = field(default_factory=`list),
+        field_defaults: dict[(str, Any)] = field(default_factory=`dict),
         enum_members: list[tuple[(str, Any)]] = field(default_factory=`list),
         nested_types: list[str] = field(default_factory=`list);
 }
 
-"""A function callable across codespace boundaries.
-
-    Records that a function defined in `source_context` is called from
-    one or more other codespace contexts listed in `callers`.
-    """
 obj InteropBinding {
     has name: str,
         source_context: InteropContext,
@@ -195,97 +427,75 @@ obj InteropBinding {
         param_types: list[str] = [],
         param_names: list[str] = [],
         ast_node: any = None,
-        route: list[InteropContext] = [],
         source_module: (str | None) = None,
-        # Kind of provider symbol this binding stubs out: 'function' for
-        # `def:pub` functions (POST /function/<name>), 'walker' for
-        # `walker:pub` archetypes (POST /walker/<name>). Drives stub
-        # codegen and runtime dispatch for sv-to-sv imports.
         kind: str = 'function';
 
-    has is_direct: bool { getter; }
-    has is_composed: bool { getter; }
     has is_cross_module: bool { getter; }
 }
 
-"""All cross-boundary function bindings for a module.
-
-    Built by BoundaryAnalysisPass (front-end), consumed by codegen + serve.
-    """
 obj InteropManifest {
     has bindings: dict[(str, InteropBinding)] = field(default_factory=`dict),
         boundary_types: dict[(str, BoundaryTypeInfo)] = field(default_factory=`dict),
-        # Graph-effect contract per RPC endpoint, keyed `walker:<name>` /
-        # `func:<name>` -> {is_writer, touches}. Produced by the boundary
-        # analysis pass (formerly WalkerEffectsPass -> client_manifest).
         endpoint_effects: dict[(str, dict)] = field(default_factory=`dict),
-        # Per-symbol auth requirement (True = auth required, secure-by-default),
-        # computed at compile time so the serve runtime never re-walks ASTs.
         func_access: dict[(str, bool)] = field(default_factory=`dict),
         walker_access: dict[(str, bool)] = field(default_factory=`dict),
         native_module_imports: dict[(str, NativeModuleInfo)] = field(
             default_factory=`dict
         ),
-        # Transitive closure of native module source strings (e.g. "foo.na").
-        # Populated by NaIRGenPass._register_imported_struct_types via DFS,
-        # consumed by _codegen_entry to emit __jac_glob_init_<safe_name>() calls.
-        native_transitive_sources: list[str] = field(default_factory=`list),
-        JAC_TO_CTYPES: dict[(str, str)] = field(
-            default_factory=lambda() :
-                {
-                    'int': 'ctypes.c_int64',
-                    'float': 'ctypes.c_double',
-                    'bool': 'ctypes.c_bool',
-                    'str': 'ctypes.c_char_p'
-                }
-        );
+        native_transitive_sources: list[str] = field(default_factory=`list);
 
     has native_imports: list[InteropBinding] { getter; }
     has native_exports: list[InteropBinding] { getter; }
     has native_cross_module_imports: list[InteropBinding] { getter; }
+    has client_native_imports: list[InteropBinding] { getter; }
     has server_exports_to_client: list[InteropBinding] { getter; }
     has server_exports_to_server: list[InteropBinding] { getter; }
 }
 
-"""Code generation target."""
+obj NodeComments {
+    has leading: list[CommentToken] = [],
+        trailing_inline: list[CommentToken] = [],
+        trailing_own: list[CommentToken] = [],
+        indent_trailing_own: bool = False;
+}
+
 obj CodeGenTarget {
     has py: str = '',
         jac: str = '',
         _doc_ir: (Doc | None) = None,
         js: str = '',
         css: str = '',
-        client_manifest: ClientManifest = field(default_factory=ClientManifest),
+        _client_manifest: (ClientManifest | None) = None,
         py_ast: list = field(default_factory=`list),
         py_bytecode: (bytes | None) = None,
         es_ast: EsNode | Sequence[EsNode] | SliceInfo | IndexInfo | None = None,
         llvm_ir: (ModuleRef | None) = None,
         native_engine: (ExecutionEngine | None) = None,
         native_bitcode: (bytes | None) = None,
-        interop_manifest: InteropManifest = field(default_factory=InteropManifest),
+        _interop_manifest: (InteropManifest | None) = None,
         interop_py_funcs: dict[(str, Any)] = field(default_factory=`dict),
         _interop_callbacks: list[any] = field(default_factory=`list),
         native_layout: (NativeModuleLayout | None) = None,
-        native_compat: bool = False,
+        osp_model: (OspModel | None) = None,
+        native_viols_reported: bool = False,
+        nogc_enforced: bool = False,
+        nogc_provenance: str = '',
+        rc_last_use: dict[int, list[str]] = field(default_factory=`dict),
+        rc_move_in: set[int] = field(default_factory=`set),
+        anon_region_open: dict[int, int] = field(default_factory=`dict),
+        anon_region_close: dict[int, int] = field(default_factory=`dict),
+        anon_region_locals: dict[int, list[str]] = field(default_factory=`dict),
         layout_registry: any = None,
-        # Paths to C shared libraries discovered during native compilation.
-        # Set by NaIRGenPass._process_clib_imports, consumed by NativeCompilePass
-        # and nacompile CLI for transitive .so loading and AOT linking.
         _clib_paths: list[str] = field(default_factory=`list),
-        # Maps each clib function's C name to the library it was imported from
-        # (e.g. "InitWindow" -> "libraylib.dylib"). Set by the same pass and
-        # consumed by the nacompile CLI to drive Mach-O two-level dylib ordinals.
         _clib_symbol_lib: dict[(str, str)] = field(default_factory=`dict),
-        # Names of `:pub` functions/globals to export across the C ABI when
-        # building a shared library (jac nacompile --shared). Recorded by
-        # NaIRGenPass, propagated across AOT-linked imports by NativeCompilePass,
-        # and consumed by the nacompile CLI + platform linkers to build the
-        # export table (ELF .dynsym / Mach-O export trie / PE export directory).
-        _exported_symbols: list[str] = field(default_factory=`list);
+        _exported_symbols: list[str] = field(default_factory=`list),
+        doc_comments: (NodeComments | None) = None;
 
     has doc_ir: Doc { getter; setter(value: Doc); }
+    has client_manifest: ClientManifest { getter; setter(value: ClientManifest); }
+    has interop_manifest: InteropManifest { getter; setter(value: InteropManifest); }
 }
 
-"""Code location info."""
 obj CodeLocInfo {
     has first_tok: Token,
         last_tok: Token;
@@ -298,9 +508,6 @@ obj CodeLocInfo {
     has col_end: int { getter; }
     has pos_start: int { getter; }
     has pos_end: int { getter; }
-    has tok_range: tuple[(Token, Token)] { getter; }
-    has first_token: Token { getter; }
-    has last_token: Token { getter; }
 
     def update_token_range(first_tok: Token, last_tok: Token) {
         self.first_tok = first_tok;
@@ -318,4 +525,6 @@ obj CodeLocInfo {
     def __str__ -> str {
         return f"{self.first_line}:{self.col_start} - {self.last_line}:{self.col_end}";
     }
+
+    def snapshot -> CodeLocInfo;
 }

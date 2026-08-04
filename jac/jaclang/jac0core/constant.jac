@@ -1,7 +1,5 @@
-"""Constants across the project."""
-import from enum { Enum, IntEnum, IntFlag, StrEnum }
+import from enum { IntFlag, StrEnum }
 
-"""Symbol types."""
 enum SymbolType {
     MODULE = 'module',
     MOD_VAR = 'mod_var',
@@ -34,7 +32,6 @@ enum SymbolType {
     }
 }
 
-"""LSP Token types for Jac."""
 enum JacSemTokenType: int {
     NAMESPACE = 0,
     TYPE = 1,
@@ -69,7 +66,6 @@ enum JacSemTokenType: int {
     }
 }
 
-"""LSP Token modifiers for Jac."""
 class JacSemTokenModifier(IntFlag) {
     with entry {
         DECLARATION = 1 << 0;
@@ -84,11 +80,9 @@ class JacSemTokenModifier(IntFlag) {
         DEFAULT_LIBRARY = 1 << 9;
     }
 
-    """Return the string list of token modifiers."""
     static def as_str_list -> list[str];
 }
 
-"""Token constants for Jac."""
 class Constants(StrEnum) {
     with entry {
         HERE = 'here';
@@ -98,11 +92,9 @@ class Constants(StrEnum) {
         SUPER_ROOT_UUID = '00000000-0000-0000-0000-000000000000';
     }
 
-    """Return the string representation of the token."""
     def __str__(self: Constants) -> str;
 }
 
-"""Code execution context for client/server/native separation."""
 enum CodeContext {
     SERVER = 'server',
     CLIENT = 'client',
@@ -120,14 +112,207 @@ enum CodeContext {
     }
 }
 
-"""Edge direction indicator."""
-enum EdgeDir {
-    IN = 1,
-    OUT = 2,
-    ANY = 3
+enum EdgeDir { IN = 1, OUT = 2, ANY = 3 }
+
+enum ExprCtx { LOAD = 'load', STORE = 'store', DEL = 'del' }
+
+enum OwnershipKind { NONE = 0, OWN = 1, BORROW = 2, MUT_BORROW = 3, IMM = 4 }
+
+glob BROWSER_SEED_GLOBALS: frozenset[str] = frozenset(
+         {
+             "window",
+             "document",
+             "navigator",
+             "localStorage",
+             "sessionStorage",
+             "requestAnimationFrame",
+             "cancelAnimationFrame",
+             "requestIdleCallback",
+             "setTimeout",
+             "setInterval",
+             "clearTimeout",
+             "clearInterval",
+             "Promise",
+             "Date",
+             "fetch",
+             "performance",
+             "IntersectionObserver",
+             "ResizeObserver",
+             "MutationObserver",
+             "AbortController",
+             "URLSearchParams",
+             "FormData",
+             "Blob",
+             "FileReader",
+             "WebSocket",
+             "CustomEvent",
+             "structuredClone",
+             "atob",
+             "btoa"
+         }
+     ),
+     BUILTIN_CALLABLE_NAMES: frozenset[str] = frozenset(
+         {
+             "ArithmeticError",
+             "AssertionError",
+             "AttributeError",
+             "BaseException",
+             "BaseExceptionGroup",
+             "BlockingIOError",
+             "BrokenPipeError",
+             "BufferError",
+             "BytesWarning",
+             "ChildProcessError",
+             "ConnectionAbortedError",
+             "ConnectionError",
+             "ConnectionRefusedError",
+             "ConnectionResetError",
+             "DeprecationWarning",
+             "EOFError",
+             "EncodingWarning",
+             "EnvironmentError",
+             "Exception",
+             "ExceptionGroup",
+             "FileExistsError",
+             "FileNotFoundError",
+             "FloatingPointError",
+             "FutureWarning",
+             "GeneratorExit",
+             "IOError",
+             "ImportError",
+             "ImportWarning",
+             "IndentationError",
+             "IndexError",
+             "InterruptedError",
+             "IsADirectoryError",
+             "KeyError",
+             "KeyboardInterrupt",
+             "LookupError",
+             "MemoryError",
+             "ModuleNotFoundError",
+             "NameError",
+             "NotADirectoryError",
+             "NotImplementedError",
+             "OSError",
+             "OverflowError",
+             "PendingDeprecationWarning",
+             "PermissionError",
+             "ProcessLookupError",
+             "PythonFinalizationError",
+             "RecursionError",
+             "ReferenceError",
+             "ResourceWarning",
+             "RuntimeError",
+             "RuntimeWarning",
+             "StopAsyncIteration",
+             "StopIteration",
+             "SyntaxError",
+             "SyntaxWarning",
+             "SystemError",
+             "SystemExit",
+             "TabError",
+             "TimeoutError",
+             "TypeError",
+             "UnboundLocalError",
+             "UnicodeDecodeError",
+             "UnicodeEncodeError",
+             "UnicodeError",
+             "UnicodeTranslateError",
+             "UnicodeWarning",
+             "UserWarning",
+             "ValueError",
+             "Warning",
+             "ZeroDivisionError",
+             "_IncompleteInputError",
+             "__build_class__",
+             "__import__",
+             "__loader__",
+             "abs",
+             "aiter",
+             "all",
+             "anext",
+             "any",
+             "ascii",
+             "bin",
+             "bool",
+             "breakpoint",
+             "bytearray",
+             "bytes",
+             "callable",
+             "chr",
+             "classmethod",
+             "compile",
+             "complex",
+             "copyright",
+             "credits",
+             "delattr",
+             "dict",
+             "dir",
+             "divmod",
+             "enumerate",
+             "eval",
+             "exec",
+             "exit",
+             "filter",
+             "float",
+             "format",
+             "frozenset",
+             "getattr",
+             "globals",
+             "hasattr",
+             "hash",
+             "help",
+             "hex",
+             "id",
+             "input",
+             "int",
+             "isinstance",
+             "issubclass",
+             "iter",
+             "len",
+             "license",
+             "list",
+             "locals",
+             "map",
+             "max",
+             "memoryview",
+             "min",
+             "next",
+             "object",
+             "oct",
+             "open",
+             "ord",
+             "pow",
+             "print",
+             "property",
+             "quit",
+             "range",
+             "repr",
+             "reversed",
+             "round",
+             "set",
+             "setattr",
+             "slice",
+             "sorted",
+             "staticmethod",
+             "str",
+             "sum",
+             "super",
+             "tuple",
+             "type",
+             "vars",
+             "zip"
+         }
+     );
+
+def is_borrow_kind(k: OwnershipKind) -> bool {
+    return k == OwnershipKind.BORROW or k == OwnershipKind.MUT_BORROW;
 }
 
-"""Symbol access levels."""
+def is_mut_kind(k: OwnershipKind) -> bool {
+    return k == OwnershipKind.MUT_BORROW;
+}
+
 enum SymbolAccess {
     PRIVATE = 'private',
     PUBLIC = 'public',
@@ -139,11 +324,6 @@ enum SymbolAccess {
     }
 }
 
-"""Where a symbol's runtime binding lives (storage class).
-
-Computed centrally from the symbol table so backends never re-derive
-scoping facts (see analysis-centralization-plan, Phase 2).
-"""
 enum SymbolStorage {
     LOCAL = 'local',
     PARAM = 'param',
@@ -157,7 +337,6 @@ enum SymbolStorage {
     }
 }
 
-"""Token constants for the lexer."""
 class Tokens(StrEnum) {
     with entry {
         FLOAT = 'FLOAT';
@@ -244,9 +423,9 @@ class Tokens(StrEnum) {
         KW_ELIF = 'KW_ELIF';
         KW_ELSE = 'KW_ELSE';
         KW_FOR = 'KW_FOR';
-        KW_TO = 'KW_TO';
         KW_BY = 'KW_BY';
         KW_WHILE = 'KW_WHILE';
+        KW_FOREVER = 'KW_FOREVER';
         KW_CONTINUE = 'KW_CONTINUE';
         KW_BREAK = 'KW_BREAK';
         KW_DISENGAGE = 'KW_DISENGAGE';
@@ -287,9 +466,6 @@ class Tokens(StrEnum) {
         KW_SWITCH = 'KW_SWITCH';
         KW_CASE = 'KW_CASE';
         KW_DEFAULT = 'KW_DEFAULT';
-        KW_CLIENT = 'KW_CLIENT';
-        KW_SERVER = 'KW_SERVER';
-        KW_NATIVE = 'KW_NATIVE';
         PLUS = 'PLUS';
         MINUS = 'MINUS';
         STAR_MUL = 'STAR_MUL';
@@ -321,8 +497,6 @@ class Tokens(StrEnum) {
         CARROW_L_P2 = 'CARROW_L_P2';
         CARROW_R_P1 = 'CARROW_R_P1';
         CARROW_R_P2 = 'CARROW_R_P2';
-        GLOBAL_OP = 'GLOBAL_OP';
-        NONLOCAL_OP = 'NONLOCAL_OP';
         KW_HERE = 'KW_HERE';
         KW_VISITOR = 'KW_VISITOR';
         KW_SELF = 'KW_SELF';
@@ -364,20 +538,13 @@ class Tokens(StrEnum) {
         F_TEXT_SQ = 'F_TEXT_SQ';
         F_TEXT_TDQ = 'F_TEXT_TDQ';
         F_TEXT_TSQ = 'F_TEXT_TSQ';
-        RF_TEXT_DQ = 'RF_TEXT_DQ';
-        RF_TEXT_SQ = 'RF_TEXT_SQ';
-        RF_TEXT_TDQ = 'RF_TEXT_TDQ';
-        RF_TEXT_TSQ = 'RF_TEXT_TSQ';
         D_LBRACE = 'D_LBRACE';
         D_RBRACE = 'D_RBRACE';
         CONV = 'CONV';
-        F_FORMAT_TEXT = 'F_FORMAT_TEXT';
     }
 }
 
-"""Token name to string value mapping."""
 glob TOKEN_MAP: dict[str, str] = {
-         'ABILITY_OP': ':can:',
          'ADD_EQ': '+=',
          'ARROW_BI': '<-->',
          'ARROW_L': '<--',
@@ -393,7 +560,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'BW_AND': '&',
          'BW_AND_EQ': '&=',
          'BW_NOT': '~',
-         'BW_NOT_EQ': '~=',
          'BW_OR': '|',
          'BW_OR_EQ': '|=',
          'BW_XOR': '^',
@@ -405,7 +571,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'CARROW_R': '++>',
          'CARROW_R_P1': '+>:',
          'CARROW_R_P2': ':+>',
-         'CLASS_OP': ':class:',
          'COLON': ':',
          'COMMA': ',',
          'COMMENT': '#',
@@ -418,7 +583,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'DOT_FWD': '.>',
          'D_LBRACE': '{{',
          'D_RBRACE': '}}',
-         'EDGE_OP': ':edge:',
          'EE': '==',
          'ELLIPSIS': '...',
          'EQ': '=',
@@ -427,7 +591,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'FLOOR_DIV_EQ': '//=',
          'F_DQ_END': '"',
          'F_DQ_START': 'f"',
-         'F_FORMAT_TEXT': '',
          'F_SQ_END': "'",
          'F_SQ_START': "f'",
          'F_TDQ_END': '"""',
@@ -438,7 +601,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'F_TEXT_TSQ': '',
          'F_TSQ_END': "'''",
          'F_TSQ_START': "f'''",
-         'GLOBAL_OP': 'global',
          'GT': '>',
          'GTE': '>=',
          'HEX': '0x',
@@ -452,7 +614,7 @@ glob TOKEN_MAP: dict[str, str] = {
          'JSX_TAG_END': '>',
          'JSX_TEXT': '',
          'KWESC_NAME': '`',
-         'KW_ABSTRACT': 'abs',
+         'KW_ABSTRACT': 'abst',
          'KW_AND': 'and',
          'KW_AS': 'as',
          'KW_ASSERT': 'assert',
@@ -463,7 +625,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'KW_CAN': 'can',
          'KW_CASE': 'case',
          'KW_CLASS': 'class',
-         'KW_CLIENT': 'cl',
          'KW_CONTINUE': 'continue',
          'KW_DEF': 'def',
          'KW_DEFAULT': 'default',
@@ -479,6 +640,7 @@ glob TOKEN_MAP: dict[str, str] = {
          'KW_FINALLY': 'finally',
          'KW_FLOW': 'flow',
          'KW_FOR': 'for',
+         'KW_FOREVER': 'forever',
          'KW_FROM': 'from',
          'KW_GLOBAL': 'glob',
          'KW_HAS': 'has',
@@ -493,7 +655,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'KW_ISN': 'is not',
          'KW_LAMBDA': 'lambda',
          'KW_MATCH': 'match',
-         'KW_NATIVE': 'na',
          'KW_NIN': 'not in',
          'KW_NODE': 'node',
          'KW_OBJECT': 'obj',
@@ -511,14 +672,12 @@ glob TOKEN_MAP: dict[str, str] = {
          'KW_ROOT': 'root',
          'KW_SELF': 'self',
          'KW_SEM': 'sem',
-         'KW_SERVER': 'sv',
          'KW_SKIP': 'skip',
          'KW_SPAWN': 'spawn',
          'KW_STATIC': 'static',
          'KW_SUPER': 'super',
          'KW_SWITCH': 'switch',
          'KW_TEST': 'test',
-         'KW_TO': 'to',
          'KW_TRY': 'try',
          'KW_VISIT': 'visit',
          'KW_VISITOR': 'visitor',
@@ -541,12 +700,9 @@ glob TOKEN_MAP: dict[str, str] = {
          'MUL_EQ': '*=',
          'NAME': '',
          'NE': '!=',
-         'NODE_OP': ':node:',
-         'NONLOCAL_OP': 'nonlocal',
          'NOT': 'not',
          'NULL': 'None',
          'NULL_OK': '?',
-         'OBJECT_OP': ':obj:',
          'OCT': '0o',
          'PIPE_BKWD': '<|',
          'PIPE_FWD': '|>',
@@ -557,10 +713,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'RF_DQ_START': 'rf"',
          'RF_SQ_START': "rf'",
          'RF_TDQ_START': 'rf"""',
-         'RF_TEXT_DQ': '',
-         'RF_TEXT_SQ': '',
-         'RF_TEXT_TDQ': '',
-         'RF_TEXT_TSQ': '',
          'RF_TSQ_START': "rf'''",
          'RPAREN': ')',
          'RSHIFT': '>>',
@@ -593,7 +745,6 @@ glob TOKEN_MAP: dict[str, str] = {
          'TYP_U64': 'u64',
          'TYP_F32': 'f32',
          'TYP_F64': 'f64',
-         'WALKER_OP': ':walker:',
          'WALRUS_EQ': ':=',
          'WS': ' '
      },
@@ -640,3 +791,11 @@ glob TOKEN_MAP: dict[str, str] = {
          '#F8F8FF',
          '#F0FFFF'
      ];
+
+glob NON_ESCAPED_KEYWORDS: set = {'float', 'int', 'str', 'bool', 'self'};
+
+glob RESERVED_IDENT_NAMES: set = {
+         v
+         for v in TOKEN_MAP.values()
+         if v not in NON_ESCAPED_KEYWORDS
+     };

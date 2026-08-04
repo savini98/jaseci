@@ -27,6 +27,7 @@ import jaclang;
 import from jaclang.compiler.passes.ecmascript { EsastGenPass }
 import from jaclang.compiler.passes.ecmascript.es_unparse { es_to_js }
 import from jaclang.compiler.passes.ecmascript.estree { Node as EsNode }
+import from jaclang.jac0core.codeinfo { native_safe_sym }
 import from jaclang.jac0core.program { JacProgram }
 
 glob FIXTURES = str(
@@ -59,11 +60,19 @@ def run_py_fixture(fixture_stem: str, func_name: str) -> dict {
 # ES (ECMAScript / JavaScript) helpers
 # -----------------------------------------------------------------------
 def compile_fixture_to_js(fixture_name: str) -> str {
+    import from jaclang.compiler.passes.main.type_checker_pass { TypeCheckPass }
     fixture_path = os.path.join(FIXTURES, fixture_name);
     prog = JacProgram();
-    ir = prog.compile(file_path=fixture_path, no_cgen=True);
-    assert not prog.errors_had , (
-        f"Compilation errors in {fixture_name}: {[str(e) for e in prog.errors_had]}"
+    # type_check=True: EsastGenPass consumes core call facts (call_kind/
+    # callee_decl) that only the inference schedule stamps.
+    ir = prog.compile(file_path=fixture_path, no_cgen=True, type_check=True);
+    fatal = [
+        e
+        for e in prog.errors_had
+        if not issubclass(e.from_pass, TypeCheckPass)
+    ];
+    assert not fatal , (
+        f"Compilation errors in {fixture_name}: {[str(e) for e in fatal]}"
     );
     es_pass = EsastGenPass(ir_in=ir, prog=prog);
     es_ir = es_pass.ir_out;
@@ -134,20 +143,26 @@ def unbox_jacval(jv: JacVal) -> object {
         if jv.payload == 0 {
             return {};
         }
+        # Hash-table dict layout (see DictStruct below). `order[0..len]` holds the
+        # keys/vals slot of each entry in insertion order (Python dict semantics),
+        # so iterate order[i] -> keys[slot]/vals[slot].
         class InnerDictStruct(ctypes.Structure) {
             has _fields_: list = [
                 ("len", ctypes.c_int64),
                 ("cap", ctypes.c_int64),
                 ("keys", ctypes.POINTER(ctypes.c_char_p)),
-                ("vals", ctypes.POINTER(JacVal))
+                ("vals", ctypes.POINTER(JacVal)),
+                ("ctrl", ctypes.POINTER(ctypes.c_uint8)),
+                ("used", ctypes.c_int64),
+                ("order", ctypes.POINTER(ctypes.c_int64))
             ];
         }
         dct_ptr = ctypes.cast(jv.payload, ctypes.POINTER(InnerDictStruct));
-        n = dct_ptr.contents.len;
         result: dict = {};
-        for i in range(n) {
-            k = dct_ptr.contents.keys[i].decode("utf-8");
-            result[k] = unbox_jacval(dct_ptr.contents.vals[i]);
+        for i in range(dct_ptr.contents.len) {
+            slot = dct_ptr.contents.order[i];
+            k = dct_ptr.contents.keys[slot].decode("utf-8");
+            result[k] = unbox_jacval(dct_ptr.contents.vals[slot]);
         }
         return result;
     } elif jv.tag == 5 {
@@ -173,21 +188,67 @@ def unbox_jacval(jv: JacVal) -> object {
     return None;
 }
 
-def run_native_function(eng: object, func_name: str) -> dict {
+def run_native_function(eng: object, func_name: str, ir: object = None) -> dict {
+    # Open-addressing hash-table dict:
+    #   {i64 len, i64 cap, i8** keys, JacVal* vals, i8* ctrl, i64 used, i64* order}
+    # Live entries sit at sparse hashed slots across `cap`. `order[0..len]` holds
+    # the keys/vals slot index of each entry in INSERTION ORDER (Python dict
+    # semantics), so iterate order[i] -> keys[slot] / vals[slot].
     class DictStruct(ctypes.Structure) {
         has _fields_: list = [
             ("len", ctypes.c_int64),
             ("cap", ctypes.c_int64),
             ("keys", ctypes.POINTER(ctypes.c_char_p)),
-            ("vals", ctypes.POINTER(JacVal))
+            ("vals", ctypes.POINTER(JacVal)),
+            ("ctrl", ctypes.POINTER(ctypes.c_uint8)),
+            ("used", ctypes.c_int64),
+            ("order", ctypes.POINTER(ctypes.c_int64))
         ];
+    }
+    # Run the module initializer first so module-level and `static has` globals
+    # whose values are not compile-time constants (strings, constructor calls)
+    # are populated before the fixture function reads them. Prefer jac_entry
+    # (chains __jac_glob_init across this module and every linked import); fall
+    # back to this module's __jac_glob_init when no `with entry` block emitted a
+    # jac_entry. Fixtures carry no entry block, so this only runs initializers.
+    init_addr = eng.get_function_address("jac_entry");
+    if init_addr != 0 {
+        ctypes.CFUNCTYPE(None)(init_addr)();
+    } else {
+        own_init = eng.get_function_address("__jac_glob_init");
+        if own_init != 0 {
+            ctypes.CFUNCTYPE(None)(own_init)();
+        }
+        # Without a jac_entry nothing has chained the glob inits of linked
+        # native imports (they are renamed to __jac_glob_init_<safe_sym> at
+        # link time), so run them here too -- otherwise an imported module's
+        # runtime-initialized globals (e.g. the bytes alphabets in
+        # na_stdlib/base64.jac) are read as null pointers and the JIT'd
+        # fixture segfaults.
+        manifest = ir.gen.interop_manifest if (ir is not None) else None;
+        sources = manifest.native_transitive_sources if manifest else [];
+        seen_srcs: set = set();
+        for src_mod in sources {
+            if src_mod is None or src_mod in seen_srcs {
+                continue;
+            }
+            seen_srcs.add(src_mod);
+            imp_init = eng.get_function_address(
+                "__jac_glob_init_" + native_safe_sym(src_mod)
+            );
+            if imp_init != 0 {
+                ctypes.CFUNCTYPE(None)(imp_init)();
+            }
+        }
     }
     f = get_func(eng, func_name, ctypes.POINTER(DictStruct));
     dict_ptr = f();
     result: dict = {};
+    # Iterate in insertion order via order[0..len].
     for i in range(dict_ptr.contents.len) {
-        key = dict_ptr.contents.keys[i].decode("utf-8");
-        jv = dict_ptr.contents.vals[i];
+        slot = dict_ptr.contents.order[i];
+        key = dict_ptr.contents.keys[slot].decode("utf-8");
+        jv = dict_ptr.contents.vals[slot];
         result[key] = unbox_jacval(jv);
     }
     return result;
@@ -263,8 +324,8 @@ def run_with_both(
     }
     na_keys: int = 0;
     try {
-        (eng, _) = compile_native(fixture);
-        na_result = run_native_function(eng, na_fn);
+        (eng, na_ir) = compile_native(fixture);
+        na_result = run_native_function(eng, na_fn, na_ir);
         na_keys = len(set(py_result.keys()) & set(na_result.keys()));
         compare_results(py_result, na_result, f"{label} [NA]", tolerance);
     } except Exception {

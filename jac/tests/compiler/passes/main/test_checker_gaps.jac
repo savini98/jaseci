@@ -22,19 +22,18 @@ Gap index:
   #50 - postinit body not validated against by-postinit field declarations
   #51 - @property on union types returns FunctionType instead of return type
   #52 - Enum iteration variable resolves to Unknown (cascading E1032 / W1051)
-  #53 - discover_base_file misses .na.jac — self is Unknown in .impl.jac files
+  #53 - discover_base_file misses .jac — self is Unknown in .impl.jac files
 """
 
 import os;
-import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import from jaclang.compiler.passes.main.type_checker_pass { TypeCheckPass }
 import from jaclang.jac0core.program { JacProgram }
 import from jaclang.jac0core.compile_options { CompileOptions }
 import jaclang.jac0core.unitree as uni;
 
-glob JAC_ROOT = str(Path(jaclang.__file__).parent.parent),
-     FIXTURES = os.path.join(
+glob FIXTURES = os.path.join(
          JAC_ROOT, "tests", "compiler", "passes", "main", "fixtures"
      ),
      CHECKER_FIXTURES = os.path.join(
@@ -46,7 +45,7 @@ def compile_and_check(fixture_name: str) -> JacProgram {
     program = JacProgram();
     mod = program.compile(
         os.path.join(CHECKER_FIXTURES, fixture_name),
-        options=CompileOptions(type_check=False)
+        options=CompileOptions(type_check=False, default_codespace='server')
     );
     TypeCheckPass(ir_in=mod, prog=program);
     return program;
@@ -330,7 +329,9 @@ test "gap 46 impl file standalone scope resolution" {
     program = JacProgram();
     mod = program.compile(
         os.path.join(CHECKER_FIXTURES, "checker_gap_impl_scope.impl.jac"),
-        options=CompileOptions(resolve_annex_parent=True, type_check=False)
+        options=CompileOptions(
+            resolve_annex_parent=True, type_check=False, default_codespace='server'
+        )
     );
     TypeCheckPass(ir_in=mod, prog=program);
 
@@ -466,19 +467,19 @@ test "gap 49 type checking forward ref" {
 # =========================================================================
 # Gap #50: postinit body not validated against by-postinit declarations
 #
-# When an obj declares fields with 'by postinit', the type checker should
+# When an obj declares fields with 'postinit', the type checker should
 # verify that the postinit method body actually assigns to ALL such fields
 # with compatible types. The semantic analysis pass already validates that
 # a postinit METHOD exists, but the type checker should go further:
 #
-#   A) All 'by postinit' fields must be assigned in the postinit body
+#   A) All 'postinit' fields must be assigned in the postinit body
 #   B) Assigned values must be compatible with declared field types
 #
 # Currently, the type checker does not inspect postinit bodies to verify
 # these constraints, allowing missing assignments (runtime AttributeError)
 # and type mismatches to slip through.
 #
-# Impact: An obj with `has z: str by postinit` but no `self.z = ...` in
+# Impact: An obj with `has z: str postinit` but no `self.z = ...` in
 #         postinit compiles cleanly, then crashes at runtime when z is
 #         accessed. Similarly, `self.value = "wrong"` for `has value: int`
 #         silently passes type checking.
@@ -491,7 +492,7 @@ test "gap 50 postinit assignment tracking" {
     # by-postinit fields are still declared with types via 'has'.
     #
     # The REAL gap is missing assignments: Incomplete.postinit never assigns
-    # to self.z (declared `has z: str by postinit`), which will crash at
+    # to self.z (declared `has z: str postinit`), which will crash at
     # runtime but produces no compile-time error.
     #
     # Check that the Incomplete case produces at least one error about the
@@ -501,12 +502,12 @@ test "gap 50 postinit assignment tracking" {
         e
         for e in program.errors_had
         if "checker_gap_postinit_tracking.jac" in (e.loc.mod_path or "")
-        and 44 <= e.loc.first_line <= 51
+            and 44 <= e.loc.first_line <= 51
     ];
     assert len(incomplete_errors) >= 1 , "Gap #50: postinit missing assignment not caught. "
-    "Incomplete.postinit never assigns to self.z (by postinit field), but "
+    "Incomplete.postinit never assigns to self.z (postinit field), but "
     "no error is produced. The type checker should validate that postinit "
-    "bodies assign to ALL 'by postinit' fields. "
+    "bodies assign to ALL 'postinit' fields. "
     f"Total errors: {len(program.errors_had)}, Incomplete errors: {len(
         incomplete_errors
     )}. "
@@ -573,21 +574,21 @@ test "gap 52 class enum iteration yields enum instance" {
 }
 
 # =========================================================================
-# Gap #53: discover_base_file misses .na.jac — self is Unknown in impl files
+# Gap #53: discover_base_file misses .jac — self is Unknown in impl files
 #
-# discover_base_file searched for .jac and .cl.jac but not .na.jac, so impl
-# files backed by a .na.jac declaration were compiled standalone. Without the
+# discover_base_file searched for .jac and .jac but not .jac, so impl
+# files backed by a .jac declaration were compiled standalone. Without the
 # declaration, self resolved as Unknown → E1032 on every self.x access.
 #
-# Fix: added '.na.jac' to the extension list in bccache.jac.
+# Fix: added '.jac' to the extension list in bccache.jac.
 # Impact: 1,073 false E1032 in lexer.impl.jac, 211 in parser.impl.jac.
 # =========================================================================
-test "gap 53 discover_base_file finds .na.jac for impl file" {
+test "gap 53 discover_base_file finds .jac for impl file" {
     import from jaclang.jac0core.bccache { discover_base_file }
     impl_path = os.path.join(FIXTURES, "na_impl", "impl", "counter.impl.jac");
     base = discover_base_file(impl_path);
-    assert base is not None and base.endswith("counter.na.jac") , (
-        f"Gap #53: discover_base_file should find counter.na.jac, got {base}"
+    assert base is not None and base.endswith("counter.jac") , (
+        f"Gap #53: discover_base_file should find counter.jac, got {base}"
     );
 }
 
@@ -632,6 +633,18 @@ test "gap 55 literal annotations resolve and discriminate" {
 # now keeps the parameter for error recovery, so only the real keyword error
 # (E0013) is reported. (jaseci-labs/jaseci#6353 gap #3)
 # =========================================================================
+test "clib import calls do not raise spurious E1051 (#7626 C2)" {
+    # Inline clib decls are real FuncSignatures, so their calls run the
+    # normal arg matcher; fixed-arity, empty-variadic, and multi-variadic
+    # shapes must all pass without "Too many positional arguments".
+    program = compile_and_check("checker_clib_no_e1051.jac");
+    msgs = [str(e) for e in program.errors_had];
+    joined = " ".join(msgs);
+    assert "Too many positional arguments" not in joined , (
+        f"clib call shapes cascaded into E1051: {msgs}"
+    );
+}
+
 test "gap 56 keyword param does not cascade into E1051" {
     program = compile_and_check("checker_keyword_param_no_cascade.jac");
     msgs = [str(e) for e in program.errors_had];

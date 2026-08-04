@@ -11,6 +11,7 @@ import os;
 import re;
 import sys;
 import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import jaclang.jac0core.unitree as uni;
 import from jaclang.jac0core.constant { CodeContext }
@@ -20,8 +21,7 @@ import from jaclang.jac0core.helpers { read_file_with_encoding }
 import from jaclang.runtimelib.test { parametrize }
 import from tests.fixtures_list { MICRO_JAC_FILES }
 
-glob JAC_ROOT = str(Path(jaclang.__file__).parent.parent),
-     FIXTURES = os.path.join(JAC_ROOT, "tests", "compiler", "fixtures"),
+glob FIXTURES = os.path.join(JAC_ROOT, "tests", "compiler", "fixtures"),
      LANG_FIXTURES = os.path.join(JAC_ROOT, "tests", "language", "fixtures");
 
 def load_fixture(fixture: str) -> str {
@@ -106,7 +106,8 @@ test "all ast has normalize" {
         if issubclass(cls, uni.UniNode) and not issubclass(cls, uni.Token)
     ];
     ordered_classes = sorted(
-        uni_node_classes, key=lambda cls : source_code.find(f"class {cls.__name__}"),
+        uni_node_classes,
+        key=lambda (cls) { source_code.find(f"class {cls.__name__}"); },
     );
     for cls in ordered_classes {
         if cls.__name__ not in exclude {
@@ -156,26 +157,33 @@ test "new keyword errors" {
 
 test "pass keyword errors" {
     # ASTValidationPass catches all 17 occurrences of 'pass' with the same
-    # message. The 5 archetype body usages also produce 'Missing ;' from the
-    # parser (fixture omits semicolons for those, mimicking Python style).
+    # message. The 5 archetype body usages (fixture omits semicolons for
+    # those, mimicking Python style) parse as semicolon-less tail
+    # expressions and are rejected with E2084 (implicit return is only
+    # valid at the end of a function body). The parameter named 'pass'
+    # additionally emits E0067 (Python reserved word as parameter name).
     captured_output = io.StringIO();
     sys.stdout = captured_output;
     prog = JacProgram();
     prog.compile(os.path.join(FIXTURES, "pass_keyword_err.jac"));
     sys.stdout = sys.__stdout__;
-    assert len(prog.errors_had) == 22;
+    assert len(prog.errors_had) == 23;
     keyword_errors = 0;
-    missing_semi = 0;
+    misplaced_tail_expr = 0;
+    reserved_param = 0;
     for alrt in prog.errors_had {
         pretty = alrt.pretty_print();
         if "'pass' is not supported in Jac" in pretty {
             keyword_errors += 1;
-        } elif "Missing ';'" in pretty {
-            missing_semi += 1;
+        } elif "implicit return" in pretty {
+            misplaced_tail_expr += 1;
+        } elif "Python reserved word" in pretty {
+            reserved_param += 1;
         }
     }
     assert keyword_errors == 17;
-    assert missing_semi == 5;
+    assert misplaced_tail_expr == 5;
+    assert reserved_param == 1;
 }
 
 test "multiple syntax errors" {
@@ -212,9 +220,8 @@ test "connect_disconnect_missing_rhs" {
         for e in prog.errors_had
         if e.code and e.code.code == "E0026"
     ];
-    assert len(e0026) == 5 , f"Expected 5 E0026 (missing RHS), got {len(e0026)}:\n" + "\n---\n".join(
-        e.pretty_print() for e in e0026
-    );
+    assert len(e0026) == 5 , f"Expected 5 E0026 (missing RHS), got {len(e0026)}:\n"
+        + "\n---\n".join(e.pretty_print() for e in e0026);
     # Sanity: the misleading "Unexpected token in expression" diagnostic
     # must no longer appear for these inputs.
     bad = [
@@ -222,9 +229,8 @@ test "connect_disconnect_missing_rhs" {
         for e in prog.errors_had
         if e.code and e.code.code == "E0004"
     ];
-    assert len(bad) == 0 , "E0004 leaked through after E0026 fix:\n" + "\n---\n".join(
-        e.pretty_print() for e in bad
-    );
+    assert len(bad) == 0 , "E0004 leaked through after E0026 fix:\n"
+        + "\n---\n".join(e.pretty_print() for e in bad);
 }
 
 test "jsx comprehensive fixture" {
@@ -243,9 +249,9 @@ test "jsx comprehensive fixture" {
     tree_repr = module.pp();
 
     expected_snippets = {
-        "self_closing": "<div />",
+        "self_closing": "<div/>",
         "attribute_binding": "id={name}",
-        "namespaced_component": "<Form.Input.Text />",
+        "namespaced_component": "<Form.Input.Text/>",
         "fragment": "<>",
         "spread_attribute": "{...props}",
         "expression_child": '{"Hello " + name + "!"}',
@@ -280,315 +286,20 @@ test "jsx star_pow spread attribute" {
     assert "Ellipsis" in module2.pp() , "Missing Ellipsis node for ... spread";
 }
 
-test "client keyword tagging" {
-    # Test 1: Mixed single and block client markers
-    source = """
-cl glob foo = 1;
-glob bar = 2;
-cl {
-    glob baz = 3;
-    test sample {}
-}
-""";
-    mod = JacProgram().parse_str(source, "test.jac");
-    bd = mod.body;
-    assert [type(stmt).__name__ for stmt in bd] == [
-        "GlobalVars",
-        "GlobalVars",
-        "ClientBlock",
-
-    ];
-    assert [
-        isinstance(stmt, uni.ContextAwareNode)
-        and stmt.code_context == CodeContext.CLIENT for stmt in bd
-    ] == [True, False, False, ];
-    client_block = bd[2];
-    assert isinstance(client_block, uni.ClientBlock);
-    assert len(client_block.body) == 2;
-    assert [type(stmt).__name__ for stmt in client_block.body] == [
-        "GlobalVars",
-        "Test"
-    ];
-    assert all(
-        stmt.code_context == CodeContext.CLIENT
-        for stmt in client_block.body
-        if isinstance(stmt, uni.ContextAwareNode)
-    );
-
-    # Test 2: Block with different statement types
-    source = """
-cl {
-    import foo;
-    glob x = 1;
-    obj MyClass {}
-    test my_test {}
-}
-""";
-    mod = JacProgram().parse_str(source, "test.jac");
-    bd = mod.body;
-    assert len(bd) == 1;
-    assert isinstance(bd[0], uni.ClientBlock);
-    assert len(bd[0].body) == 4;
-    assert all(
-        stmt.code_context == CodeContext.CLIENT
-        for stmt in bd[0].body
-        if isinstance(stmt, uni.ContextAwareNode)
-    );
-
-    # Test 3: Multiple cl blocks at top level
-    source = """
-cl {
-    glob a = 1;
-}
-glob b = 2;
-cl {
-    glob c = 3;
-}
-""";
-    mod = JacProgram().parse_str(source, "test.jac");
-    bd = mod.body;
-    assert len(bd) == 3;
-    assert isinstance(bd[0], uni.ClientBlock);
-    assert isinstance(bd[1], uni.GlobalVars);
-    assert isinstance(bd[2], uni.ClientBlock);
-    assert not (
-        isinstance(bd[1], uni.ContextAwareNode)
-        and bd[1].code_context == CodeContext.CLIENT
-    );
-
-    # Test 4: Empty client block
-    source = """
-cl {}
-glob x = 1;
-""";
-    mod = JacProgram().parse_str(source, "test.jac");
-    bd = mod.body;
-    assert len(bd) == 2;
-    assert isinstance(bd[0], uni.ClientBlock);
-    assert len(bd[0].body) == 0;
-    assert isinstance(bd[1], uni.GlobalVars);
-    assert not (
-        isinstance(bd[1], uni.ContextAwareNode)
-        and bd[1].code_context == CodeContext.CLIENT
-    );
-
-    # Test 5: Various statement types with single cl marker
-    source = """
-cl import foo;
-cl obj MyClass {}
-cl test my_test {}
-""";
-    mod = JacProgram().parse_str(source, "test.jac");
-    bd = mod.body;
-    assert len(bd) == 3;
-    assert all(
-        stmt.code_context == CodeContext.CLIENT
-        for stmt in bd
-        if isinstance(stmt, uni.ContextAwareNode)
-    );
-}
-
-test "to section headers" {
-    # Basic: each 'to X:' produces an implicit XBlock whose body contains
-    # all statements until the next header or EOF.
-    source = """
-to sv:
-def sv_fn() -> int { return 1; }
-to cl:
-def cl_fn() -> int { return 2; }
-to na:
-def na_fn() -> int { return 3; }
-to sv:
-def sv_fn2() -> int { return 4; }
-""";
-    prog = JacProgram();
-    mod = prog.parse_str(source, "test.jac");
-    assert not prog.errors_had;
-    bd = mod.body;
-    assert len(bd) == 4;
-    assert isinstance(bd[0], uni.ServerBlock) and bd[0].implicit;
-    assert isinstance(bd[1], uni.ClientBlock) and bd[1].implicit;
-    assert isinstance(bd[2], uni.NativeBlock) and bd[2].implicit;
-    assert isinstance(bd[3], uni.ServerBlock) and bd[3].implicit;
-    expected_ctxs = [
-        CodeContext.SERVER,
-        CodeContext.CLIENT,
-        CodeContext.NATIVE,
-        CodeContext.SERVER
-    ];
-    for (blk, expected) in zip(bd, expected_ctxs) {
-        inner = [
-            stmt
-            for stmt in blk.body
-            if isinstance(stmt, uni.ContextAwareNode)
-        ];
-        assert len(inner) == 1;
-        assert inner[0].code_context == expected;
-    }
-
-    # Explicit cl/sv/na single-stmt prefix inside a 'to X:' section overrides
-    # the active section's tagging for that one statement.
-    source = """
-to cl:
-def cl_a() -> int { return 1; }
-sv def sv_b() -> int { return 2; }
-def cl_c() -> int { return 3; }
-""";
-    prog = JacProgram();
-    mod = prog.parse_str(source, "test.jac");
-    assert not prog.errors_had;
-    assert len(mod.body) == 1;
-    block = mod.body[0];
-    assert isinstance(block, uni.ClientBlock) and block.implicit;
-    ctxs = [
-        s.code_context
-        for s in block.body
-        if isinstance(s, uni.ContextAwareNode)
-    ];
-    assert ctxs == [CodeContext.CLIENT, CodeContext.SERVER, CodeContext.CLIENT];
-
-    # A braced 'cl { ... }' block nested inside a 'to sv:' section is itself
-    # an element of that section's body — the braced block's own stmts are
-    # tagged CLIENT, and a later plain def resumes the surrounding SERVER.
-    source = """
-to sv:
-def sv_a() -> int { return 1; }
-cl {
-    def cl_b() -> int { return 2; }
-}
-def sv_c() -> int { return 3; }
-""";
-    prog = JacProgram();
-    mod = prog.parse_str(source, "test.jac");
-    assert not prog.errors_had;
-    assert len(mod.body) == 1;
-    outer = mod.body[0];
-    assert isinstance(outer, uni.ServerBlock) and outer.implicit;
-    assert len(outer.body) == 3;
-    assert isinstance(outer.body[0], uni.Ability);
-    assert outer.body[0].code_context == CodeContext.SERVER;
-    assert isinstance(outer.body[1], uni.ClientBlock);
-    assert not outer.body[1].implicit;
-    assert all(
-        s.code_context == CodeContext.CLIENT
-        for s in outer.body[1].body
-        if isinstance(s, uni.ContextAwareNode)
-    );
-    assert isinstance(outer.body[2], uni.Ability);
-    assert outer.body[2].code_context == CodeContext.SERVER;
-
-    # A 'to X:' header at EOF with no following stmt still parses as an empty
-    # implicit XBlock; earlier statements stay at module scope.
-    source = """
-def a() -> int { return 1; }
-to cl:
-""";
-    prog = JacProgram();
-    mod = prog.parse_str(source, "test.jac");
-    assert not prog.errors_had;
-    assert mod.body[0].code_context == CodeContext.SERVER;
-    assert isinstance(mod.body[1], uni.ClientBlock);
-    assert mod.body[1].implicit;
-    assert len(mod.body[1].body) == 0;
-}
-
-test "docstring before context prefix" {
-    # Regression: a """docstring""" placed before a `cl`/`sv`/`na` prefix used
-    # to fail with E0005 because the docstring-prefix dispatcher in
-    # parse_element_stmt only knew about the bare declaration keywords
-    # (def/can/obj/node/...) — not the context prefixes. With the fix in
-    # parse_element_stmt + parse_docstring_target, the docstring attaches to
-    # the inner declaration and the prefix tags its code_context.
-    source = """
-def first -> int { return 0; }
-
-\"\"\"Task row docstring.\"\"\"
-cl def cl_fn -> int { return 1; }
-
-\"\"\"Server helper docstring.\"\"\"
-sv def sv_fn -> int { return 2; }
-
-\"\"\"Native fn docstring.\"\"\"
-na def na_fn -> int { return 3; }
-""";
-    prog = JacProgram();
-    mod = prog.parse_str(source, "test.jac");
-    assert not prog.errors_had;
-    # body[0] is the bare `def first` (no docstring, server context by default).
-    # body[1..3] are the three docstring-prefixed prefixed defs.
-    assert len(mod.body) == 4;
-    expected = [
-        (None, CodeContext.SERVER, "first"),
-        ('"""Task row docstring."""', CodeContext.CLIENT, "cl_fn"),
-        ('"""Server helper docstring."""', CodeContext.SERVER, "sv_fn"),
-        ('"""Native fn docstring."""', CodeContext.NATIVE, "na_fn"),
-
-    ];
-    for (stmt, (exp_doc, exp_ctx, exp_name)) in zip(mod.body, expected) {
-        assert isinstance(stmt, uni.Ability) , (
-            f"expected Ability, got {type(stmt).__name__} for {exp_name}"
-        );
-        actual_doc = stmt.doc.value if stmt.doc else None;
-        assert actual_doc == exp_doc , (
-            f"{exp_name}: doc mismatch (got {actual_doc!r}, want {exp_doc!r})"
-        );
-        assert stmt.code_context == exp_ctx , (
-            f"{exp_name}: code_context mismatch "
-            f"(got {stmt.code_context}, want {exp_ctx})"
-        );
-        # And the docstring must appear in the kid chain — confirms it was
-        # actually wired in (not just stashed on .doc).
-        if exp_doc is not None {
-            kid_values = [k?.value for k in stmt.kid];
-            assert exp_doc in kid_values , (
-                f"{exp_name}: docstring not found in kid chain: {kid_values}"
-            );
+test "removed sv/cl/na markers produce the migration error" {
+    import tempfile;
+    with tempfile.TemporaryDirectory() as tmpdir {
+        path = os.path.join(tmpdir, "legacy.jac");
+        with open(path, "w") as f {
+            f.write("sv def f -> int {\n    return 1;\n}\n");
         }
+        prog = JacProgram();
+        prog.compile(path);
+        assert prog.errors_had , "a marker must be a hard error";
+        pretty = prog.errors_had[0].pretty_print();
+        assert "placement markers were removed" in pretty , pretty;
+        assert "jac fix placement" in pretty , pretty;
     }
-}
-
-test "cl/sv/na block and section-header forms parse without warning" {
-    # Braced block form parses cleanly -- it is no longer deprecated
-    source = """
-cl { def a() -> int { return 1; } }
-sv { def b() -> int { return 2; } }
-na { def c() -> int { return 3; } }
-""";
-    prog = JacProgram();
-    prog.parse_str(source, "test.jac");
-    assert not prog.errors_had;
-    w_codes: list[str] = [];
-    for w in prog.warnings_had {
-        c = w.code;
-        if c is not None {
-            w_codes.append(c.code);
-        }
-    }
-    assert "W0064" not in w_codes;
-
-    # Section headers and single-statement prefix forms also parse cleanly
-    source = """
-to cl:
-def a() -> int { return 1; }
-to sv:
-def b() -> int { return 2; }
-to na:
-def c() -> int { return 3; }
-cl def d() -> int { return 4; }
-sv def e() -> int { return 5; }
-na def f() -> int { return 6; }
-""";
-    prog = JacProgram();
-    prog.parse_str(source, "test.jac");
-    assert not prog.errors_had;
-    w_codes: list[str] = [];
-    for w in prog.warnings_had {
-        c = w.code;
-        if c is not None {
-            w_codes.append(c.code);
-        }
-    }
-    assert "W0064" not in w_codes;
 }
 
 test "anonymous ability decl" {
@@ -699,9 +410,9 @@ walker MyWalker {
     assert name1 != name2;
 }
 
-test "cl import with jac runtime" {
+test "string-path import with jac runtime" {
     source = """
-cl import from "@jac/runtime" {
+import from "@jac/runtime" {
     jacLogin,
     jacLogout,
     renderJsxTree,
@@ -720,9 +431,6 @@ cl import from "@jac/runtime" {
 
     import_stmt = imports[0];
     assert isinstance(import_stmt, uni.Import);
-    assert import_stmt.code_context == CodeContext.CLIENT , (
-        "Import should be marked as client-side"
-    );
     assert import_stmt.from_loc is not None , "Import should have from_loc";
     assert import_stmt.from_loc.dot_path_str == "@jac/runtime" , (
         "Module path should be '@jac/runtime'"
@@ -750,7 +458,7 @@ import from raylib {
 }
 """;
     prog = JacProgram();
-    mod = prog.parse_str(source, "test_logical_clib.na.jac");
+    mod = prog.parse_str(source, "test_logical_clib.jac");
     assert not prog.errors_had , f"Parser errors: {prog.errors_had}";
     imports = [
         stmt
@@ -779,7 +487,7 @@ import from libs.raylib {
 }
 """;
     prog = JacProgram();
-    mod = prog.parse_str(source, "test_dotted_clib.na.jac");
+    mod = prog.parse_str(source, "test_dotted_clib.jac");
     assert not prog.errors_had , f"Parser errors: {prog.errors_had}";
     imports = [
         stmt
@@ -863,10 +571,10 @@ test "standalone bracket filter expr" {
     assert not err , "Failed to parse standalone [?:Foo, a<3]";
 }
 
-test "bracket vs paren filter produce same AST" {
-    (mod_old, _) = rd_parse('with entry { x(?:Foo, a==5); }', "");
-    (mod_new, _) = rd_parse('with entry { x[?:Foo, a==5]; }', "");
-    # Find FilterCompr nodes in both trees
+test "bracket filter trailer produces FilterCompr AST" {
+    (mod_new, err) = rd_parse('with entry { x[?:Foo, a==5]; }', "");
+    assert not err , "Failed to parse x[?:Foo, a==5]";
+    # Find the FilterCompr node in the tree
     def find_fc(nd: object) -> object {
         if isinstance(nd, uni.FilterCompr) {
             return nd;
@@ -883,11 +591,9 @@ test "bracket vs paren filter produce same AST" {
         }
         return None;
     }
-    old_fc = find_fc(mod_old);
     new_fc = find_fc(mod_new);
-    assert old_fc is not None , "Old syntax should produce FilterCompr";
-    assert new_fc is not None , "New syntax should produce FilterCompr";
-    assert len(old_fc.compares) == len(new_fc.compares) , "Both syntaxes should have same number of compares";
+    assert new_fc is not None , "Bracket filter trailer should produce FilterCompr";
+    assert len(new_fc.compares) == 1 , "Filter should carry exactly the a==5 compare";
 }
 
 test "bracket filter on list" {
@@ -896,7 +602,7 @@ test "bracket filter on list" {
 }
 
 test "typed edge ref after start expr - no filter" {
-    # BUG: `[root()->:Type:->]` failed to parse because parse_list_or_compr
+    # BUG: `[root->:Type:->]` failed to parse because parse_list_or_compr
     # only checked for ARROW_R/ARROW_L/ARROW_BI/ARROW_R_P1/ARROW_L_P1 after
     # the first expression, missing the (RETURN_HINT, COLON, ...) form the
     # lexer actually produces for `->:`. The bare-start form `[->:Type:->]`
@@ -907,13 +613,13 @@ test "typed edge ref after start expr - no filter" {
         'edge Scheduled { has time: str; }'
         'node Task { has title: str; }'
         'with entry {'
-        '    root() +>: Scheduled(time="9:00am") :+> Task(title="Run");'
-        '    x = [root()->:Scheduled:->];'
+        '    root +>: Scheduled(time="9:00am") :+> Task(title="Run");'
+        '    x = [root->:Scheduled:->];'
         '}'
     );
     (mod, err) = rd_parse(src, "");
     assert not err , (
-        "Failed to parse [root()->:Scheduled:->] (typed edge ref after "
+        "Failed to parse [root->:Scheduled:->] (typed edge ref after "
         "explicit start expression)"
     );
 }
@@ -926,13 +632,13 @@ test "typed edge ref after start expr - with filter condition" {
         'edge Scheduled { has priority: int = 1; }'
         'node Task { has title: str; }'
         'with entry {'
-        '    root() +>: Scheduled(priority=3) :+> Task(title="A");'
-        '    urgent = [root()->:Scheduled:priority>=3:->];'
+        '    root +>: Scheduled(priority=3) :+> Task(title="A");'
+        '    urgent = [root->:Scheduled:priority>=3:->];'
         '}'
     );
     (mod, err) = rd_parse(src, "");
     assert not err , (
-        "Failed to parse [root()->:Scheduled:priority>=3:->] (typed edge "
+        "Failed to parse [root->:Scheduled:priority>=3:->] (typed edge "
         "ref with a filter condition after an explicit start expression)"
     );
 }
@@ -961,7 +667,7 @@ test "typed edge ref produces FilterCompr with compares" {
         'edge Scheduled { has priority: int = 1; }'
         'node Task { has title: str; }'
         'with entry {'
-        '    urgent = [root()->:Scheduled:priority>=3:->];'
+        '    urgent = [root->:Scheduled:priority>=3:->];'
         '}'
     );
     (mod, err) = rd_parse(src, "");
@@ -985,7 +691,7 @@ test "typed edge ref produces FilterCompr with compares" {
     }
     fc = find_filter_compr_with_compares(mod);
     assert fc is not None , (
-        "Typed edge ref `[root()->:Scheduled:priority>=3:->]` must produce "
+        "Typed edge ref `[root->:Scheduled:priority>=3:->]` must produce "
         "a FilterCompr carrying the `priority>=3` condition; an EdgeOpRef "
         "with an empty FilterCompr means the filter clause was silently "
         "dropped."
@@ -1030,7 +736,7 @@ test "docstring attaches to all member types inside archetype body" {
     def collect_doc_nodes(nd: uni.UniNode) -> list {
         results: list = [];
         if isinstance(nd, (uni.ArchHas, uni.Ability, uni.ModuleCode, uni.Archetype))
-        and nd.doc is not None {
+            and nd.doc is not None {
             results.append(nd);
         }
         for k in nd.kid {
@@ -1054,6 +760,6 @@ test "docstring attaches to all member types inside archetype body" {
 
 with entry {
     parametrize(
-        "parser", MICRO_JAC_FILES, parser_file_test, id_fn=lambda f : Path(f).stem
+        "parser", MICRO_JAC_FILES, parser_file_test, id_fn=lambda (f) { Path(f).stem; }
     );
 }

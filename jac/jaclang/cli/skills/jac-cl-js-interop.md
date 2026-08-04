@@ -3,7 +3,9 @@ name: jac-cl-js-interop
 description: JavaScript interop in client Jac - the `new()` builtin for browser constructors (WebSocket, URL, Date, CustomEvent), `.call(None, ...)` for callbacks, `glob` module state, browser globals (localStorage, window, document), polling/debounce/RAF recipes, jac2js gotchas (chr(10) newlines, let-scoping/TDZ), and debugging compiled output. Load when client code needs a browser API that isn't a React pattern.
 ---
 
-Client Jac compiles to JavaScript, so the whole browser API surface is reachable - but a few idioms differ from both Python and JS. The three you cannot guess: `new(Cls, ...)`, `.call(None, ...)`, and `glob` module state.
+Client Jac compiles to JavaScript, so the whole browser API surface is reachable - but a few idioms differ from both Python and JS. The three you cannot guess: `new(Cls, ...)`, `.call(None, ...)`, and `glob` module state. (All of it applies to any client code - plain `.jac` inferred client from JSX/npm imports. See `jac-codespaces`.)
+
+⚠ **`is None` does NOT catch `undefined`.** `x is None` / `x is not None` compile to strict `x === null` / `x !== null`, so a missing dict key, an absent prop, or an unset browser API result - all `undefined` in JS - slip straight through `if x is not None` and blow up on the next attribute access. Guard with truthiness (`if x { ... }`) whenever the value can come from a JS-shaped absence rather than an explicit `None`.
 
 > **`jac check` vs runtime:** isolated `jac check` has no typed stubs for browser globals yet, so it flags these patterns - `W2001` ("Name 'WebSocket' may be undefined"), `E1053`/`E1030`/`E1031` on `new()` args, `window.*`, `JSON.parse` - plus `W6002` portability nags. **They are correct at runtime and `jac build` succeeds.** Don't "fix" them into broken shapes; suppress per line with `# jac:ignore[CODE]` if you need a clean check.
 
@@ -16,8 +18,9 @@ ws = new(WebSocket, url);
 parsed = new(URL, String(window.location.origin));
 now = new(Date);
 evt = new(CustomEvent, "my-event", {"detail": {"key": "value"}});
+params = new(URLSearchParams, window.location.search);
 m = new(Map);
-promise = new(Promise, lambda(resolve: any, reject: any) {
+promise = new(Promise, lambda (resolve: any, reject: any) {
     resolve.call(None, result);
 });
 ```
@@ -28,7 +31,7 @@ A callback held in a variable/dict and invoked later must be called with `.call(
 
 ```
 msgHandler = onMessage;                      # assign to a local first
-ws.onmessage = lambda(e: any) {
+ws.onmessage = lambda (e: any) {
     msgHandler.call(None, JSON.parse(e.data));
 };
 ```
@@ -37,7 +40,7 @@ Same for Promise `resolve`/`reject` and anything stashed in `_pendingCallbacks[i
 
 ## `glob` - module-level state
 
-`glob` in a `.cl.jac` is a JS module variable: shared across all components importing the module, survives re-renders, NOT reactive. Use for connections, caches, init-once flags:
+`glob` in a client module is a JS module variable: shared across all components importing the module, survives re-renders, NOT reactive. Use for connections, caches, init-once flags:
 
 ```jac
 glob _ws: any = None;
@@ -52,7 +55,7 @@ glob _ws: any = None;
 def:pub connectWs(url: str) {
     _ws = new(WebSocket, url);
     _ws.onopen = lambda { console.log("[ws] connected"); };
-    _ws.onmessage = lambda(event: any) {
+    _ws.onmessage = lambda (event: any) {
         try { handleMessage(JSON.parse(event.data)); }
         except Exception as e { console.error("[ws] message error:", e); }
     };
@@ -71,11 +74,11 @@ Consuming a server-sent-event stream (raw `fetch` + `resp.body.getReader()` agai
 
 ## CustomEvent - cross-component bus
 
-Dispatch: `window.dispatchEvent(new(CustomEvent, "theme-change", {"detail": {"theme": t}}));`. Listen in a single manual `useEffect` (so add/remove share the handler closure - see the entry/exit split warning in `jac-cl-components`):
+Dispatch: `window.dispatchEvent(new(CustomEvent, "theme-change", {"detail": {"theme": t}}));`. Listening is an acquire-then-release pair (addEventListener/removeEventListener must share the handler closure), so this is one of the rare cases for a manual `useEffect` - see the entry/exit split warning in `jac-cl-components`. Effects with no handle to release stay `can with entry` abilities even here in interop land:
 
 ```
 useEffect(lambda {
-    handler = lambda(e: any) { theme = e.detail.theme; };
+    handler = lambda (e: any) { theme = e.detail.theme; };
     window.addEventListener("theme-change", handler);
     return lambda { window.removeEventListener("theme-change", handler); };
 }, []);
@@ -83,11 +86,11 @@ useEffect(lambda {
 
 ## Browser globals
 
-`localStorage.getItem/setItem/removeItem`, `window.addEventListener`, `document.querySelector`, `setTimeout`/`setInterval`/`clearInterval`, `requestAnimationFrame`, `JSON.parse/stringify`, `URLSearchParams`, `encodeURIComponent`, `globalThis.*` (including `[plugins.client.vite.define]` build-time constants) - all available directly, no import. See the `jac check` note above.
+`localStorage.getItem/setItem/removeItem`, `window.addEventListener`, `document.querySelector`, `setTimeout`/`setInterval`/`clearInterval`, `requestAnimationFrame`, `JSON.parse/stringify`, `encodeURIComponent`, `globalThis.*` (including `[client.vite.define]` build-time constants) - all available directly, no import. `URLSearchParams` is available too, but it's a constructor - build it with `new(URLSearchParams, ...)`, not a bare call (see above). See the `jac check` note above.
 
 ## Timing patterns (all use `Ref` value fields - see `jac-npm-packages`)
 
-- **Polling:** single `useEffect` returning cleanup - `interval = setInterval(lambda { fetch_data(); }, 5000); return lambda { clearInterval(interval); };`. Outer lambda must NOT be `-> None`.
+- **Polling:** an acquire/release pair (setInterval/clearInterval), so a manual `useEffect` returning cleanup - `interval = setInterval(lambda { fetch_data(); }, 5000); return lambda { clearInterval(interval); };`. Outer lambda must NOT be `-> None`. (No interval/listener/socket to release? Then it's not this pattern - use `can with entry`, see `jac-cl-components`.)
 - **Debounce:** `has timerRef: Ref[any] = Ref(None);` - on each call `if timerRef.current { clearTimeout(timerRef.current); } timerRef.current = setTimeout(lambda { doSave(); }, 2000);`.
 - **RAF batching:** `if rafRef.current { return; } rafRef.current = requestAnimationFrame(lambda { rafRef.current = None; applyPosition(lastX.current); });`.
 - **Duplicate-submit guard:** `has sendingRef: Ref[bool] = Ref(False);` - check/set around the awaited call in a `try`/`finally`.
@@ -114,7 +117,7 @@ chunk = src[i:j];
 
 ## Debugging compiled output
 
-Generated JS lives in `.jac/client/` - `compiled/` (per-module JS from your `.cl.jac`, readable), `dist/` (production bundle), `configs/` (generated vite/tailwind configs). When an interop pattern misbehaves, read `compiled/<module>.js` to see exactly what was emitted. Prefix `console.log("[useAuth] ...")` messages for DevTools filtering. Build failures: `JAC_DEBUG=1 jac start` for raw Vite output (see `jac-fullstack-patterns`).
+Generated JS lives in `.jac/client/` - `compiled/` (per-module JS from your client modules, readable), `dist/` (production bundle), `configs/` (generated vite/tailwind configs). When an interop pattern misbehaves, read `compiled/<module>.js` to see exactly what was emitted. Prefix `console.log("[useAuth] ...")` messages for DevTools filtering. Build failures: `JAC_DEBUG=1 jac start` for raw Vite output (see `jac-fullstack-patterns`).
 
 ## See also
 

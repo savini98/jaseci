@@ -1,4 +1,3 @@
-"""Generate a static shell completion script from pre-processed command data."""
 import from typing { cast }
 
 impl static_shellcode(
@@ -15,7 +14,7 @@ impl static_shellcode(
 
 impl _static_bash(commands: list[dict[str, any]], exe: str) -> str {
     cmd_names = " ".join(c["name"] for c in commands);
-    # Build per-command value-option cases
+
     value_cases: list = [];
     for c in commands {
         if not c["value_opts"] {
@@ -29,10 +28,8 @@ impl _static_bash(commands: list[dict[str, any]], exe: str) -> str {
             if short {
                 pattern += "|" + short;
             }
-            line = '                %s) COMPREPLY=($(compgen -W "%s" -- "$cur")); return ;;' % (
-                pattern,
-                " ".join(choices)
-            );
+            line = '                %s) COMPREPLY=($(compgen -W "%s" -- "$cur")); return ;;'
+                % (pattern, " ".join(choices));
             prev_cases.append(line);
         }
         value_cases.append(_BASH_VALUE_CASE % (c["name"], "\n".join(prev_cases)));
@@ -41,7 +38,7 @@ impl _static_bash(commands: list[dict[str, any]], exe: str) -> str {
     if value_cases {
         value_block = _BASH_VALUE_BLOCK % "\n".join(value_cases);
     }
-    # Build per-command flag/positional cases
+
     cmd_cases: list = [];
     for c in commands {
         cast_ValueOpts = cast(list[tuple[str, str, list[str]]], c["value_opts"]);
@@ -62,14 +59,8 @@ impl _static_bash(commands: list[dict[str, any]], exe: str) -> str {
             cmd_cases.append(_BASH_CMD_NO_FILES % (c["name"], flags));
         }
     }
-    return _BASH_TEMPLATE % (
-        exe,
-        cmd_names,
-        value_block,
-        "\n".join(cmd_cases),
-        exe,
-        exe
-    );
+    return _BASH_TEMPLATE
+        % (exe, cmd_names, value_block, "\n".join(cmd_cases), exe, exe);
 }
 
 impl _static_zsh(commands: list[dict[str, any]], exe: str) -> str {
@@ -87,13 +78,8 @@ impl _static_zsh(commands: list[dict[str, any]], exe: str) -> str {
             h = helptext.replace("'", "'\\''").replace("[", "\\[").replace("]", "\\]");
             if short {
                 args_lines.append(
-                    "                '(%s %s)'{%s,%s}'[%s]' \\" % (
-                        short,
-                        long,
-                        short,
-                        long,
-                        h
-                    )
+                    "                '(%s %s)'{%s,%s}'[%s]' \\"
+                        % (short, long, short, long, h)
                 );
             } else {
                 args_lines.append("                '%s[%s]' \\" % (long, h));
@@ -103,13 +89,8 @@ impl _static_zsh(commands: list[dict[str, any]], exe: str) -> str {
             vals = " ".join(choices);
             if short {
                 args_lines.append(
-                    "                '(%s %s)'{%s,%s}'[]:value:(%s)' \\" % (
-                        short,
-                        long,
-                        short,
-                        long,
-                        vals
-                    )
+                    "                '(%s %s)'{%s,%s}'[]:value:(%s)' \\"
+                        % (short, long, short, long, vals)
                 );
             } else {
                 args_lines.append(
@@ -122,7 +103,9 @@ impl _static_zsh(commands: list[dict[str, any]], exe: str) -> str {
         }
 
         if args_lines {
-            body = "            _arguments -s \\\n" + "\n".join(args_lines) + "\n                ;;";
+            body = "            _arguments -s \\\n"
+                + "\n".join(args_lines)
+                + "\n                ;;";
         } else {
             body = "            ;;";
         }
@@ -134,18 +117,15 @@ impl _static_zsh(commands: list[dict[str, any]], exe: str) -> str {
 impl _static_fish(commands: list[dict[str, any]], exe: str) -> str {
     lines: list = ["# Fish completions for " + exe];
     lines.append("complete -c %s -f" % exe);
-    # Subcommand completions
+
     for c in commands {
         h = c["help"].replace("'", "\\'");
         lines.append(
-            "complete -c %s -n '__fish_use_subcommand' -a '%s' -d '%s'" % (
-                exe,
-                c["name"],
-                h
-            )
+            "complete -c %s -n '__fish_use_subcommand' -a '%s' -d '%s'"
+                % (exe, c["name"], h)
         );
     }
-    # Per-command flags
+
     for c in commands {
         cast_ValueOpts = cast(list[tuple[str, str, list[str]]], c["value_opts"]);
         cast_Flags = cast(list[tuple[str, str, str]], c["flags"]);

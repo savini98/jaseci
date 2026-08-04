@@ -1,6 +1,3 @@
-"""Implementation of the capability / portability authority (Phase 9)."""
-
-# JS-specific globals and their Jac alternatives
 glob JS_GLOBALS: dict[str, str] = {
          "console": "print()",
          "Math": "Jac builtins (abs, round, min, max, pow, etc.)",
@@ -25,7 +22,6 @@ glob JS_GLOBALS: dict[str, str] = {
          "Infinity": "float('inf')",
          "NaN": "float('nan')"
      },
-     # JS-idiomatic methods and their Jac alternatives
      JS_METHODS: dict[str, str] = {
          "push": ".append()",
          "forEach": "for loop",
@@ -68,24 +64,34 @@ glob JS_GLOBALS: dict[str, str] = {
          "stringify": "str() or json.dumps()",
          "parse": "json.loads()"
      },
-     # JS-specific keywords/identifiers that may appear as bare names
      JS_KEYWORDS: dict[str, str] = {
          "undefined": "None",
          "typeof": "type()",
          "void": "None"
      },
-     # JS-specific property accesses and their alternatives
      JS_PROPERTIES: dict[str, str] = {
          "length": "len()",
          "prototype": "Jac inheritance",
          "constructor": "type() or __init__",
          "__proto__": "Jac inheritance"
      },
-     # Help text for the native `skip`-outside-event-ability rejection.
      _NATIVE_SKIP_HELP: str = (
          "`skip` is an object-spatial walker statement; native lowers it only "
          "inside a walker `with` event ability (a body that returns no value). "
          "In a value-returning function, use an explicit `return` to exit early."
+     ),
+     _NATIVE_DECORATOR_HELP: str = (
+         "Native lowers decorators only on module-level, non-generator "
+         "functions, and only when each decorator is a plain name resolving "
+         "to a native function (applied at module glob-init). Method, "
+         "archetype, and dynamically-computed decorators would silently run "
+         "the undecorated body; remove the decorator or move the definition "
+         "to a @sv/Python context."
+     ),
+     _NATIVE_UNPACK_HELP: str = (
+         "Unpacking arguments at a native call site is not lowered yet; "
+         "pass the elements explicitly or move the call to a @sv/Python "
+         "context."
      );
 
 
@@ -101,25 +107,99 @@ impl classify_native_import(item: uni.UniNode) -> tuple {
     return (mod_name, mod_name is not None and mod_name in NATIVE_SUPPORTED_STDLIB);
 }
 
+impl import_bound_name(item: uni.UniNode) -> (str | None) {
+    if not isinstance(item, uni.ModulePath) {
+        return None;
+    }
+    if item.alias is not None and isinstance(item.alias, uni.Name) {
+        return item.alias.value;
+    }
+    if item.path {
+        first = item.path[0];
+        return first.value if isinstance(first, uni.Name) else None;
+    }
+    return None;
+}
+
+impl name_in_type_position(name_nd: uni.UniNode) -> bool {
+    if name_nd.find_parent_of_type(uni.SubTag) is not None {
+        return True;
+    }
+    sig = name_nd.find_parent_of_type(uni.FuncSignature);
+    if sig is not None and sig.return_type is not None {
+        cur = name_nd;
+        while cur is not None {
+            if cur is sig.return_type {
+                return True;
+            }
+            cur = cur.parent;
+        }
+    }
+    return False;
+}
+
+impl static_fstring_spec_text(spec: uni.UniNode) -> (str | None) {
+    if isinstance(spec, uni.String) {
+        return spec.lit_value;
+    }
+    if isinstance(spec, uni.MultiString) {
+        parts: list[str] = [];
+        for s in spec.strings {
+            if not isinstance(s, uni.String) {
+                return None;
+            }
+            parts.append(s.lit_value);
+        }
+        return "".join(parts);
+    }
+    if isinstance(spec, uni.FString) {
+        parts2: list[str] = [];
+        for p in spec.parts {
+            if not isinstance(p, uni.String) {
+                return None;
+            }
+            parts2.append(p.lit_value);
+        }
+        return "".join(parts2);
+    }
+    return None;
+}
+
 impl native_capability_violations(mod: uni.Module) -> list {
     import from jaclang.jac0core.passes.module_codegen_pass { ModuleCodegenPass }
-    import from jaclang.jac0core.constant { CodeContext, Tokens as Tok }
+    import from jaclang.jac0core.constant { CodeContext, ExprCtx, Tokens as Tok }
     out: list = [];
     _stdlib_help: (str | None) = None;
-    # One NATIVE-context iteration covers both violation families. NOTE:
-    # NATIVE_DISQUALIFIER_NODES is deliberately NOT swept here - it is the
-    # AUTO-PROMOTION eligibility table, conservatively broader than what
-    # explicit na {} / .na.jac code can lower (LambdaExpr and the OSP forms
-    # are auto-promote disqualifiers but natively supported).
-    # Genuinely-unsupported node kinds remain the emitter fallbacks' job
-    # until a dedicated explicit-native rejection table is derived from
-    # them.
-    for stmt in ModuleCodegenPass.iter_context_stmts(mod, CodeContext.NATIVE) {
-        # Non-allowlisted Python imports in native context (issue #6357):
-        # the import would be dropped and member access would lower to
-        # garbage, so reject it loudly. Clib imports
-        # (`import from "lib" {...}`) and native module imports carry
-        # from_loc / clib_decls and are legal.
+
+    _native_stmts: list = list(
+        ModuleCodegenPass.iter_context_stmts(mod, CodeContext.NATIVE)
+    );
+    _runtime_used: set = set();
+    _type_used: set = set();
+    for _stmt in _native_stmts {
+        if isinstance(_stmt, uni.Import) {
+            continue;
+        }
+        for _nm in _stmt.get_all_sub_nodes(typ=uni.Name) {
+            if _nm.expr_ctx != ExprCtx.LOAD {
+                continue;
+            }
+            if _nm.find_parent_of_type(uni.Import) is not None {
+                continue;
+            }
+            if name_in_type_position(_nm) {
+                _type_used.add(_nm.value);
+            } else {
+                _runtime_used.add(_nm.value);
+            }
+        }
+    }
+
+    import os;
+    _base_dir = os.path.dirname(os.path.abspath(mod.loc.mod_path))
+        if (mod?.loc and mod.loc.mod_path)
+        else '.';
+    for stmt in _native_stmts {
         if isinstance(stmt, uni.Import) {
             if stmt.clib_decls or not stmt.items {
                 continue;
@@ -127,6 +207,32 @@ impl native_capability_violations(mod: uni.Module) -> list {
             for item in stmt.items {
                 (mod_name, _ok) = classify_native_import(item);
                 if mod_name is not None and not _ok {
+                    import from jaclang.jac0core.codeinfo {
+                        is_bundled_native_module,
+                        resolve_native_module
+                    }
+                    if is_bundled_native_module(mod_name) {
+                        continue;
+                    }
+                    _plain_bare = (
+                        not stmt.is_absorb
+                        and isinstance(item, uni.ModulePath)
+                        and item.alias is None
+                        and len(item.path) == 1
+                    );
+                    if (stmt.is_absorb or _plain_bare)
+                        and resolve_native_module(mod_name, _base_dir)[1] is not None {
+                        continue;
+                    }
+
+                    _bound = import_bound_name(item);
+                    if (
+                        _bound is not None
+                        and _bound in _type_used
+                        and _bound not in _runtime_used
+                    ) {
+                        continue;
+                    }
                     if _stdlib_help is None {
                         _supported_list = ", ".join(
                             f"`import {m}`" for m in sorted(NATIVE_SUPPORTED_STDLIB)
@@ -134,8 +240,9 @@ impl native_capability_violations(mod: uni.Module) -> list {
                         _stdlib_help = (
                             f"Native compilation supports these stdlib imports: "
                             f"{_supported_list}; C-library imports "
-                            f"(`import from \"lib\" {{...}}`); and other native "
-                            f"(.na.jac) modules (`import from mod {{...}}`). Move "
+                            f"(`import from \"lib\" {{...}}`); and other Jac "
+                            f"modules on the native pathway (`import mod` or "
+                            f"`import from mod {{...}}`, unaliased). Move "
                             f"Python-dependent code to a @sv/Python context."
                         );
                     }
@@ -144,53 +251,210 @@ impl native_capability_violations(mod: uni.Module) -> list {
             }
             continue;
         }
-        # Structural match patterns anywhere in the statement subtree.
-        # Flagged subtrees are not descended into, so one construct yields
-        # one violation, not a cascade.
+
         work: list = [stmt];
         while work {
             nd = work.pop();
-            if isinstance(nd, NATIVE_REJECT_MATCH_PATTERNS) {
-                out.append((nd, "match pattern", type(nd).__name__, None));
-                continue;
-            }
             if isinstance(nd, NATIVE_REJECT_NODES) {
                 kind = "expression" if isinstance(nd, uni.Expr) else "statement";
                 out.append((nd, kind, type(nd).__name__, None));
                 continue;
             }
-            # `skip` is an object-spatial walker statement (Return-family): the
-            # native backend lowers it only where the body returns no value --
-            # a walker `with` event ability. In a value-returning function it
-            # would have to return-void from a typed function, which native
-            # cannot do, so it is unsupported there. Detected structurally here
-            # (not only at codegen) so `jac check` and `jac nacompile` agree
-            # (issue #6636). `break`/`continue` are ordinary loop control and
-            # are unaffected.
+
             if isinstance(nd, uni.CtrlStmt)
-            and isinstance(nd.ctrl, uni.Token)
-            and (nd.ctrl.name == Tok.KW_SKIP) {
+                and isinstance(nd.ctrl, uni.Token)
+                and (nd.ctrl.name == Tok.KW_SKIP) {
                 _encl = nd.find_parent_of_type(uni.Ability);
-                if (_encl is None)
-                or (not isinstance(_encl.signature, uni.EventSignature)) {
+                _in_event = (_encl is not None)
+                    and isinstance(_encl.signature, uni.EventSignature);
+                if (_encl is None) {
+                    _encl_impl = nd.find_parent_of_type(uni.ImplDef);
+                    _in_event = (_encl_impl is not None)
+                        and isinstance(_encl_impl.spec, uni.EventSignature);
+                }
+                if not _in_event {
                     out.append((nd, "statement", "SkipStmt", _NATIVE_SKIP_HELP));
                 }
                 continue;
             }
-            # Attribute read off an UNTYPED (`any`) receiver. Native cannot
-            # pick a struct field layout for an `any` value: an untyped graph
-            # traversal (`[here -->]` / `[... ->:Edge:->]`) types its element
-            # as `any` (an edge can connect any node types), and a boxed `any`
-            # has no statically-known fields. The backend E5090s every such
-            # read at codegen; detect it structurally so `jac check` and
-            # `jac nacompile` agree (issues #6646 / #6657). The receiver type is
-            # a checker fact (`Expr.type`), available pre-codegen.
+
+            if isinstance(nd, (uni.Ability, uni.ArchSpec, uni.ImplDef))
+                and nd.decorators {
+                _dec_static_fn = (
+                    isinstance(nd, uni.Ability)
+                    and not isinstance(nd.parent, uni.Archetype)
+                    and nd.find_parent_of_type(uni.Ability) is None
+                    and not nd.get_all_sub_nodes(typ=uni.YieldExpr)
+                );
+                if _dec_static_fn {
+                    for _dexpr in nd.decorators {
+                        if not isinstance(_dexpr, uni.Name) {
+                            _dec_static_fn = False;
+                            break;
+                        }
+                    }
+                }
+                if not _dec_static_fn {
+                    _dec_owner = "?";
+                    if isinstance(nd, uni.Ability) and nd.name_ref {
+                        _dec_owner = nd.name_ref.sym_name;
+                    } elif isinstance(nd, uni.Archetype) and nd.name {
+                        _dec_owner = nd.name.value;
+                    }
+                    out.append(
+                        (
+                            nd.decorators[0],
+                            "decorator",
+                            f"on {_dec_owner}",
+                            _NATIVE_DECORATOR_HELP
+                        )
+                    );
+                }
+            }
+
+            if isinstance(nd, uni.ParamVar) and nd.unpack is not None {
+                _vp_name = f"{nd.unpack.value}{nd.name.value if nd.name else ''}";
+                _vp_encl = nd.find_parent_of_type(uni.Ability);
+                if _vp_encl is None {
+                    _vp_impl = nd.find_parent_of_type(uni.ImplDef);
+                    if _vp_impl is not None
+                        and isinstance(_vp_impl.decl_link, uni.Ability) {
+                        _vp_encl = _vp_impl.decl_link;
+                    }
+                }
+                if nd.type_tag is None {
+                    out.append(
+                        (
+                            nd,
+                            "variadic parameter",
+                            _vp_name,
+                            (
+                                "Annotate the variadic parameter (e.g. "
+                                "`*args: int`, `*args: any`) so the native "
+                                "pack type is known."
+                            )
+                        )
+                    );
+                    continue;
+                }
+                if nd.find_parent_of_type(uni.LambdaExpr) is not None {
+                    out.append((nd, "variadic parameter", _vp_name, None));
+                    continue;
+                }
+                if (
+                    _vp_encl is not None
+                    and _vp_encl.name_ref is not None
+                    and _vp_encl.name_ref.sym_name in ("init", "__init__")
+                    and isinstance(_vp_encl.parent, uni.Archetype)
+                ) {
+                    out.append(
+                        (
+                            nd,
+                            "variadic parameter",
+                            _vp_name,
+                            (
+                                "Native constructors are lowered as field "
+                                "initializers; give `init` a fixed "
+                                "parameter list."
+                            )
+                        )
+                    );
+                    continue;
+                }
+                if (
+                    _vp_encl is not None
+                    and _vp_encl.access is not None
+                    and _vp_encl.access.tag.name == Tok.KW_PUB
+                ) {
+                    out.append(
+                        (
+                            nd,
+                            "variadic parameter",
+                            _vp_name,
+                            (
+                                "The interop bridge cannot marshal a "
+                                "parameter pack; expose a fixed-arity "
+                                "`def:pub` wrapper that calls the variadic "
+                                "function instead."
+                            )
+                        )
+                    );
+                    continue;
+                }
+            }
+
+            if isinstance(nd, uni.UnaryExpr)
+                and isinstance(nd.op, uni.Token)
+                and nd.op.name == Tok.STAR_POW
+                and isinstance(nd.parent, uni.FuncCall)
+                and nd in (nd.parent.params or []) {
+                out.append(
+                    (nd, "call argument unpacking", nd.op.value, _NATIVE_UNPACK_HELP)
+                );
+                continue;
+            }
+
+            if isinstance(nd, uni.KWPair)
+                and nd.key is None
+                and isinstance(nd.parent, uni.FuncCall) {
+                out.append((nd, "call argument unpacking", "**", _NATIVE_UNPACK_HELP));
+                continue;
+            }
+
+            if isinstance(nd, uni.Ability)
+                and not isinstance(
+                    nd.signature, (uni.FuncSignature, uni.EventSignature)
+                )
+                and isinstance(nd.parent, uni.Archetype) {
+                _sig_kind = (
+                    type(nd.signature).__name__
+                        if nd.signature is not None
+                        else "no-signature"
+                );
+                _m_name = nd.name_ref.sym_name if nd.name_ref else "?";
+                _arch_name = nd.parent.name.value if nd.parent.name else "?";
+                out.append(
+                    (
+                        nd,
+                        "archetype method",
+                        f"{_arch_name}.{_m_name} ({_sig_kind})",
+                        None
+                    )
+                );
+                continue;
+            }
+
+            if isinstance(nd, uni.FormattedValue) {
+                _conv = nd.conversion if nd.conversion is not None else -1;
+                if _conv == 97 {
+                    out.append(
+                        (
+                            nd,
+                            "f-string conversion",
+                            "!a",
+                            (
+                                "ascii() escaping is not implemented natively; "
+                                "use !r or move the statement to @sv"
+                            )
+                        )
+                    );
+                    continue;
+                }
+            }
+
             if isinstance(nd, uni.AtomTrailer)
-            and nd.is_attr
-            and isinstance(nd.right, uni.Name)
-            and (nd.target.type is not None)
-            and nd.target.type.is_any_type() {
+                and nd.is_attr
+                and isinstance(nd.right, uni.Name)
+                and (nd.target.type is not None)
+                and nd.target.type.is_any_type() {
                 _fld = nd.right.value;
+                if (
+                    _fld == "environ"
+                    and isinstance(nd.target, uni.Name)
+                    and nd.target.value == "os"
+                ) {
+                    continue;
+                }
                 out.append(
                     (
                         nd,
@@ -208,29 +472,21 @@ impl native_capability_violations(mod: uni.Module) -> list {
                 );
                 continue;
             }
-            # Native lowers only a SINGLE-HOP edge reference whose chain reduces
-            # to `[origin?, EdgeOpRef, FilterCompr(no value-compare)?]`. Multi-hop
-            # chains (`[here -->-->]`) and value-compare node filters
-            # (`[?:Area(x > 1)]`) are not lowered; the backend E5090s them so a
-            # two-hop traversal is not silently truncated to one. Replicate the
-            # chain reduction here STRUCTURALLY (no `here`/tag/lowering state) so
-            # `jac check` and `jac nacompile` agree. Origin lowering, edge/node
-            # type tags, and kernel registration stay codegen backstops.
+
             if isinstance(nd, uni.EdgeRefTrailer) and nd.chain {
                 _chain = nd.chain;
                 _ci = 0 if isinstance(_chain[0], uni.EdgeOpRef) else 1;
-                _shape_ok = (_ci < len(_chain))
-                and isinstance(_chain[_ci], uni.EdgeOpRef);
-                if _shape_ok {
+                _hops = 0;
+                while (_ci < len(_chain)) and isinstance(_chain[_ci], uni.EdgeOpRef) {
+                    _hops += 1;
                     _ci += 1;
                     if (_ci < len(_chain))
-                    and isinstance(_chain[_ci], uni.FilterCompr)
-                    and (_chain[_ci].f_type is not None)
-                    and (not _chain[_ci].compares) {
+                        and isinstance(_chain[_ci], uni.FilterCompr)
+                        and (_chain[_ci].f_type is not None) {
                         _ci += 1;
                     }
-                    _shape_ok = _ci == len(_chain);
                 }
+                _shape_ok = (_hops > 0) and (_ci == len(_chain));
                 if not _shape_ok {
                     out.append(
                         (
@@ -238,13 +494,14 @@ impl native_capability_violations(mod: uni.Module) -> list {
                             "expression",
                             "EdgeRefTrailer",
                             (
-                                "native lowers only a single-hop edge reference "
-                                "(`[origin -->]` / `[here ->:Edge:->]`) with an "
-                                "optional trailing node-type filter (`[?:Node]`). "
-                                "Multi-hop chains (`[here -->-->]`) and value-compare "
-                                "filters (`[?:Node(x > 1)]`) are not yet supported; "
-                                "split the traversal into single hops or move it to "
-                                "@sv."
+                                "native lowers edge references as one or more hops "
+                                "(`[origin --> ...]` / `[here ->:Edge:-> ...]`), each "
+                                "with an optional node-type filter (`[?:Node]`, "
+                                "optionally with field predicates `[?:Node, x > 1]`). "
+                                "A compare-only filter inside a chain needs a type "
+                                "filter naming the element archetype first; other "
+                                "shapes are not yet supported - restructure the "
+                                "traversal or move it to @sv."
                             )
                         )
                     );
@@ -259,68 +516,17 @@ impl native_capability_violations(mod: uni.Module) -> list {
     return out;
 }
 
-impl module_native_compat(mod: uni.Module) -> bool {
-    scan_mods = [mod] + list(mod.impl_mod) + list(mod.test_mod) + list(mod.variant_mod);
-    has_entry = False;
-    for mc in mod.get_all_sub_nodes(typ=uni.ModuleCode) {
-        for k in mc.kid {
-            if isinstance(k, uni.Token) and k.value == "entry" {
-                has_entry = True;
-                break;
-            }
-        }
-        if has_entry {
-            break;
-        }
-    }
-    if not has_entry {
-        return False;
-    }
-    for m in scan_mods {
-        for nd_type in NATIVE_DISQUALIFIER_NODES {
-            if m.get_all_sub_nodes(typ=nd_type) {
-                return False;
-            }
-        }
-        for arch in m.get_all_sub_nodes(typ=uni.Archetype) {
-            # Any OSP archetype (node/edge/walker) disqualifies; plain
-            # obj/class archetypes (arch_kind None) are native-lowerable.
-            if arch.arch_kind is not None {
-                return False;
-            }
-        }
-        for ab in m.get_all_sub_nodes(typ=uni.Ability) {
-            if ab.is_async or isinstance(ab.signature, uni.EventSignature) {
-                return False;
-            }
-        }
-    }
-    return True;
-}
-
-impl CapabilityCheckPass.postinit -> None {
-    super.postinit();
-}
-
-impl CapabilityCheckPass.transform(ir_in: uni.Module) -> uni.Module {
-    ir_in.gen.native_compat = module_native_compat(ir_in);
-    return ir_in;
-}
-
 impl NativeCapabilityCheckPass.postinit -> None {
     super.postinit();
 }
 
-"""Emit each native-capability violation as E5090, reusing the single
-`native_capability_violations` authority the native backend emits from. Called
-on the main module only (the same scope NaIRGenPass sweeps), so `jac check` and
-`jac nacompile` report an identical violation set."""
 impl NativeCapabilityCheckPass.transform(ir_in: uni.Module) -> uni.Module {
     for (_vnode, _vkind, _vname, _vhelp) in native_capability_violations(ir_in) {
         self.emit(
             E5090, node_override=_vnode, kind=_vkind, name=_vname, help_text=_vhelp
         );
     }
+    ir_in.gen.native_viols_reported = True;
     return ir_in;
 }
 
@@ -328,35 +534,26 @@ impl PortabilityWarnPass.postinit -> None {
     super.postinit();
 }
 
-"""Run all portability checks via bulk sub-node queries (no tree traversal)."""
 impl PortabilityWarnPass.transform(ir_in: uni.Module) -> uni.Module {
     self._check_js_globals(ir_in);
     self._check_js_methods(ir_in);
     self._check_js_keywords(ir_in);
     self._check_js_properties(ir_in);
-    for annex_mod in ir_in.impl_mod + ir_in.test_mod + ir_in.variant_mod {
-        self._check_js_globals(annex_mod);
-        self._check_js_methods(annex_mod);
-        self._check_js_keywords(annex_mod);
-        self._check_js_properties(annex_mod);
-    }
     return ir_in;
 }
 
-"""Detect usage of JS-specific global objects (console, Math, JSON, etc.)."""
 impl PortabilityWarnPass._check_js_globals(mod: uni.Module) -> None {
-    import ast as ast3;
+    import from jaclang.jac0core.constant { ExprCtx }
     all_names = mod.get_all_sub_nodes(typ=uni.Name);
     for name_nd in all_names {
-        # Only check name usage (Load context), not definitions
-        if name_nd._py_ctx_func != ast3.Load {
+        if name_nd.expr_ctx != ExprCtx.LOAD {
             continue;
         }
-        # Skip if the name resolved to a user-defined symbol
+
         if name_nd.sym is not None {
             continue;
         }
-        # Skip names inside import statements
+
         if name_nd.find_parent_of_type(uni.Import) is not None {
             continue;
         }
@@ -371,14 +568,13 @@ impl PortabilityWarnPass._check_js_globals(mod: uni.Module) -> None {
     }
 }
 
-"""Detect usage of JS-idiomatic method calls (.push, .forEach, .indexOf, etc.)."""
 impl PortabilityWarnPass._check_js_methods(mod: uni.Module) -> None {
     all_trailers = mod.get_all_sub_nodes(typ=uni.AtomTrailer);
     for trailer in all_trailers {
         if not trailer.is_attr {
             continue;
         }
-        # Check if the right side is a Name that matches a JS method
+
         if not isinstance(trailer.right, uni.Name) {
             continue;
         }
@@ -386,43 +582,63 @@ impl PortabilityWarnPass._check_js_methods(mod: uni.Module) -> None {
         if method_name not in JS_METHODS {
             continue;
         }
-        # Check if this attribute access is the target of a function call
-        # (i.e., it's actually being called as a method)
+
         parent = trailer.parent;
         is_method_call = isinstance(parent, uni.FuncCall) and parent.target is trailer;
-        # Only warn if actually called as a method
-        if is_method_call {
-            self.emit(
-                W6002,
-                node_override=trailer.right,
-                method=method_name,
-                alternative=JS_METHODS[method_name]
-            );
+        if not is_method_call {
+            continue;
         }
+
+        if trailer.right.sym is not None {
+            continue;
+        }
+        if method_name == "find" and not self._find_call_is_js_style(parent) {
+            continue;
+        }
+        self.emit(
+            W6002,
+            node_override=trailer.right,
+            method=method_name,
+            alternative=JS_METHODS[method_name]
+        );
     }
 }
 
-"""Detect usage of JS-specific keywords used as identifiers (undefined, typeof, etc.)."""
+impl PortabilityWarnPass._find_call_is_js_style(call: uni.FuncCall) -> bool {
+    params = call.params;
+    if params is None or len(params) != 1 {
+        return False;
+    }
+    arg = params[0];
+    if isinstance(arg, uni.LambdaExpr) {
+        return True;
+    }
+    if isinstance(arg, uni.Name) and arg.sym is not None {
+        return arg.sym.sym_type in (SymbolType.ABILITY, SymbolType.METHOD);
+    }
+    return False;
+}
+
 impl PortabilityWarnPass._check_js_keywords(mod: uni.Module) -> None {
-    import ast as ast3;
+    import from jaclang.jac0core.constant { ExprCtx }
     all_names = mod.get_all_sub_nodes(typ=uni.Name);
     for name_nd in all_names {
-        if name_nd._py_ctx_func != ast3.Load {
+        if name_nd.expr_ctx != ExprCtx.LOAD {
             continue;
         }
-        # Skip if the name resolved to a user-defined symbol
+
         if name_nd.sym is not None {
             continue;
         }
-        # Skip names inside import statements
+
         if name_nd.find_parent_of_type(uni.Import) is not None {
             continue;
         }
-        # Skip attribute access right-hand side (x.undefined is fine as a field name)
+
         parent = name_nd.parent;
         if isinstance(parent, uni.AtomTrailer)
-        and parent.is_attr
-        and parent.right is name_nd {
+            and parent.is_attr
+            and parent.right is name_nd {
             continue;
         }
         if name_nd.value in JS_KEYWORDS {
@@ -436,7 +652,6 @@ impl PortabilityWarnPass._check_js_keywords(mod: uni.Module) -> None {
     }
 }
 
-"""Detect usage of JS-specific property access (.length instead of len(), etc.)."""
 impl PortabilityWarnPass._check_js_properties(mod: uni.Module) -> None {
     all_trailers = mod.get_all_sub_nodes(typ=uni.AtomTrailer);
     for trailer in all_trailers {
@@ -450,7 +665,11 @@ impl PortabilityWarnPass._check_js_properties(mod: uni.Module) -> None {
         if prop_name not in JS_PROPERTIES {
             continue;
         }
-        # Make sure this is a property access, not a method call
+
+        if trailer.right.sym is not None {
+            continue;
+        }
+
         parent = trailer.parent;
         is_call = isinstance(parent, uni.FuncCall) and parent.target is trailer;
         if not is_call {

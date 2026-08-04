@@ -1,16 +1,12 @@
-"""Commands for managing Jac projects and dependencies."""
-
 import from jaclang.cli.command { Arg, ArgKind }
 import from jaclang.cli.registry { get_registry }
 
-glob registry = get_registry(),
-     # Python 3.X minor versions targeted by `jac bundle --precompile`.
-     _PRECOMPILE_MINOR_RANGE: range = range(12, 15);
+glob registry = get_registry();
 
-"""Initialize a new Jac project."""
 @registry.command(
     name="create",
     help="Create a new Jac project",
+    tier="core",
     args=[
         Arg.create(
             "name",
@@ -26,28 +22,113 @@ glob registry = get_registry(),
             short="f"
         ),
         Arg.create(
+            "kind",
+            default="",
+            help="Project kind to scaffold (cli, cli-native, service, web-app, ...)",
+            short="k"
+        ),
+        Arg.create(
             "use",
             default="default",
-            help="Jacpack template: name, file path, or URL",
+            help="Custom template: file path or URL to a .jacpack (or a variant name)",
             short="u"
         ),
         Arg.create(
-            "list_jacpacks",
+            "list",
             typ=bool,
             default=False,
-            help="List available jacpack templates",
+            help="List available project kinds and named variants",
             short="l"
+        ),
+        Arg.create(
+            "pack",
+            default="",
+            short="",
+            help="Bundle a template directory into a .jacpack instead of creating (absorbs 'jac jacpack pack')"
+        ),
+        Arg.create(
+            "pack_output",
+            default="",
+            short="",
+            help="With --pack: output .jacpack file path"
+        ),
+        Arg.create(
+            "skip",
+            typ=bool,
+            default=False,
+            help="Skip dependency installation (Python + npm); run 'jac install' later"
+        ),
+        Arg.create(
+            "style",
+            typ=str,
+            default=None,
+            help="shadcn style preset (nova|vega|maia|lyra|mira)",
+            short=""
+        ),
+        Arg.create(
+            "baseColor",
+            typ=str,
+            default=None,
+            help="shadcn base palette (neutral|stone|zinc|gray)",
+            short=""
+        ),
+        Arg.create(
+            "theme",
+            typ=str,
+            default=None,
+            help="shadcn accent theme (e.g. rose, emerald)",
+            short=""
+        ),
+        Arg.create(
+            "font",
+            typ=str,
+            default=None,
+            help="shadcn font family (e.g. inter, outfit)",
+            short=""
+        ),
+        Arg.create(
+            "radius",
+            typ=str,
+            default=None,
+            help="shadcn border radius (none|small|medium|large)",
+            short=""
+        ),
+        Arg.create(
+            "menuAccent",
+            typ=str,
+            default=None,
+            help="shadcn menu accent (subtle|bold)",
+            short=""
+        ),
+        Arg.create(
+            "menuColor",
+            typ=str,
+            default=None,
+            help="shadcn menu color scheme",
+            short=""
         ),
 
     ],
     examples=[
-        ("jac create", "Initialize a project in the current directory (name from cwd)"),
-        ("jac create myapp", "Create new myapp/ directory"),
+        (
+            "jac create",
+            "Initialize a cli project in the current directory (name from cwd)"
+        ),
+        (
+            "jac create --pack ./my-template --pack_output my.jacpack",
+            "Bundle a template directory into a .jacpack"
+        ),
+        ("jac create myapp", "Create new myapp/ directory (cli kind)"),
+        ("jac create myapp --kind service", "Scaffold a headless API service"),
+        (
+            "jac create myapp --kind native-binary",
+            "Scaffold a natively-compiled binary"
+        ),
+        ("jac create myapp --kind web-app", "Scaffold a full-stack web app"),
         ("jac create --force", "Reinitialize existing project"),
-        ("jac create myapp --use client", "Create with client jacpack template"),
         ("jac create --use ./my.jacpack", "Create from local .jacpack file"),
         ("jac create --use https://example.com/t.jacpack", "Create from URL"),
-        ("jac create --list_jacpacks", "List available jacpack templates"),
+        ("jac create --list", "List available project kinds and named variants"),
 
     ],
     group="project"
@@ -55,15 +136,31 @@ glob registry = get_registry(),
 def create(
     name: str = "",
     force: bool = False,
+    kind: str = "",
     use: str = "default",
-    list_jacpacks: bool = False
+    `list: bool = False,
+    pack: str = "",
+    pack_output: str = "",
+    `skip: bool = False,
+    style: str | None = None,
+    baseColor: str | None = None,
+    theme: str | None = None,
+    font: str | None = None,
+    radius: str | None = None,
+    menuAccent: str | None = None,
+    menuColor: str | None = None
 ) -> int;
 
-"""Install all dependencies from jac.toml, or install a package in editable mode."""
 @registry.command(
     name="install",
-    help="Install project dependencies (or -e <path> for editable install)",
+    help="Install project dependencies",
     args=[
+        Arg.create(
+            "packages",
+            kind=ArgKind.MULTI_POSITIONAL,
+            default=[],
+            help="Package(s) to add to jac.toml and install into the project's venv (.jac/venv)"
+        ),
         Arg.create(
             "editable",
             kind=ArgKind.APPEND,
@@ -73,14 +170,43 @@ def create(
             metavar="PATH"
         ),
         Arg.create(
-            "dev", typ=bool, default=False, help="Include dev dependencies", short="d"
+            "dev",
+            typ=bool,
+            default=False,
+            help="Include dev dependencies, or record named package(s) as dev dependencies",
+            short="d"
         ),
         Arg.create(
             "extras",
-            kind=ArgKind.MULTI,
+            kind=ArgKind.MULTI_OPTION,
             default=[],
             help="Optional dependency groups to install (e.g. data monitoring)",
             short="x"
+        ),
+        Arg.create(
+            "no-save",
+            typ=bool,
+            default=False,
+            help="Install named package(s) without recording them in jac.toml",
+            short=""
+        ),
+        Arg.create(
+            "git",
+            default="",
+            help="Git repository URL to install and record as a git dependency",
+            short="g"
+        ),
+        Arg.create(
+            "npm",
+            typ=bool,
+            default=False,
+            help="Install npm package(s); with no names, install all npm deps from jac.toml. With --global, install standalone npm CLI tools runnable via 'jac x --global'"
+        ),
+        Arg.create(
+            "shadcn",
+            typ=bool,
+            default=False,
+            help="Install shadcn UI component(s) from the bundled registry"
         ),
         Arg.create(
             "verbose", typ=bool, default=False, help="Verbose output", short="v"
@@ -130,14 +256,62 @@ def create(
             help="Prefer wheel files over source distributions",
             short=""
         ),
+        Arg.create(
+            "global",
+            typ=bool,
+            default=False,
+            help="Install into the jac-owned global store shared by every project, not the project venv (Python: the global site; with --npm: global npm CLI tools)",
+            short="",
+            dest="install_global"
+        ),
+        Arg.create(
+            "scale",
+            typ=bool,
+            default=False,
+            help="Materialize the deploy-time capability closure (adds deploy-only clients like kubernetes/docker) instead of just the runtime closure",
+            short=""
+        ),
+        Arg.create(
+            "plan",
+            typ=bool,
+            default=False,
+            short="",
+            help="Show the fully resolved dependency plan instead of installing (absorbs 'jac deps')"
+        ),
+        Arg.create(
+            "json",
+            typ=bool,
+            default=False,
+            short="",
+            dest="as_json",
+            help="With --plan: emit the plan as JSON"
+        ),
 
     ],
     examples=[
-        ("jac install", "Install all dependencies"),
+        ("jac install", "Install all dependencies from jac.toml"),
+        ("jac install --plan", "Show the fully resolved dependency plan"),
+        (
+            "jac install --scale",
+            "Also install deploy-time capabilities (kubernetes/docker) for the operator machine"
+        ),
+        ("jac install requests", "Add requests to jac.toml and install it"),
+        (
+            'jac install "numpy>=1.24" pandas',
+            "Add multiple packages with version constraints"
+        ),
+        ("jac install pytest --dev", "Add a dev dependency"),
+        ("jac install numpy --no-save", "Install without recording in jac.toml"),
+        (
+            "jac install --git https://github.com/user/plugin.git",
+            "Install and record a git dependency"
+        ),
+        ("jac install --npm left-pad", "Add a client-side npm dependency"),
+        ("jac install --shadcn button card", "Add shadcn UI components"),
         ("jac install -e .", "Install current package in editable mode"),
         ("jac install -e /path/to/lib", "Install a cloned library in editable mode"),
         (
-            "jac install -e ./jac-byllm ./jac-scale -e ./jac-client",
+            "jac install -e ./my-plugin -e ./my-lib",
             "Install multiple packages in editable mode (space-separated or repeated -e)"
         ),
         ("jac install --dev", "Include dev dependencies"),
@@ -149,14 +323,23 @@ def create(
         ("jac install --dry-run", "Preview what would be installed without doing it"),
         ("jac install --no-deps", "Install packages without their dependencies"),
         ("jac install --prefer-binary", "Prefer pre-built wheels over source builds"),
+        (
+            "jac install -e ./my-plugin --global",
+            "Install a plugin into the global site so it's importable from any project"
+        ),
 
     ],
     group="project"
 )
 def install(
+    packages: list = [],
     editable: list = [],
     dev: bool = False,
     extras: list = [],
+    no_save: bool = False,
+    git: str = "",
+    npm: bool = False,
+    shadcn: bool = False,
     verbose: bool = False,
     force_reinstall: bool = False,
     no_cache_dir: bool = False,
@@ -164,46 +347,22 @@ def install(
     dry_run: bool = False,
     no_deps: bool = False,
     quiet: bool = False,
-    prefer_binary: bool = False
+    prefer_binary: bool = False,
+    install_global: bool = False,
+    scale: bool = False,
+    plan: bool = False,
+    as_json: bool = False
 ) -> int;
 
-"""Add dependencies to the project."""
-@registry.command(
-    name="add",
-    help="Add a dependency to the project",
-    args=[
-        Arg.create(
-            "packages", kind=ArgKind.MULTI, default=[], help="Package specifications"
-        ),
-        Arg.create(
-            "dev", typ=bool, default=False, help="Add as dev dependency", short="d"
-        ),
-        Arg.create("git", default="", help="Git repository URL", short="g"),
-        Arg.create(
-            "verbose", typ=bool, default=False, help="Verbose output", short="v"
-        ),
-
-    ],
-    examples=[
-        ("jac add requests", "Add a package"),
-        ('jac add "numpy>=1.24" pandas', "Add multiple packages with version"),
-        ("jac add pytest --dev", "Add dev dependency"),
-        ("jac add --git https://github.com/user/plugin.git", "Add from git"),
-
-    ],
-    group="project"
-)
-def add(
-    packages: list = [], dev: bool = False, git: str = "", verbose: bool = False
-) -> int;
-
-"""Remove dependencies from the project."""
 @registry.command(
     name="remove",
     help="Remove a dependency from the project",
     args=[
         Arg.create(
-            "packages", kind=ArgKind.MULTI, default=[], help="Packages to remove"
+            "packages",
+            kind=ArgKind.MULTI_POSITIONAL,
+            default=[],
+            help="Packages to remove"
         ),
         Arg.create(
             "dev",
@@ -212,25 +371,34 @@ def add(
             help="Remove from dev dependencies",
             short="d"
         ),
+        Arg.create(
+            "npm", typ=bool, default=False, help="Remove npm (client-side) dependency"
+        ),
+        Arg.create(
+            "shadcn", typ=bool, default=False, help="Remove shadcn UI component(s)"
+        ),
 
     ],
     examples=[
         ("jac remove requests", "Remove a package"),
         ("jac remove pytest --dev", "Remove dev dependency"),
+        ("jac remove --npm left-pad", "Remove a client-side npm dependency"),
+        ("jac remove --shadcn button", "Remove shadcn UI components"),
 
     ],
     group="project"
 )
-def remove(packages: list = [], dev: bool = False) -> int;
+def remove(
+    packages: list = [], dev: bool = False, npm: bool = False, shadcn: bool = False
+) -> int;
 
-"""Update project dependencies to latest compatible versions."""
 @registry.command(
     name="update",
     help="Update project dependencies to latest compatible versions",
     args=[
         Arg.create(
             "packages",
-            kind=ArgKind.MULTI,
+            kind=ArgKind.MULTI_POSITIONAL,
             default=[],
             help="Packages to update (all if empty)"
         ),
@@ -252,33 +420,10 @@ def remove(packages: list = [], dev: bool = False) -> int;
 )
 def update(packages: list = [], dev: bool = False, verbose: bool = False) -> int;
 
-"""Run custom scripts defined in jac.toml."""
-@registry.command(
-    name="script",
-    help="Run project scripts",
-    args=[
-        Arg.create(
-            "name", kind=ArgKind.POSITIONAL, default="", help="Script name to run"
-        ),
-        Arg.create(
-            "list_scripts",
-            typ=bool,
-            default=False,
-            help="List available scripts",
-            short="l"
-        ),
+def deps(scale: bool = False, as_json: bool = False) -> int;
 
-    ],
-    examples=[
-        ("jac script --list", "List available scripts"),
-        ("jac script build", "Run the 'build' script"),
-
-    ],
-    group="project"
-)
 def script(name: str = "", list_scripts: bool = False) -> int;
 
-"""Clean project build artifacts."""
 @registry.command(
     name="clean",
     help="Clean project build artifacts",
@@ -337,78 +482,6 @@ def clean(
     force: bool = False
 ) -> int;
 
-"""Bundle a template directory into a distributable .jacpack file."""
-@registry.command(
-    name="jacpack",
-    help="Manage project templates (.jacpack files)",
-    args=[
-        Arg.create(
-            "action", kind=ArgKind.POSITIONAL, default="", help="Action: pack, list"
-        ),
-        Arg.create(
-            "path",
-            kind=ArgKind.POSITIONAL,
-            default="",
-            help="Template directory path (for pack) or .jacpack path (for info)"
-        ),
-        Arg.create(
-            "output",
-            default="",
-            help="Output file path for bundled template",
-            short="o"
-        ),
-
-    ],
-    examples=[
-        (
-            "jac jacpack pack ./my-template -o my-template.jacpack",
-            "Bundle a template directory"
-        ),
-        ("jac jacpack list", "List available templates"),
-
-    ],
-    group="project"
-)
 def jacpack(action: str = "", path: str = "", output: str = "") -> int;
 
-"""Build a distributable package from jac.toml into the output directory."""
-@registry.command(
-    name="bundle",
-    help="Build a .whl (PyPI) or npm .tgz (npmjs) from jac.toml; upload separately",
-    args=[
-        Arg.create(
-            "output",
-            default="dist",
-            help="Output directory for the built artifact",
-            short="o"
-        ),
-        Arg.create(
-            "target",
-            default="wheel",
-            help="Build target: 'wheel' (PyPI), 'npm' (npmjs), 'all', or 'npm-runtime'",
-            short="t"
-        ),
-        Arg.create(
-            "precompile",
-            typ=bool,
-            default=False,
-            help="Precompile .jac → .jir for python3.X versions on PATH; requires python3.X executables (wheel only)",
-            short="p"
-        ),
-
-    ],
-    examples=[
-        ("jac bundle", "Build wheel into dist/"),
-        ("jac bundle --target npm", "Build an npm .tgz into dist/"),
-        (
-            "jac bundle --precompile",
-            "Precompile for all Py-versions on PATH then bundle"
-        ),
-        ("jac bundle -o /tmp/wheels", "Build to custom output directory"),
-
-    ],
-    group="project"
-)
-def bundle(
-    output: str = "dist", target: str = "wheel", precompile: bool = False
-) -> int;
+def bundle(output: str = "dist", target: str = "wheel", fat: bool = False) -> int;

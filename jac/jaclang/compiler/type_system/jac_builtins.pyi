@@ -36,10 +36,13 @@ __all__ = [
     "Root",
     "GenericEdge",
     "JsxElement",
+    "JsxPage",
+    "JsxLayout",
     "OPath",
     "DSFunc",
     "EdgeDir",
     "LLMModel",
+    "Region",
     # Fixed-width numeric types
     "i8",
     "u8",
@@ -59,6 +62,7 @@ __all__ = [
     "allroots",
     "save",
     "commit",
+    "on_commit",
     "store",
     "archetype_alias",
     "destroy",
@@ -69,11 +73,8 @@ __all__ = [
     "unsafe_html",
     # Ambient values and constants
     "llm",
-    "NoPerm",
-    "ReadPerm",
-    "ConnectPerm",
-    "WritePerm",
     # Builtin enums
+    "AccessLevel",
     "ScheduleTrigger",
     "APIProtocol",
 ]
@@ -106,13 +107,34 @@ class Root(Node):
 
 class GenericEdge(Edge): ...
 
-class JsxElement:
+# Route marker types for the client file-based router. A `pages/` module whose
+# public export returns `JsxPage` is a route; one returning `JsxLayout` is a
+# layout. `JsxElement` is assignable to both, so a component body returning JSX
+# satisfies a `-> JsxPage` / `-> JsxLayout` signature; the distinct annotation is
+# what marks the export as a route/layout (the name of the export is free).
+class JsxPage:
+    tag: object
+    props: dict[str, object]
+    children: list[object]
+
+class JsxLayout:
+    tag: object
+    props: dict[str, object]
+    children: list[object]
+
+class JsxElement(JsxPage, JsxLayout):
     tag: object
     props: dict[str, object]
     children: list[object]
 
 class OPath: ...
 class DSFunc: ...
+
+# First-class region handle: an ownable, sendable, escape-checked allocation
+# extent opened by `in <handle> { ... }`. On managed backends the handle is a
+# no-op; native codegen gives it arena semantics.
+class Region:
+    def partition(self) -> Region: ...
 
 class EdgeDir:
     OUT: int
@@ -154,6 +176,7 @@ def revoke(archetype: object) -> None: ...
 def allroots() -> list[Root]: ...
 def save(obj: object) -> None: ...
 def commit(anchor: object = None) -> None: ...
+def on_commit(callback: Callable[[], object]) -> None: ...
 def store(base_path: str = "./storage", create_dirs: bool = True) -> object: ...
 def archetype_alias(old_name: str) -> Callable[[type], type]: ...
 
@@ -173,6 +196,10 @@ def printgraph(
 def restspec(**specs: object) -> Callable[..., Any]: ...
 def schedule(**kwargs: object) -> Callable[..., Any]: ...
 
+_ManagedT = TypeVar("_ManagedT")
+
+def managed(x: _ManagedT) -> _ManagedT: ...
+
 # Returns a sentinel object that the JSX flattener turns into raw HTML
 # (`dangerouslySetInnerHTML` on jac-client, `innerHTML` on bare-serve).
 # Use only with content you trust -- the name is the security review hint.
@@ -184,13 +211,13 @@ def unsafe_html(html: object) -> object: ...
 
 def destroy(objs: object) -> None: ...
 
-# ── Permission constants ───────────────────────────────────────────
-NoPerm: int
-ReadPerm: int
-ConnectPerm: int
-WritePerm: int
-
 # ── Builtin enums ──────────────────────────────────────────────────
+class AccessLevel:
+    NO_ACCESS: AccessLevel
+    READ: AccessLevel
+    CONNECT: AccessLevel
+    WRITE: AccessLevel
+
 class ScheduleTrigger:
     STATIC: str
     DYNAMIC: str

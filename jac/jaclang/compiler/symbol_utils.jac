@@ -1,43 +1,43 @@
-"""Shared symbol resolution utilities for all Jac compiler backends.
-
-Centralizes symbol lookup patterns that were previously duplicated across
-the ES backend (_resolve_expr_symbol), CFG pass (_collect_narrowing_symbols,
-_collect_assigned_symbols), and Native backend (inline name lookups).
-
-All functions are free-standing — no pass or backend state required.
-"""
 import from collections.abc { Sequence }
+import from pathlib { Path }
 import jaclang.jac0core.unitree as uni;
-import from jaclang.jac0core.constant { Tokens as Tok, SymbolType }
-
-"""Kind of a function-call site, classified independently of the target backend.
-
-The single authoritative answer to "what kind of call is this?" so that every
-backend dispatches the same way instead of re-deriving it from name strings.
-"""
-enum CallKind {
-    METHOD = "method",  # obj.method(...)
-    INSTANTIATION = "instantiation",  # Foo(...) where Foo is a class/archetype
-    BUILTIN = "builtin",  # len(...)/print(...): registry builtin, unshadowed
-    CLIB = "clib",  # foreign function declared by a C-library import block
-    FUNCTION = "function"  # free function / ability / indirect / unknown
+import from jaclang.jac0core.constant { CodeContext, Tokens as Tok, SymbolType }
+import from jaclang.jac0core.diagnostics { E5082, E5084, W6006, W6007 }
+import from jaclang.jac0core.compiler {
+    ClientImportVerdict,
+    ability_of_symbol,
+    classify_client_import_item,
+    is_client_boundary_import,
+    symbol_linked_source_module
 }
 
-"""Resolve a symbol from an arbitrary expression.
+enum CallKind {
+    METHOD = "method",
+    INSTANTIATION = "instantiation",
+    BUILTIN = "builtin",
+    CLIB = "clib",
+    FUNCTION = "function"
+}
 
-Handles three patterns:
-1. Direct AstSymbolNode with resolved sym
-2. AtomTrailer chains (a.b.c) — returns last symbol
-3. Fallback to module-level lookup for simple Names
-"""
+def is_builtin_region_name(nm: object) -> bool {
+    if not isinstance(nm, uni.Name) or nm.sym_name != "Region" {
+        return False;
+    }
+    if nm.sym is None or nm.sym.decl is None {
+        return True;
+    }
+    _loc = nm.sym.decl.loc;
+    _mp = _loc.mod_path if _loc is not None else "";
+    return isinstance(_mp, str) and _mp.endswith(".pyi");
+}
+
 def resolve_expr_symbol(
     expr: uni.Expr, module: (uni.Module | None) = None
 ) -> (uni.Symbol | None) {
-    # Direct symbol node
     if isinstance(expr, uni.AstSymbolNode) and expr.sym {
         return expr.sym;
     }
-    # Dotted attribute access chain
+
     if isinstance(expr, uni.AtomTrailer) {
         attrs = expr.as_attr_list;
         if attrs {
@@ -47,22 +47,13 @@ def resolve_expr_symbol(
             }
         }
     }
-    # Fallback: simple Name looked up in module scope
+
     if module is not None and isinstance(expr, uni.Name) {
         return module.lookup(expr.sym_name);
     }
     return None;
 }
 
-"""True if a symbol is defined in user code rather than a builtin/typing stub.
-
-Builtins (`len`, `print`, ...) and ambient typing names are defined in `.pyi`
-stub modules (or synthetic `stub_only` modules), so a call target that resolves
-to a real `.jac`/`.py` module is a genuine user definition that shadows any
-same-named builtin. Returns False when the owning module can't be determined,
-so unconfirmed cases fall back to name-based builtin classification (preserving
-prior behavior).
-"""
 def _is_user_symbol(sym: uni.Symbol) -> bool {
     scope: (uni.UniScopeNode | None) = sym.parent_tab;
     while scope is not None {
@@ -77,95 +68,51 @@ def _is_user_symbol(sym: uni.Symbol) -> bool {
     return False;
 }
 
-"""Classify a call site as method / instantiation / builtin / free function.
-
-Uses the resolved target symbol (so a user definition shadows a same-named
-builtin or class) and the central builtin registry, never raw name matching.
-Backends consume this instead of re-deriving call kind from name strings.
-"""
 def classify_call(nd: uni.FuncCall) -> CallKind {
     import from jaclang.compiler.type_registry { JAC_TYPE_REGISTRY }
-    # (1) Attribute-trailer call shape: obj.method(...). Shape-based and reliable.
+
     if isinstance(nd.target, uni.AtomTrailer) and nd.target.is_attr {
         return CallKind.METHOD;
     }
-    # (2) A resolved user symbol shadows any builtin/class name.
+
     sym = resolve_expr_symbol(nd.target);
-    # (2a) A FUNCTION declared inside a C-library import block is a
-    # foreign call - the Phase 8 CallInfo seam (kind == CLIB) that the
-    # foreign marshalling plan hangs off. A clib-declared struct's
-    # constructor call is still an INSTANTIATION (the struct is laid out
-    # and allocated locally; only functions cross the C boundary).
+
     if sym is not None
-    and sym.decl is not None
-    and sym.sym_type not in (
-        SymbolType.OBJECT_ARCH,
-        SymbolType.NODE_ARCH,
-        SymbolType.EDGE_ARCH,
-        SymbolType.WALKER_ARCH,
-        SymbolType.ENUM_ARCH
-    ) {
+        and sym.decl is not None
+        and sym.sym_type
+            not in (
+                SymbolType.OBJECT_ARCH,
+                SymbolType.NODE_ARCH,
+                SymbolType.EDGE_ARCH,
+                SymbolType.WALKER_ARCH,
+                SymbolType.ENUM_ARCH
+            ) {
         _imp = sym.decl.find_parent_of_type(uni.Import);
         if _imp is not None and _imp.clib_decls {
             return CallKind.CLIB;
         }
     }
     if sym is not None and _is_user_symbol(sym) {
-        if sym.sym_type in (
-            SymbolType.OBJECT_ARCH,
-            SymbolType.NODE_ARCH,
-            SymbolType.EDGE_ARCH,
-            SymbolType.WALKER_ARCH,
-            SymbolType.ENUM_ARCH
-        ) {
+        if sym.sym_type
+            in (
+                SymbolType.OBJECT_ARCH,
+                SymbolType.NODE_ARCH,
+                SymbolType.EDGE_ARCH,
+                SymbolType.WALKER_ARCH,
+                SymbolType.ENUM_ARCH
+            ) {
             return CallKind.INSTANTIATION;
         }
         return CallKind.FUNCTION;
     }
-    # (3) Builtin function by registry name (only when not shadowed above).
+
     if isinstance(nd.target, uni.Name)
-    and JAC_TYPE_REGISTRY.is_builtin(nd.target.sym_name) {
+        and JAC_TYPE_REGISTRY.is_builtin(nd.target.sym_name) {
         return CallKind.BUILTIN;
     }
     return CallKind.FUNCTION;
 }
 
-"""Resolve an attribute chain (a.b.c) to list of resolved symbols."""
-def resolve_attr_chain(expr: uni.AtomTrailer) -> list[uni.Symbol] {
-    result: list[uni.Symbol] = [];
-    attrs = expr.as_attr_list;
-    if attrs {
-        for attr in attrs {
-            if isinstance(attr, uni.AstSymbolNode) and attr.sym {
-                result.append(attr.sym);
-            }
-        }
-    }
-    return result;
-}
-
-"""Return the ability declaration a resolved symbol denotes (if any).
-
-The symbol's first definition is either the Ability node itself or the
-ability's name atom (whose parent is the Ability). Single owner of the
-symbol-to-ability mapping: the checker uses it to stamp
-`FuncCall.callee_decl`; backends consume the stamp.
-"""
-def ability_of_symbol(sym: (uni.Symbol | None)) -> (uni.Ability | None) {
-    if sym is None or not sym.defn {
-        return None;
-    }
-    defn_node = sym.defn[0];
-    if isinstance(defn_node, uni.Ability) {
-        return defn_node;
-    }
-    if isinstance(defn_node.parent, uni.Ability) {
-        return defn_node.parent;
-    }
-    return None;
-}
-
-"""Get the archetype that owns/defines a symbol (if any)."""
 def symbol_owner_archetype(sym: uni.Symbol) -> (uni.Archetype | None) {
     decl = sym.decl;
     if decl is None {
@@ -178,12 +125,6 @@ def symbol_owner_archetype(sym: uni.Symbol) -> (uni.Archetype | None) {
     return None;
 }
 
-"""Collect field names from an archetype symbol.
-
-Generalized from ES backend's _collect_walker_field_names.
-Works for any archetype type (walker, node, edge, object).
-Optionally filter by arch_type (e.g., Tok.KW_WALKER).
-"""
 def collect_field_names(
     sym: (uni.Symbol | None), arch_type_filter: (str | None) = None
 ) -> list[str] {
@@ -200,21 +141,16 @@ def collect_field_names(
     return [field.sym_name for field in arch.get_has_vars()];
 }
 
-"""Build a dotted key string from a Name or AtomTrailer expression.
-
-Returns keys like "x" or "obj.speed" for use in affected_symbols.
-Returns None for expressions that cannot be represented as a key.
-"""
 def int_subscript_suffix(right: uni.IndexSlice) -> str | None {
     if (not right.is_range and len(right.slices) == 1) {
         idx = right.slices[0];
         if (idx.start is not None and idx.stop is None and idx.step is None) {
             start = idx.start;
-            # items[0] - positive integer literal
+
             if isinstance(start, uni.Int) {
                 return f"[{start.lit_value}]";
             }
-            # items[-1] - negative integer (UnaryExpr with minus op)
+
             if (
                 isinstance(start, uni.UnaryExpr)
                 and isinstance(start.op, uni.Token)
@@ -223,18 +159,13 @@ def int_subscript_suffix(right: uni.IndexSlice) -> str | None {
             ) {
                 return f"[-{start.operand.lit_value}]";
             }
-            # config["host"] - string literal index (MultiString wraps String in Jac AST)
+
             if isinstance(start, uni.MultiString)
-            and len(start.strings) == 1
-            and isinstance(start.strings[0], uni.String) {
+                and len(start.strings) == 1
+                and isinstance(start.strings[0], uni.String) {
                 return f'[{start.strings[0].lit_value!r}]';
             }
-            # items[i] - simple name index. The CFG assignment barrier
-            # consults the narrowing target's `deps` set (populated by
-            # `reference_key_deps` from the AST) so reassigning `i`
-            # invalidates the narrowing; `if x[i] is not None: x[i].foo`
-            # narrows under the same loop iteration while still dying
-            # the moment any index is rebound.
+
             if isinstance(start, uni.Name) {
                 return f"[{start.value}]";
             }
@@ -243,16 +174,6 @@ def int_subscript_suffix(right: uni.IndexSlice) -> str | None {
     return None;
 }
 
-"""Reference-key dependencies that invalidate narrowing when reassigned.
-
-A narrowing fact on `x[r] is not None` is keyed by the exact spelling
-`"x[r]"`, so the CFG predecessor walk drops the narrowing when the
-same key is rebound. But the key *also* depends on the base name `x`
-and the index name `r` -- reassigning either changes what `x[r]`
-denotes, so the narrowing must die too. Walks the AST to collect
-those identifier names; literal indices like `[0]` / `["host"]`
-contribute nothing because they're stable.
-"""
 def reference_key_deps(expr: uni.Expr) -> set[str] {
     deps: set[str] = set();
     cur: uni.UniNode | None = expr;
@@ -309,17 +230,13 @@ def get_expr_key(expr: uni.Expr) -> str | None {
             }
         }
     }
-    # Unwrap parentheses
+
     if isinstance(expr, uni.AtomUnit) and expr.value {
         return get_expr_key(expr.value);
     }
     return None;
 }
 
-"""Extract narrowing key from the first argument of a builtin call (isinstance/callable/hasattr).
-
-Handles unwrapping parentheses, Name, AtomTrailer, and walrus expressions.
-"""
 def _extract_first_arg_key(arg: uni.Expr) -> str | None {
     if isinstance(arg, uni.AtomUnit) and arg.value {
         arg = arg.value;
@@ -341,10 +258,6 @@ def _extract_first_arg_key(arg: uni.Expr) -> str | None {
     return None;
 }
 
-"""Extract narrowing key from the left side of a CompareExpr.
-
-Handles unwrapping parentheses, Name, AtomTrailer, and walrus expressions.
-"""
 def _extract_compare_left_key(left: uni.Expr) -> str | None {
     if isinstance(left, uni.AtomUnit) and left.value {
         left = left.value;
@@ -366,13 +279,7 @@ def _extract_compare_left_key(left: uni.Expr) -> str | None {
     return None;
 }
 
-"""Classify a leaf condition and extract its narrowing key (type-free).
-
-Free-standing function for use in symbol_utils where TypeEvaluator is unavailable.
-Returns the narrowing key or None.
-"""
 def classify_condition_key(condition: uni.Expr) -> str | None {
-    # isinstance(x, T), callable(x), or hasattr(x, "name")
     if isinstance(condition, uni.FuncCall) and isinstance(condition.target, uni.Name) {
         if (
             condition.target.value in ("isinstance", "callable", "hasattr")
@@ -381,18 +288,18 @@ def classify_condition_key(condition: uni.Expr) -> str | None {
             return _extract_first_arg_key(condition.params[0]);
         }
     }
-    # CompareExpr: x is None, x == literal, etc.
+
     if isinstance(condition, uni.CompareExpr) {
         return _extract_compare_left_key(condition.left);
     }
-    # Truthiness: x / x.attr
+
     if isinstance(condition, uni.Name) {
         return condition.value;
     }
     if isinstance(condition, uni.AtomTrailer) and condition.is_attr {
         return get_expr_key(condition);
     }
-    # Walrus: (x := expr)
+
     if (
         isinstance(condition, uni.BinaryExpr)
         and isinstance(condition.op, uni.Token)
@@ -404,19 +311,13 @@ def classify_condition_key(condition: uni.Expr) -> str | None {
     return None;
 }
 
-"""Collect symbols narrowed by a condition expression.
-
-Extracted from CFGBuildPass._collect_narrowing_symbols.
-Structural wrappers (parens, NOT, AND/OR) recurse; leaf conditions
-are classified via classify_condition_key.
-"""
 def collect_narrowing_symbols(condition: uni.Expr) -> set[str] {
     symbols: set[str] = set();
-    # Structural wrappers — recurse
+
     if isinstance(condition, uni.CfgExpr) {
         symbols.update(collect_narrowing_symbols(condition.expr));
     } elif isinstance(condition, uni.AtomUnit)
-    and isinstance(condition.value, uni.Expr) {
+        and isinstance(condition.value, uni.Expr) {
         symbols.update(collect_narrowing_symbols(condition.value));
     } elif isinstance(condition, uni.UnaryExpr) {
         symbols.update(collect_narrowing_symbols(condition.operand));
@@ -425,7 +326,6 @@ def collect_narrowing_symbols(condition: uni.Expr) -> set[str] {
             symbols.update(collect_narrowing_symbols(val));
         }
     } else {
-        # Leaf classification — single dispatch point
         key = classify_condition_key(condition);
         if key is not None {
             symbols.add(key);
@@ -434,18 +334,6 @@ def collect_narrowing_symbols(condition: uni.Expr) -> set[str] {
     return symbols;
 }
 
-"""Find the positional index path of a reference key inside a single
-destructuring target, or `None` if the key isn't written there.
-
-For `(x, _) = ...` with key `"x"` the result is `[0]`; for
-`((a, b), c) = ...` with key `"b"` it's `[0, 1]`. The starred slot in
-`(a, *rest) = ...` is intentionally excluded because its type is the
-list of the tail, not a single element at a fixed index — callers that
-want to narrow `rest` need different logic.
-
-Only the first occurrence wins; a well-formed destructuring target
-binds each key at most once anyway.
-"""
 def find_destructure_index_path(target: uni.UniNode, key: str) -> list[int] | None {
     if isinstance(target, uni.Name) {
         return [] if target.value == key else None;
@@ -462,7 +350,7 @@ def find_destructure_index_path(target: uni.UniNode, key: str) -> list[int] | No
             if not isinstance(sub, uni.UniNode) {
                 continue;
             }
-            # Skip starred slots — their type isn't a single element.
+
             if (
                 isinstance(sub, uni.UnaryExpr)
                 and isinstance(sub.op, uni.Token)
@@ -479,13 +367,6 @@ def find_destructure_index_path(target: uni.UniNode, key: str) -> list[int] | No
     return None;
 }
 
-"""Collect every reference key bound by a single assignment target.
-
-Walks one element of `Assignment.target`, extracting the reference keys
-it writes. Handles flat names, dotted attribute paths, recursive
-tuple/list destructuring (e.g. `(a, (b, c)) = ...`), and starred
-unpack slots (`(a, *rest) = ...`).
-"""
 def collect_assignment_target_keys(target: uni.UniNode) -> set[str] {
     keys: set[str] = set();
     if isinstance(target, uni.Name) {
@@ -507,36 +388,25 @@ def collect_assignment_target_keys(target: uni.UniNode) -> set[str] {
         and isinstance(target.op, uni.Token)
         and target.op.name == Tok.STAR_MUL
     ) {
-        # Starred unpack slot: `*rest` inside (a, *rest) = ...
         keys.update(collect_assignment_target_keys(target.operand));
     } elif isinstance(target, uni.AtomUnit) and isinstance(target.value, uni.UniNode) {
-        # Parenthesized target: `(x) = ...` or `((x, y)) = ...`.
         keys.update(collect_assignment_target_keys(target.value));
     }
     return keys;
 }
 
-"""Collect all symbols assigned/bound in a statement.
-
-Extracted from CFGBuildPass._collect_assigned_symbols.
-Handles assignments, for-loops, and walrus operators.
-"""
 def collect_assigned_symbols(nd: uni.UniNode) -> set[str] {
     symbols: set[str] = set();
-    # Assignment: x = ..., (x, y) = ..., obj.attr = ...
+
     if isinstance(nd, uni.Assignment) {
         for target in nd.target {
             symbols.update(collect_assignment_target_keys(target));
         }
-    }
-    # For loop: for x in ...
-    elif isinstance(nd, uni.InForStmt) {
+    } elif isinstance(nd, uni.InForStmt) {
         if isinstance(nd.target, uni.Name) {
             symbols.add(nd.target.value);
         }
-    }
-    # Walrus operator / assignment comprehension: (x := ...)
-    elif isinstance(nd, uni.AssignCompr) {
+    } elif isinstance(nd, uni.AssignCompr) {
         if isinstance(nd.target, uni.Name) {
             symbols.add(nd.target.value);
         }
@@ -544,10 +414,6 @@ def collect_assigned_symbols(nd: uni.UniNode) -> set[str] {
     return symbols;
 }
 
-"""Collect method names from an archetype's raw body (no ImplDef resolution).
-
-Used by native backend where raw body iteration is intentional.
-"""
 def collect_method_names(arch: uni.Archetype) -> set[str] {
     names: set[str] = set();
     if arch.body is not None and isinstance(arch.body, Sequence) {
@@ -561,4 +427,286 @@ def collect_method_names(arch: uni.Archetype) -> set[str] {
         }
     }
     return names;
+}
+
+def resolve_import_source_module(prog: any, nd: uni.Import) -> (uni.Module | None) {
+    if not nd.from_loc {
+        return None;
+    }
+    resolved_path = nd.from_loc.resolve_relative_path();
+    abs_path = str(Path(resolved_path).resolve());
+    source_mod = prog.mod.hub.get(resolved_path) or prog.mod.hub.get(abs_path);
+    if source_mod {
+        return source_mod;
+    }
+    if Path(resolved_path).exists() {
+        saved_opts = prog?._compile_options;
+        try {
+            source_mod = prog.compile(
+                resolved_path, no_cgen=True, type_check=False, symtab_ir_only=True
+            );
+        } finally {
+            if saved_opts is not None {
+                prog._compile_options = saved_opts;
+            }
+        }
+        prog.mod.hub[abs_path] = source_mod;
+        return source_mod;
+    }
+    return None;
+}
+
+def import_target_pinned_server(nd: uni.Import) -> bool {
+    if nd.from_loc is None {
+        return False;
+    }
+    try {
+        target = nd.from_loc.resolve_relative_path();
+        if isinstance(target, str) and target.endswith('.jac') {
+            import from jaclang.jac0core.placement_pins { config_module_pin }
+            return config_module_pin(target) == 'server';
+        }
+    } except Exception {
+        return False;
+    }
+    return False;
+}
+
+def decl_has_access(source_mod: uni.Module, item: uni.ModuleItem) -> bool {
+    nm = item.name.value if isinstance(item.name, uni.Name) else '';
+    if not nm or source_mod.sym_tab is None {
+        return False;
+    }
+    sym = source_mod.sym_tab.lookup(nm, deep=True);
+    if not (sym and sym.defn) {
+        return False;
+    }
+    decl = sym.defn[0];
+    owner = decl.parent if (isinstance(decl, uni.NameAtom) and decl.parent) else decl;
+    return owner?.access is not None;
+}
+
+def report_dead_client_import(
+    reporter: any, nd: uni.Import, item: uni.ModuleItem
+) -> None {
+    name = item.name.sym_name
+        if isinstance(item.name, uni.Name)
+        else str(item.name.value);
+    module_name = nd.from_loc.dot_path_str if nd.from_loc is not None else '';
+    for e in reporter.prog.errors_had {
+        if (
+            e.code is E5082
+            and e.loc.mod_path == item.loc.mod_path
+            and e.loc.first_line == item.loc.first_line
+            and e.loc.col_start == item.loc.col_start
+        ) {
+            return;
+        }
+    }
+    reporter.emit(E5082, node_override=item, name=name, module=module_name);
+}
+
+
+def report_client_bare_import_uses(reporter: any, mod: uni.Module) {
+    for stmt in mod.body {
+        if (
+            isinstance(stmt, uni.ContextAwareNode)
+            and stmt.code_context == CodeContext.CLIENT
+            and not stmt.codespace_dual
+        ) {
+            _report_client_bare_import_uses(reporter, mod, stmt);
+        }
+    }
+}
+
+def _already_warned(reporter: any, diag: any, nd: uni.UniNode) -> bool {
+    for w in reporter.prog.warnings_had {
+        if (
+            w.code is diag
+            and w.loc.mod_path == nd.loc.mod_path
+            and w.loc.first_line == nd.loc.first_line
+            and w.loc.col_start == nd.loc.col_start
+        ) {
+            return True;
+        }
+    }
+    return False;
+}
+
+def _in_annotation_position(nm: uni.Name, stop: uni.UniNode) -> bool {
+    cur = nm.parent;
+    while cur is not None and cur is not stop {
+        if isinstance(cur, uni.SubTag) {
+            return True;
+        }
+        if isinstance(cur, uni.ParamVar) {
+            return False;
+        }
+        if isinstance(cur, uni.FuncSignature) {
+            return True;
+        }
+        cur = cur.parent;
+    }
+    return False;
+}
+
+def _bare_py_import_bindings(mod: uni.Module) -> dict[str, tuple] {
+    out: dict[str, tuple] = {};
+    for imp in mod.get_all_sub_nodes(uni.Import) {
+        if imp.is_service_import or imp.is_typed {
+            continue;
+        }
+        if imp.ecosystem != 'py' {
+            continue;
+        }
+        if imp.from_loc is None or imp.from_loc.level > 0 {
+            continue;
+        }
+        if imp.code_context == CodeContext.CLIENT {
+            continue;
+        }
+        for item in imp.items {
+            if not isinstance(item, uni.ModuleItem) {
+                continue;
+            }
+            if item.alias is not None {
+                binding = item.alias.sym_name;
+            } elif isinstance(item.name, uni.Name) {
+                binding = item.name.sym_name;
+            } else {
+                binding = str(item.name.value);
+            }
+            out[binding] = (item, imp);
+        }
+    }
+    return out;
+}
+
+
+def _shadows_bare_import(nm: uni.Name) -> bool {
+    sym = nm.sym;
+    if sym is None or sym.decl is None {
+        return False;
+    }
+    decl = sym.decl;
+    if isinstance(decl, uni.ModuleItem) or isinstance(decl.parent, uni.ModuleItem) {
+        return False;
+    }
+    cur = decl.parent;
+    while cur is not None {
+        if isinstance(cur, (uni.ParamVar, uni.HasVar)) {
+            return True;
+        }
+        if isinstance(cur, uni.Assignment) {
+            return decl in cur.target
+                or any([decl in t.get_all_sub_nodes(uni.Name) for t in cur.target]);
+        }
+        if isinstance(cur, uni.ElementStmt) {
+            return False;
+        }
+        cur = cur.parent;
+    }
+    return False;
+}
+
+
+def _report_client_bare_import_uses(reporter: any, mod: uni.Module, stmt: uni.UniNode) {
+    bindings = _bare_py_import_bindings(mod);
+    if not bindings {
+        return;
+    }
+    for nm in stmt.get_all_sub_nodes(uni.Name) {
+        par = nm.parent;
+        if (isinstance(par, uni.AtomTrailer) and par.is_attr and par.right is nm) {
+            continue;
+        }
+        hit = bindings.get(nm.value);
+        if hit is None {
+            continue;
+        }
+        if _shadows_bare_import(nm) {
+            continue;
+        }
+        if _in_annotation_position(nm, stmt) {
+            continue;
+        }
+        (item, imp) = hit;
+        module_name = imp.from_loc.dot_path_str if imp.from_loc is not None else '';
+        already = False;
+        for e in reporter.prog.errors_had {
+            if (
+                e.code is E5084
+                and e.loc.mod_path == item.loc.mod_path
+                and e.loc.first_line == item.loc.first_line
+                and e.loc.col_start == item.loc.col_start
+            ) {
+                already = True;
+                break;
+            }
+        }
+        if not already {
+            reporter.emit(
+                E5084,
+                node_override=item,
+                name=item.name.sym_name
+                    if isinstance(item.name, uni.Name)
+                    else str(item.name.value),
+                module=module_name
+            );
+        }
+    }
+}
+
+def report_placement_warnings(reporter: any, mod: uni.Module) {
+    import from jaclang.jac0core.placement { get_module_summary }
+    import from jaclang.jac0core.constant { CodeContext }
+    ps = get_module_summary(mod, reporter.prog);
+    written_glob_idxs: set[int] = set();
+    for es in ps.elements {
+        for widx in es.glob_writes {
+            written_glob_idxs.add(widx);
+        }
+    }
+    for (idx, stmt) in enumerate(mod.body) {
+        if not isinstance(stmt, uni.ContextAwareNode) {
+            continue;
+        }
+        if (
+            isinstance(stmt, uni.GlobalVars)
+            and stmt.codespace_dual
+            and idx in written_glob_idxs
+        ) {
+            es = ps.elements[idx] if idx < len(ps.elements) else None;
+            gname = es.name if es is not None else 'glob';
+            if not _already_warned(reporter, W6006, stmt) {
+                reporter.emit(W6006, node_override=stmt, name=gname);
+            }
+        }
+        if stmt.code_context == CodeContext.CLIENT and not stmt.codespace_dual {
+            _report_client_bare_import_uses(reporter, mod, stmt);
+        }
+        is_clientish = stmt.code_context == CodeContext.CLIENT or stmt.codespace_dual;
+        if not is_clientish or idx >= len(ps.elements) {
+            continue;
+        }
+        for esc in ps.elements[idx].escapes {
+            tidx = esc[0];
+            if tidx >= len(mod.body) {
+                continue;
+            }
+            target = mod.body[tidx];
+            if (
+                isinstance(target, uni.ContextAwareNode)
+                and isinstance(target, uni.Ability)
+                and target.code_context == CodeContext.SERVER
+                and not target.codespace_dual
+            ) {
+                tes = ps.elements[tidx] if tidx < len(ps.elements) else None;
+                tname = tes.name if tes is not None else 'function';
+                if not _already_warned(reporter, W6007, stmt) {
+                    reporter.emit(W6007, node_override=stmt, name=tname);
+                }
+            }
+        }
+    }
 }

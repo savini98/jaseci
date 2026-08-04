@@ -1,11 +1,8 @@
-"""Implementation for NativeStructView and NativeListView."""
-
 import ctypes;
 
 impl NativeStructView.postinit -> None {
-    # from_address: NO copy -- creates view over C memory
     self._native = self.ct_cls.from_address(self.addr);
-    # Build field metadata lookup (name -> NativeFieldInfo)
+
     if (self.layout and hasattr(self.layout, "structs")) {
         sl = self.layout.structs.get(self.struct_name);
         if sl {
@@ -26,13 +23,52 @@ impl NativeStructView.__getattr__(name: str) -> any {
     return self._resolve(name, raw);
 }
 
+impl NativeStructView.__setattr__(name: str, value: any) -> None {
+    if name in type(self).__dataclass_fields__ {
+        object.__setattr__(self, name, value);
+        return;
+    }
+    finfo = self._field_meta.get(name);
+    if finfo is None {
+        raise AttributeError(f"'{self.struct_name}' has no field '{name}'");
+    }
+    lt = finfo.llvm_type;
+    if (
+        not finfo.is_func_ptr and lt in ("i64", "i32", "i16", "i8", "i1", "f64", "f32")
+    ) {
+        out_val = value;
+        if (finfo.enum_type and not isinstance(value, (int, float))) {
+            emap = self.enum_maps.get(finfo.enum_type) or [];
+            if value in emap {
+                out_val = emap.index(value);
+            }
+        }
+        setattr(self._native, name, out_val);
+        return;
+    }
+    raise TypeError(
+        f"cannot write field '{name}' of type '{lt}' through NativeStructView"
+    );
+}
+
+impl NativeStructView.__eq__(other: any) -> any {
+    if isinstance(other, NativeStructView) {
+        return (self.addr == other.addr and self.struct_name == other.struct_name);
+    }
+    return NotImplemented;
+}
+
+impl NativeStructView.__hash__ -> int {
+    return hash(("s", self.addr, self.struct_name));
+}
+
 impl NativeStructView._resolve(name: str, raw: any) -> any {
     finfo = self._field_meta.get(name);
     if finfo is None {
         return raw;
     }
     lt = finfo.llvm_type;
-    # Function pointer: wrap raw address as callable ctypes function
+
     if finfo.is_func_ptr {
         if (raw is None or raw == 0) {
             return None;
@@ -40,14 +76,14 @@ impl NativeStructView._resolve(name: str, raw: any) -> any {
         fn_type = _build_cfunctype(finfo);
         return fn_type(raw);
     }
-    # String: decode from raw pointer on demand
+
     if lt == "i8*" {
         if (raw is None or raw == 0) {
             return "";
         }
         return ctypes.string_at(raw).decode("utf-8", errors="replace");
     }
-    # Enum field: ordinal -> enum value
+
     if (lt in ("i64", "i32") and finfo.enum_type) {
         val = int(raw);
         emap = self.enum_maps.get(finfo.enum_type);
@@ -56,25 +92,50 @@ impl NativeStructView._resolve(name: str, raw: any) -> any {
         }
         return val;
     }
-    # Nested struct pointer
+
+    if (lt.startswith("Dict.") and lt.endswith("*")) {
+        if (raw and raw != 0) {
+            return _marshal_dict(int(raw), lt[5:-1]);
+        }
+        return {};
+    }
+
+    if (lt.startswith("Set.") and lt.endswith("*")) {
+        if (raw and raw != 0) {
+            return _marshal_set(int(raw), lt[4:-1]);
+        }
+        return set();
+    }
+
     if (lt.endswith("*") and not lt.startswith("List.") and lt != "i8*") {
         sname = lt[:-1];
         if (raw and raw != 0) {
             ct_cls = self.ctypes_classes.get(sname);
             if ct_cls {
-                return NativeStructView(
-                    raw, ct_cls, sname, self.layout, self.ctypes_classes, self.enum_maps
+                return get_struct_view(
+                    raw,
+                    ct_cls,
+                    sname,
+                    self.layout,
+                    self.ctypes_classes,
+                    self.enum_maps,
+                    view_memo=self._view_memo
                 );
             }
         }
         return None;
     }
-    # List pointer
+
     if (lt.startswith("List.") and lt.endswith("*")) {
         if (raw and raw != 0) {
             elem_key = lt[5:-1];
-            return NativeListView(
-                raw, elem_key, self.ctypes_classes, self.enum_maps, self.layout
+            return get_list_view(
+                raw,
+                elem_key,
+                self.ctypes_classes,
+                self.enum_maps,
+                self.layout,
+                view_memo=self._view_memo
             );
         }
         return NativeListView.empty();
@@ -113,20 +174,17 @@ impl NativeListView.postinit -> None {
     nl = NativeList.from_address(self.list_ptr);
     self._count = nl.len if (nl.len > 0 and nl.data) else 0;
 
-    # Resolve struct class for ptr elements
     self._struct_name = self.struct_hint;
     if (self.elem_key == "ptr" and self._struct_name) {
         self._ct_cls = self.ctypes_classes.get(self._struct_name);
     }
 
-    # Create array view over data -- zero-copy via from_address
     if self._count > 0 {
         if self.elem_key == "i64" {
             self._arr = (ctypes.c_int64 * self._count).from_address(nl.data);
         } elif self.elem_key == "f64" {
             self._arr = (ctypes.c_double * self._count).from_address(nl.data);
         } else {
-            # 'ptr' and others
             self._arr = (ctypes.c_void_p * self._count).from_address(nl.data);
         }
     }
@@ -153,16 +211,24 @@ impl NativeListView.__getitem__(index: any) -> any {
     if self.elem_key == "f64" {
         return float(raw);
     }
-    # Struct pointer element
+
     if (self._ct_cls and raw and raw != 0) {
-        return NativeStructView(
+        return get_struct_view(
             raw,
             self._ct_cls,
             self._struct_name,
             self.layout,
             self.ctypes_classes,
-            self.enum_maps
+            self.enum_maps,
+            view_memo=self._view_memo
         );
+    }
+
+    if (self.elem_hint == "str" and self.elem_key == "ptr") {
+        if (raw is None or raw == 0) {
+            return "";
+        }
+        return ctypes.string_at(raw).decode("utf-8", errors="replace");
     }
     return raw;
 }

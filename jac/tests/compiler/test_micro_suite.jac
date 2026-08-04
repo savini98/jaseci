@@ -14,14 +14,13 @@ import ast as ast3;
 import os;
 import from difflib { unified_diff }
 import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import jaclang.jac0core.unitree as uni;
 import from jaclang.jac0core.helpers { add_line_numbers }
 import from jaclang.jac0core.program { JacProgram }
 import from jaclang.runtimelib.test { parametrize }
 import from tests.fixtures_list { MICRO_JAC_FILES }
-
-glob JAC_ROOT = str(Path(jaclang.__file__).parent.parent);
 
 def parent_scrub(`node: uni.UniNode) -> bool {
     for i in `node.kid {
@@ -107,7 +106,7 @@ def micro_suite_combined_test(rel_path: str) -> None {
             before_fmt = ast3.dump(code_gen.gen.py_ast[0], indent=2);
             after_fmt = ast3.dump(code_gen_fmt.gen.py_ast[0], indent=2);
             assert isinstance(code_gen, uni.Module)
-            and isinstance(code_gen_fmt, uni.Module) , "Parsed objects are not modules.";
+                and isinstance(code_gen_fmt, uni.Module) , "Parsed objects are not modules.";
             diff = "\n".join(
                 unified_diff(before_fmt.splitlines(), after_fmt.splitlines())
             );
@@ -135,6 +134,6 @@ with entry {
         "micro suite",
         MICRO_JAC_FILES,
         micro_suite_combined_test,
-        id_fn=lambda f : Path(f).stem
+        id_fn=lambda (f) { Path(f).stem; }
     );
 }

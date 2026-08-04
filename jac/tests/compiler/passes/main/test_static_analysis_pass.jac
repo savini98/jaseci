@@ -1,19 +1,13 @@
 """Static analysis pass tests."""
 
 import os;
-import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import jaclang.jac0core.unitree as uni;
 import from jaclang.jac0core.program { JacProgram }
 
 glob FIXTURES = os.path.join(
-         str(Path(jaclang.__file__).parent.parent),
-         "tests",
-         "compiler",
-         "passes",
-         "main",
-         "fixtures",
-         "static_analysis"
+         JAC_ROOT, "tests", "compiler", "passes", "main", "fixtures", "static_analysis"
      );
 
 test "unused variable produces warning" {
@@ -161,6 +155,36 @@ test "ambient typing names resolve without import" {
     for tname in typing_names {
         assert tname in py_code , f"Expected {tname} in injected typing import";
     }
+}
+
+test "ambient typing names resolve in .impl.jac annex files" {
+    # Ambient typing names (Callable, Sequence, ...) are injected into the
+    # module's parent (builtins) scope by the TypeEvaluator, so _check_undefined_names
+    # suppresses W2001 for them via the parent-scope check. This fixture pair
+    # exercises that path across both the decl signature and the .impl.jac body,
+    # and also confirms the guard does not over-suppress: a genuinely undefined
+    # name referenced in the same .impl.jac annex still produces W2001.
+    file_path = os.path.join(FIXTURES, "ambient_typing_impl.jac");
+    prog = JacProgram();
+    prog.compile(file_path, type_check=True);
+    warning_msgs = [str(w) for w in prog.warnings_had];
+    error_msgs = [str(e) for e in prog.errors_had];
+    for tname in ["Callable", "Sequence"] {
+        undef = [
+            w
+            for w in warning_msgs
+            if f"'{tname}' may be undefined" in w
+        ];
+        assert len(undef) == 0 , f"{tname} should be ambient in .impl.jac: got {undef}";
+    }
+    # Negative control: genuinely undefined names in .impl.jac still warn.
+    bad = [
+        w
+        for w in warning_msgs
+        if "'totally_undefined_thing' may be undefined" in w
+    ];
+    assert len(bad) > 0 , "genuinely undefined name in .impl.jac should still warn (W2001)";
+    assert len(error_msgs) == 0 , f"Expected no errors, got: {error_msgs}";
 }
 
 test "redundant typing imports warn on the import line" {

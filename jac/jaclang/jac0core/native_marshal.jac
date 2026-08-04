@@ -1,16 +1,3 @@
-"""Zero-copy ctypes marshalling for native (.na.jac) interop.
-
-Given a NativeModuleLayout (exported by NaIRGenPass), this module:
-1. Builds ctypes Structure classes matching LLVM struct layouts
-2. Provides NativeStructView/NativeListView for zero-copy field access
-3. Wraps native functions with automatic Python<->native marshalling
-4. Installs native-backed replacements on Python modules
-
-Structs are accessed via from_address() -- Python reads directly from
-native memory with no upfront copying. String fields are decoded on
-demand (one copy when accessed, not when struct is created).
-"""
-
 import ctypes;
 import logging;
 import from dataclasses { field }
@@ -28,7 +15,6 @@ glob logger = logging.getLogger(__name__),
          "void": None
      };
 
-"""Build a ctypes CFUNCTYPE from NativeFieldInfo function pointer metadata."""
 def _build_cfunctype(finfo: any) -> type {
     ret_ct = LLVM_TO_CTYPES.get(finfo.func_ret_type);
     if ret_ct is None {
@@ -43,7 +29,6 @@ def _build_cfunctype(finfo: any) -> type {
 }
 
 
-"""Matches LLVM List.{elem} struct: {i64 len, i64 cap, elem* data}."""
 class NativeList(ctypes.Structure) {
     has _fields_: list[tuple[str, type]] = [
         ("len", ctypes.c_int64),
@@ -53,13 +38,19 @@ class NativeList(ctypes.Structure) {
 }
 
 
-# -- Zero-copy view classes --
-"""Zero-copy view over a native struct in C memory.
+class NativeDict(ctypes.Structure) {
+    has _fields_: list[tuple[str, type]] = [
+        ("len", ctypes.c_int64),
+        ("cap", ctypes.c_int64),
+        ("keys", ctypes.c_void_p),
+        ("vals", ctypes.c_void_p),
+        ("ctrl", ctypes.c_void_p),
+        ("used", ctypes.c_int64),
+        ("order", ctypes.c_void_p)
+    ];
+}
 
-Field access reads directly from native memory via ctypes descriptors.
-String fields are decoded on demand (single copy when accessed).
-Supports both attribute (.field) and dict-style (["field"]) access.
-"""
+
 obj NativeStructView {
     has addr: int,
         ct_cls: any = None,
@@ -68,24 +59,23 @@ obj NativeStructView {
         ctypes_classes: dict = field(default_factory=`dict),
         enum_maps: dict = field(default_factory=`dict),
         _native: any = field(default=None, repr=False),
-        _field_meta: dict = field(default_factory=`dict, repr=False);
+        _field_meta: dict = field(default_factory=`dict, repr=False),
+        _view_memo: dict = field(default_factory=`dict, repr=False);
 
     def postinit -> None;
     def __getattr__(name: str) -> any;
+    def __setattr__(name: str, value: any) -> None;
     def _resolve(name: str, raw: any) -> any;
     def __getitem__(key: str) -> any;
     def __contains__(key: str) -> bool;
+    def __eq__(other: any) -> any;
+    def __hash__ -> int;
     def keys -> any;
     def items -> any;
     def __repr__ -> str;
 }
 
 
-"""Zero-copy view over a native list in C memory.
-
-Elements are accessed lazily -- no upfront iteration or copying.
-Supports len(), indexing, slicing, iteration, and equality with lists.
-"""
 obj NativeListView {
     has list_ptr: int = 0,
         elem_key: str = "",
@@ -93,10 +83,12 @@ obj NativeListView {
         enum_maps: dict = field(default_factory=`dict),
         layout: any = None,
         struct_hint: (str | None) = None,
+        elem_hint: (str | None) = None,
         _count: int = field(default=0, repr=False),
         _arr: any = field(default=None, repr=False),
         _ct_cls: any = field(default=None, repr=False),
-        _struct_name: (str | None) = field(default=None, repr=False);
+        _struct_name: (str | None) = field(default=None, repr=False),
+        _view_memo: dict = field(default_factory=`dict, repr=False);
 
     def postinit -> None;
     @classmethod
@@ -112,24 +104,186 @@ obj NativeListView {
 }
 
 
-# -- ctypes class generation --
-"""Build ctypes Structure classes from NativeModuleLayout.structs.
+def get_struct_view(
+    addr: int,
+    ct_cls: any,
+    struct_name: str,
+    layout: any,
+    ctypes_classes: dict,
+    enum_maps: dict,
+    view_memo: (dict | None) = None
+) -> NativeStructView {
+    if view_memo is None {
+        view_memo = {};
+    }
+    memo_key = ("s", addr, struct_name);
+    cached = view_memo.get(memo_key);
+    if cached is not None {
+        return cached;
+    }
+    view = NativeStructView(
+        addr,
+        ct_cls,
+        struct_name,
+        layout,
+        ctypes_classes,
+        enum_maps,
+        _view_memo=view_memo
+    );
+    view_memo[memo_key] = view;
+    return view;
+}
 
-All pointer fields (including strings) use c_void_p to avoid
-auto-copying. NativeStructView handles decoding on demand.
-"""
+
+def get_list_view(
+    list_ptr: int,
+    elem_key: str,
+    ctypes_classes: dict,
+    enum_maps: dict,
+    layout: any = None,
+    struct_hint: (str | None) = None,
+    elem_hint: (str | None) = None,
+    view_memo: (dict | None) = None
+) -> NativeListView {
+    if (list_ptr is None or list_ptr == 0) {
+        return NativeListView.empty();
+    }
+    if view_memo is None {
+        view_memo = {};
+    }
+    memo_key = ("l", list_ptr, elem_key, struct_hint, elem_hint);
+    cached = view_memo.get(memo_key);
+    if cached is not None {
+        return cached;
+    }
+    view = NativeListView(
+        list_ptr,
+        elem_key,
+        ctypes_classes,
+        enum_maps,
+        layout,
+        struct_hint=struct_hint,
+        elem_hint=elem_hint,
+        _view_memo=view_memo
+    );
+    view_memo[memo_key] = view;
+    return view;
+}
+
+
+def _decode_scalar_array(
+    addr: any, count: int, type_name: str, as_str: bool = False
+) -> list {
+    if (count <= 0 or not addr) {
+        return [];
+    }
+    if type_name == "i64" {
+        return [int(x) for x in (ctypes.c_int64 * count).from_address(addr)];
+    }
+    if type_name == "f64" {
+        return [float(x) for x in (ctypes.c_double * count).from_address(addr)];
+    }
+    ptrs = (ctypes.c_void_p * count).from_address(addr);
+    if (type_name == "bytes" or as_str) {
+        return [
+            ctypes.string_at(p).decode("utf-8", errors="replace") if p else ""
+            for p in ptrs
+        ];
+    }
+    return [int(p) if p is not None else 0 for p in ptrs];
+}
+
+
+def _decode_scalar_at(
+    addr: any, slots: list, type_name: str, as_str: bool = False
+) -> list {
+    if (not slots or not addr) {
+        return [];
+    }
+    if type_name == "i64" {
+        arr = (ctypes.c_int64 * (max(slots) + 1)).from_address(addr);
+        return [int(arr[s]) for s in slots];
+    }
+    if type_name == "f64" {
+        arr = (ctypes.c_double * (max(slots) + 1)).from_address(addr);
+        return [float(arr[s]) for s in slots];
+    }
+    ptrs = (ctypes.c_void_p * (max(slots) + 1)).from_address(addr);
+    if (type_name == "bytes" or as_str) {
+        out = [];
+        for s in slots {
+            p = ptrs[s];
+            out.append(
+                ctypes.string_at(p).decode("utf-8", errors="replace") if p else ""
+            );
+        }
+        return out;
+    }
+    return [int(ptrs[s]) if ptrs[s] is not None else 0 for s in slots];
+}
+
+
+def _marshal_dict(dict_ptr: int, spec: str, func_layout: any = None) -> any {
+    parts = spec.split(".", 1);
+    if len(parts) != 2 {
+        return dict_ptr;
+    }
+    (key_name, val_name) = (parts[0], parts[1]);
+    if (
+        key_name not in ("i64", "f64", "bytes", "ptr")
+        or val_name not in ("i64", "f64", "ptr")
+    ) {
+        return dict_ptr;
+    }
+    nd = NativeDict.from_address(dict_ptr);
+    count = int(nd.len) if nd.len > 0 else 0;
+    cap = int(nd.cap) if nd.cap > 0 else 0;
+    if (count <= 0 or cap <= 0 or not nd.order) {
+        return {};
+    }
+    ret_keys = func_layout?.ret_elem_keys if func_layout is not None else None;
+    key_as_str = bool(
+        key_name == "ptr" and ret_keys and len(ret_keys) == 2 and ret_keys[0] == "str"
+    );
+    val_as_str = bool(
+        val_name == "ptr" and ret_keys and len(ret_keys) == 2 and ret_keys[1] == "str"
+    );
+    order = (ctypes.c_int64 * count).from_address(nd.order);
+    slots = [
+        int(s)
+        for s in order
+        if 0 <= int(s) and int(s) < cap
+    ];
+    dkeys = _decode_scalar_at(nd.keys, slots, key_name, as_str=key_as_str);
+    dvals = _decode_scalar_at(nd.vals, slots, val_name, as_str=val_as_str);
+    return dict(zip(dkeys, dvals));
+}
+
+
+def _marshal_set(set_ptr: int, elem_name: str, func_layout: any = None) -> any {
+    if elem_name not in ("i64", "f64", "bytes", "ptr") {
+        return set_ptr;
+    }
+    nl = NativeList.from_address(set_ptr);
+    count = int(nl.len) if (nl.len > 0 and nl.data) else 0;
+    ret_keys = func_layout?.ret_elem_keys if func_layout is not None else None;
+    as_str = bool(
+        elem_name == "ptr" and ret_keys and len(ret_keys) == 1 and ret_keys[0] == "str"
+    );
+    return set(_decode_scalar_array(nl.data, count, elem_name, as_str=as_str));
+}
+
+
 def build_ctypes_classes(layout: any) -> dict {
     classes: dict = {};
     for (name, struct_layout) in layout.structs.items() {
         fields: list = [];
         for f in struct_layout.fields {
             if f.is_func_ptr {
-                # Function pointer fields stored as c_void_p; resolved on access
                 ct = ctypes.c_void_p;
             } else {
                 ct = LLVM_TO_CTYPES.get(f.llvm_type);
                 if (ct is None or f.llvm_type == "i8*") {
-                    # All pointers as c_void_p -- no auto-copy for strings
                     ct = ctypes.c_void_p;
                 }
             }
@@ -142,11 +296,6 @@ def build_ctypes_classes(layout: any) -> dict {
 }
 
 
-"""Build ordinal->Python enum value maps from NativeModuleLayout.enums.
-
-For each enum, looks up the Python enum class in module_ns and creates
-a list indexed by ordinal.
-"""
 def build_enum_maps(layout: any, module_ns: dict) -> dict {
     maps: dict = {};
     for (enum_name, enum_layout) in layout.enums.items() {
@@ -154,7 +303,7 @@ def build_enum_maps(layout: any, module_ns: dict) -> dict {
         if py_enum_cls is None {
             continue;
         }
-        # Build ordinal->member map
+
         max_ord = max((m[2] for m in enum_layout.members), default=-1);
         ordinal_map: list = [None] * (max_ord + 1);
         for (member_name, _value, ordinal) in enum_layout.members {
@@ -169,12 +318,6 @@ def build_enum_maps(layout: any, module_ns: dict) -> dict {
 }
 
 
-# -- Value marshalling --
-"""Convert a native value to a Python object based on its LLVM type.
-
-Returns zero-copy NativeStructView/NativeListView for composite types.
-Scalars (int, float, bool, str) are returned as Python primitives.
-"""
 def marshal_value(
     raw: any,
     llvm_type: str,
@@ -183,9 +326,9 @@ def marshal_value(
     py_classes: dict,
     field_info: any = None,
     func_layout: any = None,
-    layout: any = None
+    layout: any = None,
+    view_memo: (dict | None) = None
 ) -> any {
-    # Function pointer fields
     if (field_info and field_info.is_func_ptr) {
         if (raw is None or raw == 0) {
             return None;
@@ -193,18 +336,17 @@ def marshal_value(
         fn_type = _build_cfunctype(field_info);
         return fn_type(raw);
     }
-    # Simple scalars
+
     if llvm_type in ("i64", "i32", "i16", "i8") {
         val = int(raw);
-        # Enum-typed struct field: map ordinal -> Python enum member.
+
         if (field_info and field_info.enum_type) {
             emap = enum_maps.get(field_info.enum_type);
             if (emap and 0 <= val < len(emap) and emap[val] is not None) {
                 return emap[val];
             }
         }
-        # Enum-typed function return: map ordinal -> enum member; an
-        # out-of-range value is the -1 None sentinel for a `T | None` return.
+
         _ret_enum = func_layout?.ret_enum_type if func_layout else None;
         if _ret_enum {
             emap = enum_maps.get(_ret_enum);
@@ -228,14 +370,13 @@ def marshal_value(
         if isinstance(raw, bytes) {
             return raw.decode("utf-8", errors="replace");
         }
-        # c_void_p returns int (pointer address)
+
         if isinstance(raw, int) {
             return ctypes.string_at(raw).decode("utf-8", errors="replace");
         }
         return str(raw);
     }
 
-    # Tuple pointer: "Tuple*"
     if llvm_type == "Tuple*" {
         if (raw is None or raw == 0) {
             return None;
@@ -247,57 +388,90 @@ def marshal_value(
                 ctypes_classes,
                 enum_maps,
                 py_classes,
-                layout
+                layout,
+                view_memo=view_memo
             );
         }
-        return raw;  # fallback if no layout info
+        return raw;
     }
 
-    # Struct pointer: "StructName*" -- zero-copy NativeStructView
+    if (llvm_type.startswith("Dict.") and llvm_type.endswith("*")) {
+        if (raw is None or raw == 0) {
+            return {};
+        }
+        return _marshal_dict(raw, llvm_type[5:-1], func_layout);
+    }
+
+    if (llvm_type.startswith("Set.") and llvm_type.endswith("*")) {
+        if (raw is None or raw == 0) {
+            return set();
+        }
+        return _marshal_set(raw, llvm_type[4:-1], func_layout);
+    }
+
     if (llvm_type.endswith("*") and not llvm_type.startswith("List.")) {
         struct_name = llvm_type[:-1];
         if struct_name == "ptr" {
-            return raw;  # Can't auto-marshal opaque pointers
+            return raw;
         }
         ct_cls = ctypes_classes.get(struct_name);
         if (ct_cls is None or raw is None or raw == 0) {
             return raw;
         }
-        return NativeStructView(
-            raw, ct_cls, struct_name, layout, ctypes_classes, enum_maps
+        return get_struct_view(
+            raw,
+            ct_cls,
+            struct_name,
+            layout,
+            ctypes_classes,
+            enum_maps,
+            view_memo=view_memo
         );
     }
 
-    # List pointer: "List.elem*" -- zero-copy NativeListView
     if (llvm_type.startswith("List.") and llvm_type.endswith("*")) {
-        elem_key = llvm_type[5:-1];  # e.g., "ptr", "i64", "f64"
+        elem_key = llvm_type[5:-1];
         if (raw is None or raw == 0) {
             return NativeListView.empty();
         }
-        return NativeListView(raw, elem_key, ctypes_classes, enum_maps, layout);
+        struct_hint: (str | None) = None;
+        elem_hint: (str | None) = None;
+        ret_keys = func_layout?.ret_elem_keys if func_layout is not None else None;
+        if (elem_key == "ptr" and ret_keys and len(ret_keys) == 1 and ret_keys[0]) {
+            if ret_keys[0] == "str" {
+                elem_hint = "str";
+            } elif ret_keys[0] in ctypes_classes {
+                struct_hint = ret_keys[0];
+            }
+        }
+        return get_list_view(
+            raw,
+            elem_key,
+            ctypes_classes,
+            enum_maps,
+            layout,
+            struct_hint=struct_hint,
+            elem_hint=elem_hint,
+            view_memo=view_memo
+        );
     }
 
     return raw;
 }
 
 
-"""Read a native tuple struct and marshal each element.
-
-Tuple elements that are lists or structs get wrapped as
-NativeListView/NativeStructView via marshal_value dispatch.
-"""
 def _marshal_tuple(
     tuple_ptr: int,
     tuple_layout: any,
     ctypes_classes: dict,
     enum_maps: dict,
     py_classes: dict,
-    layout: any = None
+    layout: any = None,
+    view_memo: (dict | None) = None
 ) -> tuple {
     elem_types = tuple_layout.element_types;
     struct_hints = tuple_layout.element_struct_hints or [];
 
-    # Build a ctypes Structure matching the tuple layout
     fields: list = [];
     for (i, et) in enumerate(elem_types) {
         ct = LLVM_TO_CTYPES.get(et, ctypes.c_void_p);
@@ -312,16 +486,28 @@ def _marshal_tuple(
     for (i, et) in enumerate(elem_types) {
         raw_val = getattr(native, f"e{i}");
         hint = struct_hints[i] if i < len(struct_hints) else None;
-        # For List.ptr* with struct hint, create NativeListView with hint
+
         if (et == "List.ptr*" and hint and raw_val and raw_val != 0) {
             result.append(
-                NativeListView(
-                    raw_val, "ptr", ctypes_classes, enum_maps, layout, struct_hint=hint
+                get_list_view(
+                    raw_val,
+                    "ptr",
+                    ctypes_classes,
+                    enum_maps,
+                    layout,
+                    struct_hint=hint,
+                    view_memo=view_memo
                 )
             );
         } else {
             marshalled = marshal_value(
-                raw_val, et, ctypes_classes, enum_maps, py_classes, layout=layout
+                raw_val,
+                et,
+                ctypes_classes,
+                enum_maps,
+                py_classes,
+                layout=layout,
+                view_memo=view_memo
             );
             result.append(marshalled);
         }
@@ -331,11 +517,6 @@ def _marshal_tuple(
 }
 
 
-# -- Function wrapping --
-"""Create a Python wrapper for a native function with auto-marshalling.
-
-Returns None if the function can't be wrapped (e.g., unsupported types).
-"""
 def wrap_native_function(
     engine: any,
     func_layout: any,
@@ -349,24 +530,22 @@ def wrap_native_function(
         return None;
     }
 
-    # Build ctypes arg types
     c_arg_types: list = [];
     for pt in func_layout.param_types {
         ct = LLVM_TO_CTYPES.get(pt);
         if ct is None {
-            ct = ctypes.c_void_p;  # pointer types
+            ct = ctypes.c_void_p;
         }
         c_arg_types.append(ct);
     }
 
-    # Build ctypes return type
     ret_type = func_layout.ret_type;
     c_ret = LLVM_TO_CTYPES.get(ret_type);
     if c_ret is None {
         if ret_type == "void" {
             c_ret = None;
         } else {
-            c_ret = ctypes.c_void_p;  # pointer return
+            c_ret = ctypes.c_void_p;
         }
     }
 
@@ -374,14 +553,44 @@ def wrap_native_function(
     native_fn = fn_type(addr);
 
     param_types = func_layout.param_types;
-    fl = func_layout;  # capture for closure
+    fl = func_layout;
+
+    str_new_fn: any = None;
+    if any(pt == "i8*" for pt in param_types) {
+        _sn_addr = 0;
+        for _sn_name in ("jac_str_new", "__jac_str_new") {
+            try {
+                _sn_addr = engine.get_function_address(_sn_name);
+            } except Exception {
+                _sn_addr = 0;
+            }
+            if _sn_addr {
+                break;
+            }
+        }
+        if _sn_addr {
+            _sn_type = ctypes.CFUNCTYPE(
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int64
+            );
+            str_new_fn = _sn_type(_sn_addr);
+        }
+    }
 
     def wrapper(*args: any) -> any {
-        # Convert Python args to ctypes
         c_args: list = [];
         for (arg, pt) in zip(args, param_types) {
             if (pt == "i8*" and isinstance(arg, str)) {
-                c_args.append(arg.encode("utf-8"));
+                _b = arg.encode("utf-8");
+                if str_new_fn is not None {
+                    _sp = str_new_fn(_b, len(_b));
+                    c_args.append(ctypes.cast(_sp, ctypes.c_char_p));
+                } else {
+                    c_args.append(_b);
+                }
+            } elif isinstance(arg, NativeStructView) {
+                c_args.append(arg.addr);
+            } elif isinstance(arg, NativeListView) {
+                c_args.append(arg.list_ptr);
             } else {
                 c_args.append(arg);
             }
@@ -394,7 +603,8 @@ def wrap_native_function(
             enum_maps,
             py_classes,
             func_layout=fl,
-            layout=layout
+            layout=layout,
+            view_memo={}
         );
     }
 
@@ -405,27 +615,16 @@ def wrap_native_function(
 }
 
 
-# -- Module-level installation --
-"""Run a freshly-compiled native module's global initializers.
-
-A native function that reads module globals (e.g. the lexer's KEYWORDS dict)
-segfaults if the globals were never initialized. The codegen emits a
-`__jac_glob_init` for the module's own globals and a renamed
-`__jac_glob_init_<safe_name>` for each imported native module; imported
-modules must be initialized before the importer. `manifest` is the compiled
-module's InteropManifest (ir.gen.interop_manifest); its
-`native_transitive_sources` lists the imported native modules in dependency
-order.
-"""
 def init_native_globals(engine: any, manifest: any) {
     import ctypes;
-    import re;
+    import from jaclang.jac0core.codeinfo { native_safe_sym }
     srcs = manifest.native_transitive_sources if manifest is not None else [];
     for src in (srcs or []) {
         if not src {
             continue;
         }
-        safe = re.sub(r'[^a-zA-Z0-9_]', '_', src);
+
+        safe = native_safe_sym(src);
         addr = engine.get_function_address(f"__jac_glob_init_{safe}");
         if addr {
             ctypes.CFUNCTYPE(None)(addr)();
@@ -437,30 +636,15 @@ def init_native_globals(engine: any, manifest: any) {
     }
 }
 
-"""Install native-backed function wrappers on a Python module.
-
-Args:
-    module: The Python module object
-    engine: The native JIT engine
-    layout: NativeModuleLayout with struct/enum/function metadata
-    py_classes: Optional mapping of struct names to Python classes.
-                If None, attempts to find classes in the module namespace.
-
-Returns:
-    Number of functions successfully wrapped.
-"""
 def install_native_wrappers(
     module: any, engine: any, layout: any, py_classes: (dict | None) = None
 ) -> int {
     module_ns = module.__dict__;
 
-    # Build ctypes classes from layout
     ctypes_classes = build_ctypes_classes(layout);
 
-    # Build enum ordinal maps
     enum_maps = build_enum_maps(layout, module_ns);
 
-    # Resolve Python classes for struct marshalling
     if py_classes is None {
         py_classes = {};
         for struct_name in layout.structs {
@@ -472,17 +656,22 @@ def install_native_wrappers(
     }
 
     wrapped_count = 0;
+    mod_name = module?.__name__;
     for (func_name, func_layout) in layout.functions.items() {
-        # Only wrap functions that exist in the module namespace
         if func_name not in module_ns {
+            continue;
+        }
+
+        existing = module_ns[func_name];
+        owner = existing?.__module__;
+        if owner is None or mod_name is None or owner != mod_name {
             continue;
         }
         wrapper = wrap_native_function(
             engine, func_layout, ctypes_classes, enum_maps, py_classes, layout=layout
         );
         if wrapper is not None {
-            # Save original Python version
-            module_ns[f"_py_{func_name}"] = module_ns[func_name];
+            module_ns[f"_py_{func_name}"] = existing;
             module_ns[func_name] = wrapper;
             wrapped_count += 1;
             logger.debug(f"Installed native wrapper for {func_name}");
@@ -491,4 +680,3 @@ def install_native_wrappers(
 
     return wrapped_count;
 }
-# -- LLVM type string -> ctypes type mapping --

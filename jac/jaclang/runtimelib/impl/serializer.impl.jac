@@ -1,11 +1,9 @@
-"""Helper: get type metadata dict."""
 impl Serializer._type_info(`obj: object, `include: bool) -> dict[str, object] {
     return {'__type__': type(`obj).__name__, '__module__': type(`obj).__module__}
         if `include
         else {};
 }
 
-"""Helper: serialize object attributes (non-private, non-callable)."""
 impl Serializer._serialize_attrs(
     `obj: object,
     include_type: bool,
@@ -20,11 +18,8 @@ impl Serializer._serialize_attrs(
         for a in dir(`obj)
         if not a.startswith('_') and not callable(getattr(`obj, a, None))
     };
-    # Storage-mode extras. The hasattr gate keeps the hot path import-free
-    # for the overwhelmingly common case of archetypes with no drift rules.
+
     if include_type and not api_mode {
-        # Dual-write: aliased fields also emit their old stored name so
-        # old-version readers keep working during a rolling deploy.
         if hasattr(type(`obj), '__jac_schema__') {
             import from jaclang.runtimelib.schema_rules {
                 merged_rules_for,
@@ -38,9 +33,7 @@ impl Serializer._serialize_attrs(
                 }
             }
         }
-        # Attic round-trip: preserved drift values picked up at deserialize
-        # time must survive a full re-save. Literal key (rather than
-        # schema_rules.ATTIC_KEY) avoids an import on rule-free archetypes.
+
         attic = `obj?.__jac_attic__;
         if isinstance(attic, dict) and attic {
             result['__jac_attic__'] = Serializer._serialize_value(
@@ -51,7 +44,6 @@ impl Serializer._serialize_attrs(
     return result;
 }
 
-"""Serialize any object to JSON-compatible format."""
 impl Serializer.serialize(
     `obj: object,
     include_type: bool = False,
@@ -62,7 +54,6 @@ impl Serializer.serialize(
     return Serializer._serialize_value(`obj, include_type, api_mode, ref_mode, _seen);
 }
 
-"""Serialize a value recursively."""
 impl Serializer._serialize_value(
     val: object,
     include_type: bool,
@@ -70,7 +61,6 @@ impl Serializer._serialize_value(
     ref_mode: bool = False,
     _seen: (tuple[set, set] | None) = None
 ) -> object {
-    # Primitives & UUID & Enum
     if val is None or isinstance(val, (str, int, float, bool)) {
         return val;
     }
@@ -80,7 +70,7 @@ impl Serializer._serialize_value(
     if isinstance(val, Enum) {
         return val.value;
     }
-    # Collections
+
     if isinstance(val, (list, tuple)) {
         return [
             Serializer._serialize_value(v, include_type, api_mode, ref_mode, _seen)
@@ -94,7 +84,7 @@ impl Serializer._serialize_value(
             ) for (k, v) in val.items()
         };
     }
-    # Access types
+
     if isinstance(val, Access) {
         return {'anchors': {str(k): v.value for (k, v) in val.anchors.items()}};
     }
@@ -106,7 +96,7 @@ impl Serializer._serialize_value(
             )
         };
     }
-    # Anchor (NodeAnchor, EdgeAnchor)
+
     if isinstance(val, Anchor) {
         result = Serializer._type_info(val, include_type);
         result |= {
@@ -119,22 +109,15 @@ impl Serializer._serialize_value(
         };
         if val.is_populated() {
             arch = val.archetype;
-            result['archetype'] = Serializer._type_info(arch, include_type) | Serializer._serialize_attrs(
-                arch, include_type, api_mode, ref_mode, _seen
-            );
+            result['archetype'] = Serializer._type_info(arch, include_type)
+                | Serializer._serialize_attrs(
+                    arch, include_type, api_mode, ref_mode, _seen
+                );
         }
         if isinstance(val, NodeAnchor) {
             result['edges'] = [str(e.id) for e in val.edges];
-            # Topology index lives only on root anchors
-            if val.topology_index_data is not None
-            and isinstance(val.archetype, Root) {
-                import from base64 { b64encode }
-                result['topology_index_data'] = b64encode(
-                    val.topology_index_data
-                ).decode(
-                    'ascii'
-                );
-            }
+
+            result['version'] = val.version;
         }
         if isinstance(val, EdgeAnchor) {
             result |= {
@@ -145,7 +128,7 @@ impl Serializer._serialize_value(
         }
         return result;
     }
-    # Archetype (standalone)
+
     if isinstance(val, Archetype) {
         if _seen is not None {
             jac_anchor = val?.__jac__;
@@ -165,8 +148,7 @@ impl Serializer._serialize_value(
                     return {'$ref': jac_id.hex, '$type': ref_type};
                 }
                 jac_uuids.add(jac_id);
-                # Register in memory so _deserialize_jac_ref can resolve
-                # $ref placeholders back to the live archetype.
+
                 try {
                     import from jaclang { JacRuntimeInterface as Jac }
                     Jac.get_context().mem.put(jac_anchor);
@@ -187,13 +169,11 @@ impl Serializer._serialize_value(
                     else 'walker' if isinstance(val, WalkerArchetype) else 'archetype'
             };
         }
-        return result | Serializer._serialize_attrs(
-            val, include_type, api_mode, ref_mode, _seen
-        );
+        return result
+            | Serializer._serialize_attrs(val, include_type, api_mode, ref_mode, _seen);
     }
-    # Generic object with __dict__
+
     if val?.__dict__ {
-        # Cycle guard for non-Jac objects (tracked by identity, not UUID).
         if _seen is not None {
             (_, obj_ids) = _seen;
             obj_identity = id(val);
@@ -222,7 +202,6 @@ impl Serializer._serialize_value(
     return str(val);
 }
 
-"""Deserialize a $ref placeholder back to the live archetype, typed stub, or None."""
 impl Serializer._deserialize_jac_ref(data: dict[str, object]) -> (object | None) {
     id_str = data.get('$ref');
     if not isinstance(id_str, str) {
@@ -262,7 +241,6 @@ impl Serializer._deserialize_jac_ref(data: dict[str, object]) -> (object | None)
     return Serializer._id_to_stub(stub_cls, id_str);
 }
 
-"""Deserialize data back to original object type."""
 impl Serializer.deserialize(data: dict[str, object]) -> (object | None) {
     if not isinstance(data, dict) {
         return data;
@@ -281,24 +259,35 @@ impl Serializer.deserialize(data: dict[str, object]) -> (object | None) {
     if (handler := dispatch.get(type_name)) {
         return handler(data);
     }
-    # Reconstruct from registry
+
     if (cls := Serializer._get_class(data.get('__module__'), type_name)) {
         try {
             instance = cls.__new__(cls);
+            field_types = get_field_types(cls);
             for (k, v) in data.items() {
                 if not k.startswith('__') {
-                    setattr(instance, k, Serializer._deserialize_value(v));
+                    deser_v = Serializer._deserialize_value(v);
+                    if (target := field_types.get(k)) is not None {
+                        (coerced, ok) = Serializer.coerce(deser_v, target);
+                        if ok {
+                            deser_v = coerced;
+                        }
+                    }
+                    setattr(instance, k, deser_v);
                 }
             }
             return instance;
         } except Exception as e {
-            logger.error(f"Failed to deserialize {type_name}: {e}");
+            if Serializer._should_warn_once(
+                "deserialize-failed", f"{cls.__module__}.{type_name}:{type(e).__name__}"
+            ) {
+                logger.error(f"Failed to deserialize {type_name}: {e}");
+            }
         }
     }
     return None;
 }
 
-"""Deserialize a value recursively."""
 impl Serializer._deserialize_value(val: object) -> object {
     if val is None or isinstance(val, (str, int, float, bool)) {
         return val;
@@ -317,20 +306,22 @@ impl Serializer._deserialize_value(val: object) -> object {
     return val;
 }
 
-"""Register a class for safe deserialization and attach its fingerprint."""
 impl Serializer.register(cls: type) -> None {
     Serializer._registry[f"{cls.__module__}.{cls.__name__}"] = cls;
-    import from jaclang.runtimelib.typecache { invalidate as _invalidate_typecache }
+    import from jaclang.runtimelib.typecache {
+        invalidate as _invalidate_typecache,
+        warm as _warm_typecache
+    }
     _invalidate_typecache(cls);
+
+    _warm_typecache(cls);
     try {
         cls.__jac_fingerprint__ = Serializer.fingerprint(cls);
     } except Exception as e {
         logger.debug(f"Failed to compute fingerprint for {cls.__name__}: {e}");
         cls.__jac_fingerprint__ = '';
     }
-    # Collect declared drift rules from the class's own __jac_schema__ hook.
-    # Validation errors propagate: a contradictory rule set must fail at
-    # registration (app startup), never silently mid-traffic.
+
     import from jaclang.runtimelib.schema_rules { collect_rules }
     if (rules := collect_rules(cls)) {
         for old_name in rules.was_names {
@@ -339,18 +330,15 @@ impl Serializer.register(cls: type) -> None {
     }
 }
 
-"""Register an alias mapping `old_name` -> current registry key for `cls`."""
 impl Serializer.register_alias(old_name: str, cls: type) -> None {
     new_name = f"{cls.__module__}.{cls.__name__}";
     if old_name == new_name {
-        # No-op alias; likely a copy/paste error. Warn but don't fail.
         logger.debug(f"archetype_alias: {old_name} == current name; alias is a no-op");
         return;
     }
     Serializer._aliases[old_name] = new_name;
 }
 
-"""Apply declared drift rules to a raw stored archetype dict."""
 impl Serializer.repair(data: dict[str, object], cls: type) -> tuple {
     import from jaclang.runtimelib.schema_rules {
         apply_rules,
@@ -369,31 +357,28 @@ impl Serializer.repair(data: dict[str, object], cls: type) -> tuple {
     if repaired is data and not steps {
         return (data, []);
     }
+    cls_key = f"{cls.__module__}.{cls.__name__}";
     if mode == 'detect' {
-        if steps {
+        if steps and Serializer._should_warn_once("drift-detected", cls_key) {
             logger.info(
-                f"Serializer: drift detected on {cls.__module__}.{cls.__name__} "
+                f"Serializer: drift detected on {cls_key} "
                 f"(JAC_SCHEMA_REPAIR=detect; steps not applied: {steps})"
             );
         }
         return (data, []);
     }
-    if steps {
-        logger.info(f"Serializer: repaired {cls.__module__}.{cls.__name__}: {steps}");
+    if steps and Serializer._should_warn_once("repaired", cls_key) {
+        logger.info(f"Serializer: repaired {cls_key}: {steps}");
     }
-    # `repaired` may differ from `data` even with no steps (silent strip of
-    # equal dual-written shadows); those changes apply without write-back.
+
     return (repaired, steps);
 }
 
-"""Best-effort coercion table. Returns (value, ok)."""
 impl Serializer.coerce(val: object, target_type: object) -> tuple {
-    # Unresolved or missing annotation: caller falls back to raw.
     if target_type is None or isinstance(target_type, str) {
         return (val, False);
     }
-    # Unwrap Optional[X] / X | None at this layer: None passes through;
-    # a non-None val is coerced against the non-None branch.
+
     (origin, args) = (get_origin(target_type), get_args(target_type));
     if origin is Union or origin is UnionType {
         non_none = [
@@ -404,7 +389,7 @@ impl Serializer.coerce(val: object, target_type: object) -> tuple {
         if val is None {
             return (None, True);
         }
-        # Try each non-None variant; first success wins.
+
         for variant in non_none {
             (coerced, ok) = Serializer.coerce(val, variant);
             if ok {
@@ -413,11 +398,9 @@ impl Serializer.coerce(val: object, target_type: object) -> tuple {
         }
         return (val, False);
     }
-    # Strip parameterized generics to their origin for isinstance checks.
+
     base = origin if origin is not None else target_type;
     if not isinstance(base, type) {
-        # e.g. ParamSpec, TypeVar, Literal: we can't isinstance-check;
-        # leave the value alone and call it "ok" (don't spam coercion warnings).
         return (val, True);
     }
     if val is None {
@@ -426,12 +409,8 @@ impl Serializer.coerce(val: object, target_type: object) -> tuple {
     if isinstance(val, base) {
         return (val, True);
     }
-    # Ordered coercion attempts — the first that raises or returns wrong type
-    # falls through to the next. The outer try/except catches everything so
-    # coercion is never worse than a no-op.
+
     try {
-        # Booleans must be checked before int/float because bool is a subclass
-        # of int and isinstance(True, int) == True would short-circuit above.
         if base is bool {
             if isinstance(val, (int, float)) {
                 return (bool(val), True);
@@ -466,8 +445,7 @@ impl Serializer.coerce(val: object, target_type: object) -> tuple {
         if base is UUID and isinstance(val, str) {
             return (UUID(val), True);
         }
-        # ISO-string coercions to datetime/date/time use getattr dispatch to
-        # sidestep typeshed gaps on `fromisoformat` in some Python versions.
+
         if base is datetime and isinstance(val, str) {
             return (getattr(datetime, 'fromisoformat')(val), True);
         }
@@ -478,7 +456,6 @@ impl Serializer.coerce(val: object, target_type: object) -> tuple {
             return (getattr(time, 'fromisoformat')(val), True);
         }
         if isinstance(base, type) and issubclass(base, Enum) {
-            # Try value-based construction (Enum(val)); if that fails, name lookup.
             try {
                 return (base(val), True);
             } except (ValueError, KeyError) {
@@ -488,8 +465,7 @@ impl Serializer.coerce(val: object, target_type: object) -> tuple {
                 }
             }
         }
-        # Container widening: list <-> tuple, keep contents as-is
-        # (deep container coercion is Layer 4 territory).
+
         if base is tuple and isinstance(val, list) {
             return (tuple(val), True);
         }
@@ -505,35 +481,19 @@ impl Serializer.coerce(val: object, target_type: object) -> tuple {
     return (val, False);
 }
 
-"""Compute an archetype schema fingerprint."""
 impl Serializer.fingerprint(cls: type) -> str {
     field_pairs: list[list[str]] = [];
     if is_dataclass(cls) {
         for f in fields(cls) {
-            # str() on the type annotation handles typing generics, unions,
-            # and forward refs uniformly. It's not perfectly stable across
-            # Python versions, but it's stable within a given version — and
-            # the fingerprint is recomputed at class-load time, so version
-            # drift of type reprs just produces a new fingerprint, which
-            # migration layer will treat as drift (conservative, safe).
             field_pairs.append([f.name, str(f.type)]);
         }
     }
-    field_pairs.sort(key=lambda p: list : p[0]);
+    field_pairs.sort(key=lambda (p: list) { p[0]; });
     payload = {'module': cls.__module__, 'name': cls.__name__, 'fields': field_pairs};
     encoded = _json_dumps(payload, sort_keys=True, default=str).encode('utf-8');
     return sha256(encoded).hexdigest()[:FINGERPRINT_LENGTH];
 }
 
-"""Look up a class by module.name, consulting the alias registry on miss.
-
-Order:
-  1. Direct hit in `_registry`.
-  2. Alias resolution: follow one level (an alias can point only to a
-     registered class; chains are not supported to keep resolution O(1)
-     and prevent cycles).
-  3. Log and return None (caller quarantines).
-"""
 impl Serializer._get_class(module_name: str, class_name: str) -> (type | None) {
     if not module_name or not class_name {
         return None;
@@ -542,27 +502,72 @@ impl Serializer._get_class(module_name: str, class_name: str) -> (type | None) {
     if (cls := Serializer._registry.get(key)) {
         return cls;
     }
-    # Alias miss-path: resolve one level.
+
     if (aliased_key := Serializer._aliases.get(key)) {
         if (cls := Serializer._registry.get(aliased_key)) {
-            logger.info(f"Serializer: resolving aliased class {key} -> {aliased_key}");
+            if Serializer._should_warn_once("alias-resolved", key) {
+                logger.info(
+                    f"Serializer: resolving aliased class {key} -> {aliased_key}"
+                );
+            }
             return cls;
         }
-        # Alias pointed at something that isn't registered either. Log once
-        # with the specific alias context; don't also emit the generic
-        # "unregistered class" warning since that would be misleading (the
-        # original key IS known, via the alias — it's the target that's gone).
-        logger.warning(
-            f"Serializer: alias {key} -> {aliased_key} has no registered "
-            "target; cannot resolve."
-        );
+
+        if Serializer._should_warn_once("alias-missing", key) {
+            logger.warning(
+                f"Serializer: alias {key} -> {aliased_key} has no registered "
+                "target; cannot resolve."
+            );
+        }
         return None;
     }
-    logger.warning(f"Refused to deserialize unregistered class: {key}");
+    if Serializer._should_warn_once("unregistered", key) {
+        logger.warning(f"Refused to deserialize unregistered class: {key}");
+    }
     return None;
 }
 
-"""Helper: Convert string ID to unpopulated anchor stub."""
+impl Serializer._should_warn_once(scope: str, key: str) -> bool {
+    dedup_key = f"{scope}:{key}";
+    seen = Serializer._warned_class_keys;
+    if dedup_key in seen {
+        return False;
+    }
+    if Serializer._warn_dedup_saturated {
+        if logger.isEnabledFor(logging.DEBUG) {
+            logger.debug(
+                f"Serializer: warning suppressed (dedup cap reached): {dedup_key}"
+            );
+        }
+        return False;
+    }
+    with Serializer._warn_lock {
+        if dedup_key in seen {
+            return False;
+        }
+        if len(seen) >= _MAX_WARNED_CLASS_KEYS {
+            if not Serializer._warn_dedup_saturated {
+                Serializer._warn_dedup_saturated = True;
+                logger.warning(
+                    f"Serializer: warning dedup cache reached {_MAX_WARNED_CLASS_KEYS} "
+                    "distinct keys; further first-occurrence warnings are suppressed "
+                    "(enable DEBUG to still see suppressed keys)."
+                );
+            }
+            return False;
+        }
+        seen.add(dedup_key);
+        return True;
+    }
+}
+
+impl Serializer._reset_warn_cache -> None {
+    with Serializer._warn_lock {
+        Serializer._warned_class_keys.clear();
+        Serializer._warn_dedup_saturated = False;
+    }
+}
+
 impl Serializer._id_to_stub(anchor_cls: type, id_str: str) -> (Anchor | None) {
     try {
         stub = anchor_cls.__new__(anchor_cls);
@@ -576,7 +581,6 @@ impl Serializer._id_to_stub(anchor_cls: type, id_str: str) -> (Anchor | None) {
     }
 }
 
-"""Deserialize Anchor (Node/Edge)."""
 impl Serializer._deserialize_anchor(data: dict[str, object]) -> (Anchor | None) {
     anchor_cls = {'NodeAnchor': NodeAnchor, 'EdgeAnchor': EdgeAnchor}.get(
         data.get('__type__', ''), Anchor
@@ -590,31 +594,31 @@ impl Serializer._deserialize_anchor(data: dict[str, object]) -> (Anchor | None) 
 
         if (arch_data := data.get('archetype')) {
             if not isinstance(arch_data, dict) {
-                logger.warning(
-                    "Serializer: archetype field is not a dict "
-                    f"({type(arch_data).__name__}); dropping anchor."
-                );
+                if Serializer._should_warn_once(
+                    "archetype-not-dict",
+                    f"{data.get('__type__', 'anchor')}.{type(arch_data).__name__}"
+                ) {
+                    logger.warning(
+                        "Serializer: archetype field is not a dict "
+                        f"({type(arch_data).__name__}); dropping anchor."
+                    );
+                }
                 return None;
             }
             archetype = Serializer._deserialize_archetype(arch_data, anchor);
             if archetype is None {
-                # Class resolution or reconstruction failed. Don't leave a
-                # half-constructed shell with archetype=None — every caller
-                # (SqliteMemory, MongoBackend, direct test uses) would then
-                # cache an unusable anchor and NPE later on attribute access.
-                # Signal the failure with a single return None and let the
-                # caller quarantine.
-                logger.warning(
-                    "Serializer: archetype reconstruction failed for "
-                    f"{arch_data.get('__module__')}.{arch_data.get('__type__')}; "
-                    "dropping anchor (caller should quarantine)."
-                );
+                arch_key = f"{arch_data.get('__module__')}.{arch_data.get('__type__')}";
+                if Serializer._should_warn_once("archetype-failed", arch_key) {
+                    logger.warning(
+                        "Serializer: archetype reconstruction failed for "
+                        f"{arch_key}; dropping anchor (caller should quarantine)."
+                    );
+                }
                 return None;
             }
             anchor.archetype = archetype;
         }
         if isinstance(anchor, NodeAnchor) {
-            # Restore edges from serialized edge IDs
             edge_ids = data.get('edges');
             if not edge_ids {
                 anchor.edges = [];
@@ -627,24 +631,18 @@ impl Serializer._deserialize_anchor(data: dict[str, object]) -> (Anchor | None) 
                 }
                 anchor.edges = edges;
             }
-            # Snapshot initial edge IDs for merge-based conflict resolution
+
             setattr(
                 anchor,
                 '_initial_edge_ids',
                 frozenset(UUID(eid) for eid in (edge_ids or []))
             );
-            # Topology index lives only on root anchors
-            anchor.topology_index_data = None;
-            if isinstance(anchor.__dict__.get('archetype'), Root) {
-                if (topo_b64 := data.get('topology_index_data')) {
-                    import from base64 { b64decode }
-                    anchor.topology_index_data = b64decode(topo_b64);
-                }
-            }
+
+            anchor.version = data.get('version', 0);
         }
         if isinstance(anchor, EdgeAnchor) {
             anchor.is_undirected = data.get('is_undirected', False);
-            # Restore source and target from serialized IDs
+
             if (source_id := data.get('source')) {
                 anchor.source = Serializer._id_to_stub(NodeAnchor, source_id);
             }
@@ -656,12 +654,21 @@ impl Serializer._deserialize_anchor(data: dict[str, object]) -> (Anchor | None) 
         anchor.hash = Serializer._compute_hash(anchor);
         return anchor;
     } except Exception as e {
-        logger.error(f"Failed to deserialize anchor: {e}");
+        failed_arch = data.get('archetype');
+        arch_id = (
+            f"{failed_arch.get('__module__')}.{failed_arch.get('__type__')}"
+                if isinstance(failed_arch, dict)
+                else data.get('__type__', 'anchor')
+        );
+        if Serializer._should_warn_once(
+            "anchor-failed", f"{arch_id}:{type(e).__name__}"
+        ) {
+            logger.error(f"Failed to deserialize anchor: {e}");
+        }
         return None;
     }
 }
 
-"""Deserialize Permission."""
 impl Serializer._deserialize_permission(data: object) -> Permission {
     if not isinstance(data, dict) {
         return Permission();
@@ -674,7 +681,6 @@ impl Serializer._deserialize_permission(data: object) -> Permission {
     return perm;
 }
 
-"""Deserialize Access."""
 impl Serializer._deserialize_access(data: object) -> Access {
     if not isinstance(data, dict) {
         return Access();
@@ -686,25 +692,6 @@ impl Serializer._deserialize_access(data: object) -> Access {
     return access;
 }
 
-"""Deserialize Archetype with declared-rule repair + Layer 3 coercion.
-
-The raw dict first runs through `Serializer.repair` (renames, upgrade
-callbacks, drop-attic from the class's __jac_schema__ rules). Then, for
-each field in the (possibly repaired) data:
-  - `__*` keys are skipped (metadata). The attic (`__jac_attic__`) is
-    picked up explicitly and round-trips on the instance.
-  - Fields NOT declared on the current class are preserved in the attic
-    (legacy: silently dropped when JAC_SCHEMA_REPAIR is off/detect).
-  - Fields declared on the current class run through `Serializer.coerce`
-    against the resolved annotation. Successful coercions setattr the
-    converted value; unsuccessful ones log at debug and setattr the raw
-    value (never lose data — if a field is un-coercible, downstream code
-    will notice, but the anchor still loads).
-Declared fields absent from the stored data are backfilled: factory
-defaults are instantiated per-instance (plain defaults already resolve
-via the class attribute), so a field added after the document was
-written can't surface as a latent AttributeError.
-"""
 impl Serializer._deserialize_archetype(
     data: dict[str, object], anchor: Anchor
 ) -> (object | None) {
@@ -728,12 +715,7 @@ impl Serializer._deserialize_archetype(
         field_types = get_field_types(cls);
         known = set(field_types.keys());
         attic: dict = {};
-        # Round-trip a previously written attic so a re-save can't destroy
-        # preserved values. Unconditional on purpose: this is preservation,
-        # not repair behavior — JAC_SCHEMA_REPAIR=off is the emergency
-        # rollback path, and a rollback must never erase attic data that an
-        # earlier repair-mode deploy accumulated. Databases that never ran
-        # repair have no attic key, so legacy behavior is unchanged.
+
         stored_attic = data.get(ATTIC_KEY);
         if isinstance(stored_attic, dict) {
             attic.update(stored_attic);
@@ -746,8 +728,6 @@ impl Serializer._deserialize_archetype(
             }
             deser_v = Serializer._deserialize_value(v);
             if k not in known {
-                # Field not on current class: preserve in the attic
-                # (legacy modes keep the historical silent drop).
                 dropped.append(k);
                 if mode == 'repair' {
                     attic[k] = {'value': deser_v, 'reason': 'unknown'};
@@ -757,6 +737,7 @@ impl Serializer._deserialize_archetype(
             target = field_types[k];
             (coerced, ok) = Serializer.coerce(deser_v, target);
             if not ok {
+                field_key = f"{module_name}.{type_name}.{k}";
                 origin = get_origin(target);
                 args = get_args(target);
                 is_optional = (
@@ -778,36 +759,50 @@ impl Serializer._deserialize_archetype(
                         }
                     }
                     if not has_default {
-                        logger.warning(
-                            f"Serializer: {module_name}.{type_name}.{k}: stored None "
-                            f"on non-Optional field {target} and no class default "
-                            "available; cannot recover."
-                        );
+                        if Serializer._should_warn_once(
+                            "stored-none-no-default", field_key
+                        ) {
+                            logger.warning(
+                                f"Serializer: {module_name}.{type_name}.{k}: stored None "
+                                f"on non-Optional field {target} and no class default "
+                                "available; cannot recover."
+                            );
+                        }
                         return None;
                     }
-                    logger.warning(
-                        f"Serializer: {module_name}.{type_name}.{k}: stored None "
-                        f"on non-Optional field {target}; restored class default."
-                    );
+                    if Serializer._should_warn_once(
+                        "stored-none-defaulted", field_key
+                    ) {
+                        logger.warning(
+                            f"Serializer: {module_name}.{type_name}.{k}: stored None "
+                            f"on non-Optional field {target}; restored class default."
+                        );
+                    }
                     setattr(arch, k, recovered);
                     assigned.add(k);
                     continue;
                 }
-                logger.warning(
-                    f"Serializer: coercion fallback on {module_name}."
-                    f"{type_name}.{k}: stored={type(deser_v).__name__}, "
-                    f"target={target}; stored value kept as-is."
-                );
+                if Serializer._should_warn_once("coercion-fallback", field_key) {
+                    logger.warning(
+                        f"Serializer: coercion fallback on {module_name}."
+                        f"{type_name}.{k}: stored={type(deser_v).__name__}, "
+                        f"target={target}; stored value kept as-is."
+                    );
+                }
             }
             setattr(arch, k, coerced);
             assigned.add(k);
         }
         if dropped {
             if mode == 'repair' {
-                logger.info(
-                    f"Serializer: preserved unknown fields in attic on "
-                    f"{module_name}.{type_name}: {sorted(dropped)}"
-                );
+                if Serializer._should_warn_once(
+                    "attic-preserved", f"{module_name}.{type_name}"
+                ) {
+                    logger.info(
+                        f"Serializer: preserved unknown fields in attic on "
+                        f"{module_name}.{type_name}: {sorted(dropped)}"
+                    );
+                }
             } else {
                 logger.debug(
                     f"Serializer: dropped removed fields on {module_name}."
@@ -815,9 +810,7 @@ impl Serializer._deserialize_archetype(
                 );
             }
         }
-        # Backfill declared fields the stored document predates. Factory
-        # defaults are NOT class attributes, so without this an old doc
-        # loads with the attribute missing entirely.
+
         for fd in fields(cls) {
             if fd.name in assigned {
                 continue;
@@ -825,11 +818,15 @@ impl Serializer._deserialize_archetype(
             if fd.default_factory is not MISSING {
                 setattr(arch, fd.name, fd.default_factory());
             } elif fd.default is MISSING {
-                logger.warning(
-                    f"Serializer: {module_name}.{type_name}.{fd.name}: "
-                    "required field missing from stored data and no default "
-                    "available; attribute left unset."
-                );
+                if Serializer._should_warn_once(
+                    "required-missing", f"{module_name}.{type_name}.{fd.name}"
+                ) {
+                    logger.warning(
+                        f"Serializer: {module_name}.{type_name}.{fd.name}: "
+                        "required field missing from stored data and no default "
+                        "available; attribute left unset."
+                    );
+                }
             }
         }
         if attic {
@@ -841,12 +838,15 @@ impl Serializer._deserialize_archetype(
         setattr(arch, '__jac__', anchor);
         return arch;
     } except Exception as e {
-        logger.error(f"Failed to deserialize archetype {type_name}: {e}");
+        if Serializer._should_warn_once(
+            "archetype-error", f"{module_name}.{type_name}:{type(e).__name__}"
+        ) {
+            logger.error(f"Failed to deserialize archetype {type_name}: {e}");
+        }
         return None;
     }
 }
 
-"""Serialize only specified archetype fields of an anchor."""
 impl Serializer.serialize_fields(
     anchor: object, field_names: set[str]
 ) -> dict[str, object] {
@@ -864,8 +864,7 @@ impl Serializer.serialize_fields(
         val = getattr(arch, name, None);
         result[name] = Serializer._serialize_value(val, include_type=True, _seen=_seen);
     }
-    # Dual-write on partial updates too: a renamed field's shadow copy must
-    # refresh alongside it, or old-version readers see stale values.
+
     if result and hasattr(type(arch), '__jac_schema__') {
         import from jaclang.runtimelib.schema_rules { merged_rules_for, repair_mode }
         if repair_mode() == 'repair' and (rules := merged_rules_for(type(arch))) {
@@ -879,7 +878,6 @@ impl Serializer.serialize_fields(
     return result;
 }
 
-"""Compute a hash of the anchor's serialized state for dirty checking."""
 impl Serializer._compute_hash(anchor: Anchor) -> int {
     import from json { dumps }
     try {

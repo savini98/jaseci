@@ -5,13 +5,12 @@ fixture files without errors, and test compilation-level behaviour.
 """
 
 import os;
-import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import from jaclang.jac0core.program { JacProgram }
 import from jaclang.cli.commands { analysis }
 
-glob JAC_ROOT = str(Path(jaclang.__file__).parent.parent),
-     EXAMPLES = os.path.join(JAC_ROOT, "examples"),
+glob EXAMPLES = os.path.join(JAC_ROOT, "examples"),
      FIXTURES = os.path.join(
          JAC_ROOT, "tests", "compiler", "passes", "main", "fixtures"
      ),
@@ -48,18 +47,31 @@ test "arith precedence" {
     import from builtins { compile as pycompile, exec as pyexec }
     import io;
     import sys;
-    prog = JacProgram().compile(
-        use_str="with entry {print(4-5-4);}", file_path="test.jac"
-    );
-    old = sys.stdout;
-    buf = io.StringIO();
-    sys.stdout = buf;
-    try {
-        pyexec(pycompile(prog.gen.py_ast[0], "test.jac", "exec"));
-    } finally {
-        sys.stdout = old;
+    import from jaclang.project.config {
+        JacConfig,
+        CheckConfig,
+        LintConfig,
+        set_config
     }
-    assert buf.getvalue() == "-5\n";
+    # Isolate from the repo jac.toml (`select = ["all"]`), which enables the
+    # opt-in no-print rule (E3012) that would reject the print used below.
+    set_config(JacConfig(check=CheckConfig(lint=LintConfig(select=["default"]))));
+    try {
+        prog = JacProgram().compile(
+            use_str="with entry {print(4-5-4);}", file_path="test.jac"
+        );
+        old = sys.stdout;
+        buf = io.StringIO();
+        sys.stdout = buf;
+        try {
+            pyexec(pycompile(prog.gen.py_ast[0], "test.jac", "exec"));
+        } finally {
+            sys.stdout = old;
+        }
+        assert buf.getvalue() == "-5\n";
+    } finally {
+        set_config(None);
+    }
 }
 
 test "double format issue" {
@@ -103,12 +115,12 @@ test "obj hasvar initialization" {
         'Missing "postinit" method required by uninitialized attribute(s).',
         "    9 | obj Test2 {",
         "   10 |     has var1: str;",
-        "   11 |     has var2: int by postinit;",
+        "   11 |     has var2: int postinit;",
         "      |         ^^^^",
         "   12 | }",
         "Non default attribute 'var4' follows default attribute",
         "   17 |     has var2: int = 42;",
-        "   18 |     has var3: int by postinit;  # <-- This is fine.",
+        "   18 |     has var3: int postinit;  # <-- This is fine.",
         "   19 |     has var4: int;  # <-- This should be syntax error.",
         "      |         ^^^^",
         "   20 |",

@@ -31,28 +31,49 @@ Bug index:
   #HOGEN-1 - TypeVars not bound through function-typed args; blocks generic decorator-application
   #WITHAS-1 - `with cm() as x` bound x to the manager not __enter__'s result; async with used sync protocol
   #UNPACK-1 - Assignment unpacking of a non-tuple iterable (bytes/str/range) typed targets as Unknown
+  #STARGUARD-1 - version-guarded names re-exported via `from M import *` (e.g. Buffer) fail to resolve
   #BYTES-1 - Byte-string literals (b"...") typed as str instead of bytes
   #EVOLVING-NONE - `x = None` then reassign inside `if` lost the new type post-branch
+  #LITWIDEN - literal initializers not widened for mutable vars/attrs/container elements
+  #INCLUDE-MEMBER-1 - member access on `include`d (absorb) symbols resolved to
+                      Unknown when the included submodule imported back from its
+                      own package (circular self-import); poisoned the vendored
+                      llvm ir/binding surface and every native pass (#7163)
+  #LOOPHDR-1 - loop-header back-edge detection used find_parent_of_type(<same
+               kind>), so a back edge originating inside a nested loop of the
+               SAME kind was treated as a loop-entry pred and destroyed the
+               header narrowing (#7853)
+  #CYCLE-IMPORT-1 - re-entrant module import while that module's compile was
+                    still on the stack fell into a fresh program.compile of the
+                    same path instead of answering from the in-flight state
+                    (#7853)
+  #CYCLE-TAINT-1 - an Unknown born from the symbol-resolution cycle guard was
+                   cached on the expression node and diagnosed (W1051 / E1032 /
+                   E1053), freezing transient in-flight types that settle once
+                   the cycle unwinds (#7853)
 """
 
 import os;
-import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import from jaclang.compiler.passes.main.type_checker_pass { TypeCheckPass }
 import from jaclang.jac0core.program { JacProgram }
 import from jaclang.jac0core.passes.transform { Alert }
 import from jaclang.compiler.type_system.type_utils { compute_mro_linearization }
-import from jaclang.compiler.type_system.types { ClassType, TypeFlags }
+import from jaclang.compiler.type_system.types { ClassType, TypeFlags, UnknownType }
 
-glob JAC_ROOT = str(Path(jaclang.__file__).parent.parent),
-     CHECKER_FIXTURES = os.path.join(
+glob CHECKER_FIXTURES = os.path.join(
          JAC_ROOT, "tests", "compiler", "passes", "main", "fixtures", "checker"
      );
 
 """Compile a checker fixture and run the type check pass."""
 def compile_and_check(fixture_name: str) -> JacProgram {
+    import from jaclang.jac0core.compile_options { CompileOptions }
     program = JacProgram();
-    mod = program.compile(os.path.join(CHECKER_FIXTURES, fixture_name));
+    mod = program.compile(
+        os.path.join(CHECKER_FIXTURES, fixture_name),
+        options=CompileOptions(type_check=False, default_codespace='server')
+    );
     TypeCheckPass(ir_in=mod, prog=program);
     return program;
 }
@@ -141,6 +162,39 @@ test "bug_6_mro_not_c3_diamond" {
     assert mro_names == expected_c3 , "Bug #6: MRO is not C3 linearized. "
     f"Expected {expected_c3} but got {mro_names}. "
     "In diamond inheritance, C should come before A in the MRO.";
+}
+
+# =========================================================================
+# Cyclic heritage: compute_mro_linearization must not recurse infinitely
+#
+# compute_mro_linearization recursed into base_classes with no in-progress
+# guard. A malformed or cyclic inheritance graph (a self-referential class,
+# or A -> B -> A) recursed until the stack overflowed instead of degrading
+# to a best-effort MRO. The fix adds an in-progress guard keyed on the class.
+# =========================================================================
+test "cyclic_heritage_mro_does_not_recurse" {
+    # Self-referential: A lists itself as a base.
+    a_shared = ClassType.ClassDetailsShared(
+        class_name="A", symbol_table=None, mro=[], base_classes=[]
+    );
+    a_type = ClassType(_shared=a_shared, flags=TypeFlags.Instantiable);
+    a_type.shared.base_classes = [a_type];
+    compute_mro_linearization(a_type);
+    assert a_type.shared.mro and a_type.shared.mro[0] is a_type;
+
+    # Mutual cycle: B -> C -> B.
+    b_shared = ClassType.ClassDetailsShared(
+        class_name="B", symbol_table=None, mro=[], base_classes=[]
+    );
+    b_type = ClassType(_shared=b_shared, flags=TypeFlags.Instantiable);
+    c_shared = ClassType.ClassDetailsShared(
+        class_name="C", symbol_table=None, mro=[], base_classes=[]
+    );
+    c_type = ClassType(_shared=c_shared, flags=TypeFlags.Instantiable);
+    b_type.shared.base_classes = [c_type];
+    c_type.shared.base_classes = [b_type];
+    compute_mro_linearization(b_type);
+    assert b_type.shared.mro and b_type.shared.mro[0] is b_type;
 }
 
 # =========================================================================
@@ -535,7 +589,7 @@ test "bug_impl1_has_var_shadow_in_impl_body" {
     );
     program = JacProgram();
     program.compile(
-        os.path.join(fixture_dir, "impl_has_var_reassign.cl.jac"), type_check=True
+        os.path.join(fixture_dir, "impl_has_var_reassign.jac"), type_check=True
     );
 
     # Expected after fix: 0 errors. The impl body should type-check cleanly:
@@ -705,7 +759,27 @@ test "bug_comprehension_narrowing" {
     assert len(program.errors_had) == 0 , (
         "`T | None` narrowing established by an enclosing guard must "
         "propagate into list/dict/set/gen comprehension iterators, out "
-        "expressions, and conditional clauses. "
+        "expressions, and conditional clauses -- both for early-return "
+        "guards and for in-body `if x is not None { ... }` blocks. "
+        f"Got errors: {[str(e) for e in program.errors_had]}"
+    );
+}
+
+# =========================================================================
+# Bug #COMPR-NARROW (true-positive guard): the in-body edge classification
+# must not over-narrow comprehension edges to the true branch. Inside
+# `if r is None { ... }` (and the else of `if r is not None`) the narrowed
+# type of `r` really is `None`, so `r.parts` inside a comprehension there
+# must still raise. Guards against a regression where the parent-walk
+# returns "true" for every nested comprehension, silently dropping errors.
+# =========================================================================
+test "bug_comprehension_narrowing_negative" {
+    program = compile_and_check("checker_bug_compr_narrowing_negative.jac");
+
+    assert len(program.errors_had) == 2 , (
+        "Comprehensions inside a branch where `r` is narrowed to `None` "
+        "must still raise on `r.parts` -- the in-body edge fix must not "
+        "over-classify nested comprehension edges as the true branch. "
         f"Got errors: {[str(e) for e in program.errors_had]}"
     );
 }
@@ -898,6 +972,51 @@ test "bug_withas_1_async_with_as_binds_and_checks" {
     );
 }
 
+test "bug_starguard_1_guarded_star_reexport_resolves" {
+    program = compile_and_check("checker_star_reexport_guard.jac");
+    e1055 = sum(
+        1
+        for e in program.errors_had
+        if e.code and e.code.code == "E1055"
+    );
+    assert e1055 == 1 , (
+        "Bug #STARGUARD-1: `bytes + str` must error because str is not a "
+        "Buffer. The guarded ReadableBuffer/Buffer re-export must resolve so "
+        f"bytes.__add__ rejects str. Expected 1 E1055, got {e1055}."
+    );
+}
+
+test "bug_starguard_1_single_segment_reexport_resolves" {
+    program = compile_and_check(os.path.join("star_reexport_guard", "consumer.jac"));
+    e1032 = sum(
+        1
+        for e in program.errors_had
+        if e.code and e.code.code == "E1032"
+    );
+    assert len(program.errors_had) == 0 , (
+        "Bug #STARGUARD-1: a guarded name re-exported via a single-segment "
+        "`from M import *` must resolve. Marker was Unknown "
+        f"({e1032} E1032). Got errors: {[str(e) for e in program.errors_had]}"
+    );
+}
+
+test "bug_starguard_1_multi_segment_reexport_resolves" {
+    program = compile_and_check(
+        os.path.join("star_reexport_guard_multiseg", "consumer.jac")
+    );
+    e1032 = sum(
+        1
+        for e in program.errors_had
+        if e.code and e.code.code == "E1032"
+    );
+    assert len(program.errors_had) == 0 , (
+        "Bug #STARGUARD-1: a guarded name re-exported via a MULTI-SEGMENT "
+        "`from pkg.submod import *` must resolve. The buggy extension-probing "
+        "appended an extension to an already-extensioned path, so Marker was "
+        f"Unknown ({e1032} E1032). Got errors: {[str(e) for e in program.errors_had]}"
+    );
+}
+
 test "bug_byte_literal_typed_as_bytes" {
     program = compile_and_check("checker_bytes_literal.jac");
     assert program.errors_had == [] , (
@@ -916,5 +1035,195 @@ test "bug_evolving_none_narrowing" {
         "Bug #EVOLVING-NONE: `x = None; if cond { x = real_value; }; return x;` "
         "must narrow to the assigned type post-branch (Pyright evolving-locals). "
         f"Got errors: {[str(e) for e in program.errors_had]}"
+    );
+}
+
+# Bug #LITWIDEN: literal types inferred from a literal initializer were not
+# widened for mutable variables and container elements, so `row = ["."] * 3;
+# row[0] = "B";` failed with E1001 (Cannot assign Literal["B"] to Literal["."]).
+# Widening must reach into container element types (list/dict/set), matching
+# mypy/pyright, while explicit annotations and expression-position literals
+# keep their Literal type.
+test "bug_literal_widening_for_mutable_declarations" {
+    program = compile_and_check("checker_bug_literal_widening.jac");
+    assert program.errors_had == [] , (
+        "Bug #LITWIDEN: literals inferred for mutable variables and container "
+        "elements must widen to their base type (['.'] * 3 -> list[str]) so "
+        "later stores of a different value are allowed. "
+        f"Got errors: {[str(e) for e in program.errors_had]}"
+    );
+}
+
+# Bug #INCLUDE-MEMBER-1 / #7163: a class re-exported into a package only via
+# `include` (absorb) was Unknown when reached through the package namespace
+# (`ir.Value`) if the included submodule imported back from its own package
+# (circular self-import, as the vendored llvm ir/binding submodules do). The
+# module-item path (`from pkg import X`) already fell back to walking the absorb
+# imports via _resolve_star_import_symbol; the member-access path did not, and
+# returned UnknownType on the lookup miss. This poisoned the whole llvm surface
+# -- the native passes do `import from ...llvm { ir }` then `ir.Value` /
+# `ir.Module` / ... -- cascading ~1,700 E1030/E1032 errors across every native
+# pass. The base Value class also did not declare its `type` attribute. With the
+# absorb-aware fallback in place and Value.type declared, the issue's repro must
+# type-check clean.
+#
+# The reproduction rides the vendored llvm package on purpose: the bug only
+# surfaces when the absorbing package is resolved through the type evaluator's
+# cross-module import path (external / JIR-cached), which a fixture compiled as
+# the main target does not exercise.
+test "bug_7163_llvm_ir_boundary_resolves" {
+    program = compile_and_check("checker_llvm_ir_boundary.jac");
+    assert program.errors_had == [] , (
+        "Bug #7163: `import from ...llvm { ir }` then `ir.Value` with `.type` "
+        "must resolve. `ir.Value` was Unknown (member access on an absorbed "
+        f"symbol). Got errors: {[str(e) for e in program.errors_had]}"
+    );
+}
+
+# =========================================================================
+# Bug #LOOPHDR-1 / #7853: loop-header narrowing merges only loop-entry
+# preds; back edges are skipped. Detection used
+# `pred.find_parent_of_type(<kind of header>)`, i.e. the NEAREST same-kind
+# ancestor, so a back edge originating inside a nested loop of the SAME
+# kind (the tail of the inner loop's else clause links straight to the
+# outer header) resolved to the inner loop, was mistaken for a loop-entry
+# pred, and its widening assignment (`cur = start`, Item | None) erased the
+# entry narrowing (`cur = Item()`). `cur.val` in the outer body then raised
+# a spurious "Cannot access attribute ... missing from NoneType" error.
+# The fixture's single-loop control is the unnested equivalent that always
+# checked clean; nested same-kind loops must match it.
+# =========================================================================
+test "bug_loophdr1_nested_same_kind_loop_back_edge" {
+    program = compile_and_check("checker_nested_loop_backedge.jac");
+    assert program.errors_had == [] , (
+        "Bug #LOOPHDR-1: a back edge into a loop header that originates "
+        "inside a nested loop of the same kind must be skipped when "
+        "computing the header narrowing, exactly like its unnested "
+        "equivalent. "
+        f"Got errors: {[str(e) for e in program.errors_had]}"
+    );
+}
+
+# =========================================================================
+# Bug #CYCLE-IMPORT-1 / #7853, part 1: a well-formed two-module import
+# cycle where each side uses the other's symbol in a signature must check
+# clean end-to-end. (This path is answered from the module hub -- the
+# partially-built tree -- and guards the overall cyclic-import contract.)
+# =========================================================================
+test "bug_cycimp1_cyclic_import_pair_checks_clean" {
+    program = compile_and_check("checker_cycle_import_sig_a.jac");
+    assert program.errors_had == [] , (
+        "Bug #CYCLE-IMPORT-1: a cyclic import pair with signature-level "
+        "cross-references must produce no errors. "
+        f"Got errors: {[str(e) for e in program.errors_had]}"
+    );
+    unresolved = [
+        w
+        for w in program.warnings_had
+        if "could not be resolved" in str(w)
+    ];
+    assert unresolved == [] , (
+        "Bug #CYCLE-IMPORT-1: a cyclic import pair must not leave W1051 "
+        f"noise. Got: {[str(w) for w in unresolved]}"
+    );
+}
+
+# =========================================================================
+# Bug #CYCLE-IMPORT-1 / #7853, part 2: the re-entrant import guard itself.
+# When the evaluator is asked for a module whose compile is still on the
+# stack (tracked in `_modules_in_compile`) and the partial tree is not in
+# any hub yet -- reachable organically only through the narrow window
+# before parse publishes the module (e.g. a parse-failed member of a
+# native cyclic pair) -- it must answer with a stub instead of re-entering
+# program.compile for the same path (unbounded mutual recursion). This
+# test drives the branch directly: it marks the path as in-compile and
+# asserts the stub answer, that no compile happened (no diagnostics, path
+# still absent from the hub), and that a later, non-re-entrant query does
+# compile and resolve the real module.
+# =========================================================================
+test "bug_cycimp1_reentrant_import_guard_returns_stub" {
+    import from pathlib { Path }
+    program = JacProgram();
+    evaluator = program.get_type_evaluator();
+    target = str(
+        Path(os.path.join(CHECKER_FIXTURES, "checker_cycle_guard_target.jac")).resolve()
+    );
+    pre_errs = len(program.errors_had);
+    evaluator._modules_in_compile.add(target);
+    try {
+        stub = evaluator._import_module_from_path(target);
+    } finally {
+        evaluator._modules_in_compile.discard(target);
+    }
+    assert stub.stub_only , (
+        "Bug #CYCLE-IMPORT-1: a re-entrant import of a mid-compile module "
+        "absent from every hub must return a stub module."
+    );
+    assert target not in program.mod.hub , (
+        "Bug #CYCLE-IMPORT-1: the re-entrant import guard must not compile "
+        "or publish the module -- that is the in-flight compile's job."
+    );
+    assert len(program.errors_had) == pre_errs , (
+        "Bug #CYCLE-IMPORT-1: the guard path must not emit diagnostics. "
+        f"Got errors: {[str(e) for e in program.errors_had[pre_errs:]]}"
+    );
+
+    settled = evaluator._import_module_from_path(target);
+    assert not settled.stub_only and settled.name == "checker_cycle_guard_target" , (
+        "Bug #CYCLE-IMPORT-1: once the module is no longer mid-compile, the "
+        "same query must compile and return the real module."
+    );
+}
+
+# =========================================================================
+# Bug #CYCLE-TAINT-1 / #7853: an Unknown produced by the symbol-resolution
+# cycle guard (get_type_of_symbol re-entered for a symbol already on the
+# resolution stack) is transient: once the cycle unwinds, the type settles.
+# The checker used to treat it like any other Unknown -- caching it on the
+# expression node, emitting W1051, letting E1032 fire on attribute access
+# and E1053 on argument checks, and freezing the assignment's LHS -- so
+# code whose types fully settle reported spurious diagnostics and the
+# symbol stayed Unknown forever.
+#
+# Fixture shape (mutually referencing globals across an import cycle):
+#   main:    glob CONFIG = REGISTRY.defaults;
+#   sibling: glob REGISTRY = Reg() if CONFIG is None else Reg();
+# Resolving CONFIG re-enters CONFIG through the sibling's initializer, but
+# the re-entrant leg only feeds `is None` (bool either way), so REGISTRY
+# settles to Reg and CONFIG to dict. Pre-fix this produced 2 spurious
+# errors (E1032-style attribute access, E1053-style len() arg) plus W1051
+# noise, and get_type_of_symbol(CONFIG) stayed <Unknown> after the pass.
+# =========================================================================
+test "bug_cyctaint1_settling_cycle_checks_clean_and_resolves" {
+    import from jaclang.jac0core.compile_options { CompileOptions }
+    program = JacProgram();
+    mod = program.compile(
+        os.path.join(CHECKER_FIXTURES, "checker_cycle_taint_main.jac"),
+        options=CompileOptions(type_check=False, default_codespace='server')
+    );
+    TypeCheckPass(ir_in=mod, prog=program);
+
+    assert program.errors_had == [] , (
+        "Bug #CYCLE-TAINT-1: a symbol-resolution cycle whose types settle "
+        "after unwinding must not produce errors. "
+        f"Got errors: {[str(e) for e in program.errors_had]}"
+    );
+    unresolved = [
+        w
+        for w in program.warnings_had
+        if "could not be resolved" in str(w)
+    ];
+    assert unresolved == [] , (
+        "Bug #CYCLE-TAINT-1: the transient in-flight Unknown must not be "
+        f"diagnosed as W1051. Got: {[str(w) for w in unresolved]}"
+    );
+
+    config_sym = mod.names_in_scope.get("CONFIG");
+    assert config_sym is not None , "CONFIG symbol missing from fixture module";
+    settled = program.get_type_evaluator().get_type_of_symbol(config_sym);
+    assert not isinstance(settled, UnknownType) and str(settled) == "dict" , (
+        "Bug #CYCLE-TAINT-1: after the cycle unwinds, a later query must "
+        "resolve the settled type (dict via Reg.defaults), not a frozen "
+        f"Unknown. Got: {settled}"
     );
 }

@@ -4,30 +4,25 @@
 
 This monorepo contains:
 
-- `jac/`: Jac language compiler, runtime, and language server
+- `jac/`: Jac language compiler, runtime, language server, and the client/desktop runtimes (`jac/jaclang/runtimelib/client/`)
 - `jac-byllm/`: LLM integration and model-driven features
-- `jac-client/`: Client libraries and SDKs
 - `docs/`: Documentation site and reference materials
 - `scripts/`: Build, test, and maintenance scripts
 
 ## Common Workflows
 
-Run tests for a specific package:
+`jaclang` ships as the single `jac` binary (Zig launcher + bundled CPython) -- there is no pip-installed jaclang. Build it and put it on PATH with `./scripts/fresh_env.sh` (see CONTRIBUTING.md).
+
+Run tests through the binary's bundled runner (`JAC_TEST_JOBS=auto` runs them in parallel):
 
 ```bash
-pytest -n auto <package-name>
+cd jac && JAC_TEST_JOBS=auto jac test tests
 ```
 
-Run pre-commit checks (formatting, linting):
+Run the formatting/lint gate (same checks the git hook runs):
 
 ```bash
-./scripts/check.sh
-```
-
-Full test suite across all packages:
-
-```bash
-./scripts/tests.sh
+jac precommit
 ```
 
 ## Package-Specific Notes
@@ -46,11 +41,11 @@ Full test suite across all packages:
 
 - Core logic: `byllm/lib.py`, `llm_connector.py`
 - Schema definitions: `schema.py`
-- Examples: `examples/agentic_ai/`, `examples/tool_calling/`
+- Examples: `examples/agentic_ai/`
 
-### jac-client/ (Client SDKs)
+### Client & Desktop Runtimes
 
-- Plugin: `jac_client/plugin/`
+- Now part of `jaclang` core: `jac/jaclang/runtimelib/client/`
 
 ## Jac Language Conventions
 
@@ -70,7 +65,7 @@ with entry { /* ... */ }
 ## PR Guidelines
 
 - **Target repository**: Always create PRs against `https://github.com/jaseci-labs/jaseci` (not forks). Use `gh pr create --repo jaseci-labs/jaseci`.
-- **Release notes**: If your PR affects Jac developer experience, add a concise bullet under `## jaclang <version> (Unreleased)` in `docs/docs/communityhub/release_notes/jaclang.md`.
+- **Release notes**: If your PR affects Jac developer experience, add a release-note fragment at `release_notes/unreleased/<package>/<PR#>.<category>.md`.
 - **Grouping**: Organize related changes under sections like "Type Checking Enhancements" or "Cloud Platform Updates".
 - **Testing**: Ensure relevant tests pass before submitting.
 

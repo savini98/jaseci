@@ -1,6 +1,6 @@
 """Type checker tests for client JS globals and generic `new`.
 
-Regression coverage for the littleX TweetCard.cl.jac:25 failure, where
+Regression coverage for the littleX TweetCard.jac:25 failure, where
 `Date.now() - new(Date, created_at).getTime()` produced four cascading
 errors:
   - E1032 (Date is Unknown, no attribute "now")
@@ -16,13 +16,12 @@ Two independent fixes, each pinned below:
 """
 
 import os;
-import from pathlib { Path }
+import from tests.support { JAC_ROOT }
 import jaclang;
 import from jaclang.compiler.passes.main.type_checker_pass { TypeCheckPass }
 import from jaclang.jac0core.program { JacProgram }
 
-glob JAC_ROOT = str(Path(jaclang.__file__).parent.parent),
-     CHECKER_FIXTURES = os.path.join(
+glob CHECKER_FIXTURES = os.path.join(
          JAC_ROOT, "tests", "compiler", "passes", "main", "fixtures", "checker"
      );
 
@@ -45,10 +44,10 @@ def error_codes(program: JacProgram) -> list[str] {
 
 # -------------------------------------------------------------------------
 # 1. Client context: JS globals resolve and chain cleanly.
-#    This is the exact TweetCard.cl.jac:25 pattern plus Math/JSON/console.
+#    This is the exact TweetCard.jac:25 pattern plus Math/JSON/console.
 # -------------------------------------------------------------------------
 test "client js globals resolve" {
-    program = compile_and_check("checker_js_globals_client.cl.jac");
+    program = compile_and_check("checker_js_globals_client.jac");
 
     pretty = "\n".join([e.pretty_print() for e in program.errors_had]);
     assert len(program.errors_had) == 0 , "Client JS globals (Date/Math/JSON/console/parseInt) and "

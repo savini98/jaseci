@@ -1,14 +1,10 @@
 """AI Day Planner -- authenticated, multi-file version."""
 
-to cl:
-
 import from frontend { app as ClientApp }
 
 def:pub app -> JsxElement {
-    return <ClientApp/>;
+    <ClientApp/>
 }
-
-to sv:
 
 enum Category { WORK, PERSONAL, SHOPPING, HEALTH, FITNESS, OTHER }
 
@@ -49,7 +45,7 @@ node ShoppingItem {
 def:priv add_task(title: str) -> Task {
     category = str(categorize(title)).split(".")[-1].lower();
     task = root ++> Task(title=title, category=category);
-    return task[0];
+    return task;
 }
 
 """Get all tasks."""

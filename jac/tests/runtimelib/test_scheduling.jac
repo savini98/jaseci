@@ -19,23 +19,25 @@ test "task registration and scheduler lifecycle" {
 
     # Future date registers successfully
     future = (datetime.datetime.now() + datetime.timedelta(hours=1)).isoformat();
-    sched.register("future_task", lambda : None , ScheduleSpec(date=future), False);
+    sched.register("future_task", lambda { None; }, ScheduleSpec(date=future), False);
     assert len(sched._tasks) == 1;
     assert sched._tasks[0].name == "future_task";
     assert sched._tasks[0].next_run is not None;
 
     # Past date is skipped
     past = (datetime.datetime.now() - datetime.timedelta(hours=1)).isoformat();
-    sched.register("past_task", lambda : None , ScheduleSpec(date=past), False);
+    sched.register("past_task", lambda { None; }, ScheduleSpec(date=past), False);
     assert len(sched._tasks) == 1;
 
     # Invalid date is skipped
-    sched.register("bad_date", lambda : None , ScheduleSpec(date="not-a-date"), False);
+    sched.register(
+        "bad_date", lambda { None; }, ScheduleSpec(date="not-a-date"), False
+    );
     assert len(sched._tasks) == 1;
 
     # Multiple task types
-    sched.register("t_interval", lambda : None , ScheduleSpec(interval=60), False);
-    sched.register("t_cron", lambda : None , ScheduleSpec(cron="* * * * *"), False);
+    sched.register("t_interval", lambda { None; }, ScheduleSpec(interval=60), False);
+    sched.register("t_cron", lambda { None; }, ScheduleSpec(cron="* * * * *"), False);
     assert len(sched._tasks) == 3;
     names = [t.name for t in sched._tasks];
     assert "future_task" in names and "t_interval" in names and "t_cron" in names;
@@ -44,8 +46,8 @@ test "task registration and scheduler lifecycle" {
     sched.start();
     assert sched._running;
     assert sched._thread is not None
-    and sched._thread.is_alive()
-    and sched._thread.daemon;
+        and sched._thread.is_alive()
+        and sched._thread.daemon;
     thread1 = sched._thread;
     sched.start();
     assert sched._thread is thread1;
@@ -96,16 +98,13 @@ test "cron field matching and next run computation" {
 
     # Cron next-run
     now = datetime.datetime(2026, 1, 1, 12, 0, 0);
-    assert sched._parse_cron_next("* * * * *", now) == datetime.datetime(
-        2026, 1, 1, 12, 1, 0
-    );
-    assert sched._parse_cron_next("30 * * * *", now) == datetime.datetime(
-        2026, 1, 1, 12, 30, 0
-    );
+    assert sched._parse_cron_next("* * * * *", now)
+        == datetime.datetime(2026, 1, 1, 12, 1, 0);
+    assert sched._parse_cron_next("30 * * * *", now)
+        == datetime.datetime(2026, 1, 1, 12, 30, 0);
     now2 = datetime.datetime(2026, 1, 1, 8, 0, 0);
-    assert sched._parse_cron_next("0 9 * * *", now2) == datetime.datetime(
-        2026, 1, 1, 9, 0, 0
-    );
+    assert sched._parse_cron_next("0 9 * * *", now2)
+        == datetime.datetime(2026, 1, 1, 9, 0, 0);
 
     # Invalid field count raises ValueError
     raised = False;

@@ -1,16 +1,3 @@
-"""Type resolution and LLVM type helpers."""
-
-"""Lower a semantic TypeBase (from the central type checker) to an LLVM type.
-
-NaIRGenPass runs after TypeCheckPass, so annotation Expr nodes carry a fully
-resolved `.type`. This consumes that TypeBase directly instead of re-deriving
-type structure from raw annotation AST. Returns None when the type category
-is not (yet) handled, so callers can fall back to the legacy AST walk.
-
-Successful lowerings are memoized per LLVM module keyed by the canonical
-type key (TypeBase.mangle); a cache hit also implies the type's collection
-helpers were already emitted for this module.
-"""
 impl NaIRGenPass._lower_type(t: any) -> (ir.Type | None) {
     if t is None {
         return None;
@@ -21,12 +8,20 @@ impl NaIRGenPass._lower_type(t: any) -> (ir.Type | None) {
             UnionType as _UnionType,
             FunctionType as _FunctionType,
             NeverType as _NeverType,
-            AnyType as _AnyType
+            AnyType as _AnyType,
+            TypeVarType as _TypeVarType
         }
     } except ImportError {
         return None;
     }
-    key = t.mangle() if t?.mangle else None;
+    if isinstance(t, _TypeVarType) {
+        _sol = self._mono_solution;
+        if _sol is not None and t.name in _sol {
+            return self._lower_type(_sol[t.name]);
+        }
+        return None;
+    }
+    key = self._mangled_of(t);
     if key is not None and key in self._lowered_type_cache {
         return self._lowered_type_cache[key];
     }
@@ -38,16 +33,28 @@ impl NaIRGenPass._lower_type(t: any) -> (ir.Type | None) {
     } elif isinstance(t, _ClassType) {
         lowered = self._lower_class_type(t);
     } elif isinstance(t, _UnionType) {
-        # `T | None` (and general unions) lower to the first non-None member;
-        # native pointers are nullable, so the optional wrapper is implicit.
         lowered = ir.VoidType();
+        _members: list = [];
         for m in (t.types or []) {
             if isinstance(m, _ClassType)
-            and m.shared.class_name in ("NoneType", "None") {
+                and m.shared.class_name in ("NoneType", "None") {
                 continue;
             }
-            lowered = self._lower_type(m);
-            break;
+            _members.append(m);
+        }
+        _had_none = len(_members) < len(t.types or []);
+        if _members {
+            _mlow = self._lower_type(_members[0]);
+            if (
+                _had_none
+                and len(_members) == 1
+                and _mlow is not None
+                and not isinstance(_mlow, (ir.PointerType, ir.VoidType))
+            ) {
+                lowered = self._jac_optional_type(_mlow);
+            } else {
+                lowered = _mlow;
+            }
         }
     } elif isinstance(t, _FunctionType) {
         lowered = self._lower_function_type(t);
@@ -58,27 +65,19 @@ impl NaIRGenPass._lower_type(t: any) -> (ir.Type | None) {
     return lowered;
 }
 
-"""Return the canonical type key (TypeBase.mangle) of an expression's checked
-type, or None when the expression is untyped. This is the sanctioned way for
-native codegen to ask "what Jac type is this expression" — replacing the
-legacy variable-name-keyed shadow dicts/sets."""
 impl NaIRGenPass._type_key_of(expr: (uni.UniNode | None)) -> (str | None) {
     if not isinstance(expr, uni.Expr) or expr.type is None {
         return None;
     }
-    return expr.type.mangle();
+    return self._mangled_of(expr.type);
 }
 
-"""Return the enum class name of an expression's checked type, or None when
-the expression is not enum-typed. Handles both an enum instance (ClassType
-with is_enum_class) and a specific member (EnumMemberType)."""
 impl NaIRGenPass._enum_name_of(expr: (uni.UniNode | None)) -> (str | None) {
     if not isinstance(expr, uni.Expr) or expr.type is None {
         return None;
     }
     try {
         import from jaclang.compiler.type_system.types {
-            ClassType as _ClassType,
             EnumMemberType as _EnumMemberType
         }
     } except ImportError {
@@ -88,55 +87,74 @@ impl NaIRGenPass._enum_name_of(expr: (uni.UniNode | None)) -> (str | None) {
     if isinstance(t, _EnumMemberType) and t.enum_class is not None {
         return t.enum_class.shared.class_name;
     }
-    if isinstance(t, _ClassType) and t._shared is not None and t.shared.is_enum_class {
+    if self._is_enum_class_type(t) {
         return t.shared.class_name;
     }
     return None;
 }
 
-"""Return the native tuple registry key for an expression's checked type, or
-None when the expression is not tuple-typed (or its element types cannot be
-lowered). Lowering the type registers the tuple struct as a side effect, so
-the returned key is always present in `tuple_types`."""
+impl NaIRGenPass._is_enum_class_type(t: any) -> bool {
+    try {
+        import from jaclang.compiler.type_system.types { ClassType as _ClassType }
+    } except ImportError {
+        return False;
+    }
+    return isinstance(t, _ClassType)
+        and t._shared is not None
+        and t.shared.is_enum_class;
+}
+
 impl NaIRGenPass._tuple_key_of(expr: (uni.UniNode | None)) -> (str | None) {
     if not isinstance(expr, uni.Expr) or expr.type is None {
         return None;
     }
-    tk = expr.type.mangle();
+    tk = self._mangled_of(expr.type);
     if not tk.startswith("tuple[") {
         return None;
     }
     lowered = self._lower_type(expr.type);
     if lowered is None
-    or not isinstance(lowered, ir.PointerType)
-    or not isinstance(lowered.pointee, ir.LiteralStructType) {
+        or not isinstance(lowered, ir.PointerType)
+        or not isinstance(lowered.pointee, ir.LiteralStructType) {
         return None;
     }
     elems = lowered.pointee.elements;
     return f"Tuple.{len(elems)}." + ".".join([str(x) for x in elems]);
 }
 
-"""Return the native set spec key for an expression's checked set/frozenset
-type, or None when the expression is not set-typed. Lowering the type
-registers the set struct + helpers as a side effect, so the returned spec is
-always present in `set_types`/`set_helpers`."""
 impl NaIRGenPass._set_spec_of(expr: (uni.UniNode | None)) -> (str | None) {
+    return self._spec_of(expr, ("set", "frozenset"), self.set_types);
+}
+
+impl NaIRGenPass._dict_key_of(expr: (uni.UniNode | None)) -> (str | None) {
+    return self._spec_of(expr, ("dict", ), self.dict_types);
+}
+
+impl NaIRGenPass._list_spec_of(expr: (uni.UniNode | None)) -> (str | None) {
+    return self._spec_of(expr, ("list", "bytearray"), self.list_types);
+}
+
+impl NaIRGenPass._spec_of(
+    expr: (uni.UniNode | None), names: tuple, registry: dict
+) -> (str | None) {
     if not isinstance(expr, uni.Expr) or expr.type is None {
         return None;
     }
-    tk = expr.type.mangle();
-    if not (
-        tk in ("set", "frozenset")
-        or tk.startswith("set[")
-        or tk.startswith("frozenset[")
-    ) {
+    tk = self._mangled_of(expr.type);
+    matched = tk in names;
+    for nm in names {
+        if tk.startswith(nm + "[") {
+            matched = True;
+        }
+    }
+    if not matched {
         return None;
     }
     lowered = self._lower_type(expr.type);
     if lowered is None {
         return None;
     }
-    for (spec, st) in self.set_types.items() {
+    for (spec, st) in registry.items() {
         if lowered == st.as_pointer() {
             return spec;
         }
@@ -144,59 +162,6 @@ impl NaIRGenPass._set_spec_of(expr: (uni.UniNode | None)) -> (str | None) {
     return None;
 }
 
-"""Return the native dict registry key ("k:v" spec) for an expression's
-checked dict type, or None when the expression is not dict-typed. Lowering
-the type registers the dict struct + helpers as a side effect, so the
-returned key is always present in `dict_types`/`dict_helpers`."""
-impl NaIRGenPass._dict_key_of(expr: (uni.UniNode | None)) -> (str | None) {
-    if not isinstance(expr, uni.Expr) or expr.type is None {
-        return None;
-    }
-    tk = expr.type.mangle();
-    if not (tk == "dict" or tk.startswith("dict[")) {
-        return None;
-    }
-    lowered = self._lower_type(expr.type);
-    if lowered is None {
-        return None;
-    }
-    for (dkey, dt) in self.dict_types.items() {
-        if lowered == dt.as_pointer() {
-            return dkey;
-        }
-    }
-    return None;
-}
-
-"""Return the native list spec key for an expression's checked list type, or
-None when the expression is not list-typed. Lowering the type registers the
-list struct + helpers as a side effect, so the returned spec is always
-present in `list_types`/`list_helpers`."""
-impl NaIRGenPass._list_spec_of(expr: (uni.UniNode | None)) -> (str | None) {
-    if not isinstance(expr, uni.Expr) or expr.type is None {
-        return None;
-    }
-    tk = expr.type.mangle();
-    if not (tk == "list" or tk.startswith("list[")) {
-        return None;
-    }
-    lowered = self._lower_type(expr.type);
-    if lowered is None {
-        return None;
-    }
-    for (spec, lt) in self.list_types.items() {
-        if lowered == lt.as_pointer() {
-            return spec;
-        }
-    }
-    return None;
-}
-
-"""Return the native struct name for an expression whose checked type is a
-known struct instance, or None otherwise. Unions like `T | None` resolve to
-the struct member. `self` resolves to the archetype currently being
-codegen'd: inherited methods are re-emitted per subclass with a flattened
-layout, so the declaring parent the checker reports would be wrong."""
 impl NaIRGenPass._struct_name_of(expr: (uni.UniNode | None)) -> (str | None) {
     if (
         isinstance(expr, uni.Name)
@@ -208,7 +173,7 @@ impl NaIRGenPass._struct_name_of(expr: (uni.UniNode | None)) -> (str | None) {
     if not isinstance(expr, uni.Expr) or expr.type is None {
         return None;
     }
-    tk = expr.type.mangle();
+    tk = self._mangled_of(expr.type);
     if tk in self.struct_types {
         return tk;
     }
@@ -222,25 +187,56 @@ impl NaIRGenPass._struct_name_of(expr: (uni.UniNode | None)) -> (str | None) {
     return None;
 }
 
-"""Return the lowered LLVM type of a checked list type's element, or None.
-For `list[Piece | None]` returns `Piece*`; for `list[list[int]]` returns
-`List.i64*`. Lowering registers any needed collection helpers."""
+impl NaIRGenPass._struct_ptr_pointee_name(val: ir.Value) -> (str | None) {
+    _vt = val.type;
+    if isinstance(_vt, ir.PointerType)
+        and isinstance(_vt.pointee, ir.IdentifiedStructType) {
+        _name = _vt.pointee.name;
+        if _name in self.struct_types and self.struct_types[_name] == _vt.pointee {
+            return _name;
+        }
+    }
+    return None;
+}
+
+impl NaIRGenPass._struct_array_elem_ptr(ptr: ir.Value, idx_val: ir.Value) -> ir.Value {
+    _i64 = ir.IntType(64);
+    _wide_idx = (
+        idx_val
+            if idx_val.type == _i64
+            else self.builder.sext(idx_val, _i64, name="arr.idx.i64")
+    );
+    return self.builder.gep(ptr, [_wide_idx], name="ptr.elem.ptr");
+}
+
 impl NaIRGenPass._list_elem_llvm_of(expr: (uni.UniNode | None)) -> (ir.Type | None) {
+    return self._typed_elem_llvm_of(expr, "list[");
+}
+
+impl NaIRGenPass._iter_elem_llvm_of(expr: (uni.UniNode | None)) -> (ir.Type | None) {
+    return self._typed_elem_llvm_of(expr, "Iterator[");
+}
+
+impl NaIRGenPass._typed_elem_llvm_of(
+    expr: (uni.UniNode | None), prefix: str
+) -> (ir.Type | None) {
     if not isinstance(expr, uni.Expr) or expr.type is None {
         return None;
     }
-    if not expr.type.mangle().startswith("list[") {
+    if not self._mangled_of(expr.type).startswith(prefix) {
         return None;
     }
     args = expr.type.private.type_args or [];
     if not args {
         return None;
     }
-    return self._lower_type(args[0]);
+    lowered = self._lower_type(args[0]);
+    if lowered is not None and isinstance(lowered, ir.VoidType) {
+        return ir.IntType(64);
+    }
+    return lowered;
 }
 
-"""Return the native element spec of a checked list type's element
-("i64"/"f64"/"ptr"/"jacval"), or None when the expression isn't a typed list."""
 impl NaIRGenPass._elem_spec_of(expr: (uni.UniNode | None)) -> (str | None) {
     et = self._list_elem_llvm_of(expr);
     if et is None {
@@ -258,40 +254,49 @@ impl NaIRGenPass._elem_spec_of(expr: (uni.UniNode | None)) -> (str | None) {
     return "i64";
 }
 
-"""Lower a ClassType TypeBase to an LLVM type, or None if unresolved.
-
-Handles primitives (registry-backed), enums, user structs, and the builtin
-collections list/dict/set/frozenset/tuple — recursing on type arguments.
-"""
 impl NaIRGenPass._lower_class_type(t: any) -> (ir.Type | None) {
     cname = t.shared.class_name;
-    # Primitive (registry-backed): int/float/bool/str/i8../f64..
+
     if cname in self.type_map {
         return self.type_map[cname];
     }
     if cname in ("NoneType", "None") {
         return ir.VoidType();
     }
-    # Both Jac's lowercase `any` and the central checker's normalised
-    # `Any` ClassType wrapper lower to the boxed jacval representation.
+
     if cname in ("any", "Any", "object") {
         return self.jacval_type;
     }
-    # (No enum branch: _codegen_enum registers every enum name in both
-    # enum_types and type_map with the same i64 backing, and type_map is
-    # checked above -- so an enum_types lookup here could never be reached.)
-    # Native runtime `File` (modeled centrally via na_builtins.pyi): register
-    # its struct on demand so a `File` annotation lowers even before any file
-    # op has emitted the helpers.
+
     if cname == "File" {
         return self._get_file_struct_type().as_pointer();
     }
-    # User-defined object/struct -> pointer to struct.
+
+    if cname == "BinaryFile" {
+        return self._get_binary_file_struct_type().as_pointer();
+    }
+
+    if cname == "bytes" {
+        return self._get_bytes_struct_type().as_pointer();
+    }
+
+    if cname == "bytearray" {
+        return self._ensure_bytearray_type();
+    }
+
     if cname in self.struct_types {
         return self.struct_types[cname].as_pointer();
     }
+    if self._is_enum_class_type(t) {
+        return ir.IntType(64);
+    }
     type_args = t.private.type_args or [];
-    # list[T] — bare `list` defaults to a list of i64.
+
+    if cname in ("Iterator", "Iterable") {
+        self._ensure_iter_types();
+        return self._jac_iter_type.as_pointer();
+    }
+
     if cname == "list" {
         elem_llvm: ir.Type = ir.IntType(64);
         if type_args {
@@ -306,11 +311,13 @@ impl NaIRGenPass._lower_class_type(t: any) -> (ir.Type | None) {
             spec = "f64";
         } elif isinstance(elem_llvm, ir.PointerType) {
             spec = "ptr";
+        } elif self?.jacval_type and elem_llvm == self.jacval_type {
+            spec = "jacval";
         }
         self._emit_list_helpers(spec, elem_llvm);
         return self.list_types[spec].as_pointer();
     }
-    # dict[K, V] — bare `dict` defaults to dict[i64, i64].
+
     if cname == "dict" {
         k_llvm: ir.Type = ir.IntType(64);
         v_llvm: ir.Type = ir.IntType(64);
@@ -323,31 +330,13 @@ impl NaIRGenPass._lower_class_type(t: any) -> (ir.Type | None) {
             k_llvm = _k;
             v_llvm = _v;
         }
-        # Key spec: i64 / f64 / ptr / tuple{size}.
-        k_spec = "i64";
-        k_size = 0;
-        if isinstance(k_llvm, ir.DoubleType) {
-            k_spec = "f64";
-        } elif isinstance(k_llvm, ir.PointerType) {
-            k_spec = "ptr";
-            if isinstance(k_llvm.pointee, ir.LiteralStructType) {
-                k_size = self._get_struct_size(k_llvm.pointee);
-                k_spec = f"tuple{k_size}";
-            }
-        }
-        # Value spec: i64 / f64 / ptr / jacval.
-        v_spec = "i64";
-        if isinstance(v_llvm, ir.DoubleType) {
-            v_spec = "f64";
-        } elif isinstance(v_llvm, ir.PointerType) {
-            v_spec = "ptr";
-        } elif self?.jacval_type and v_llvm == self.jacval_type {
-            v_spec = "jacval";
-        }
+
+        (k_spec, k_size) = self._dict_key_spec(k_llvm);
+        v_spec = self._dict_val_spec(v_llvm);
         self._emit_dict_helpers(k_spec, v_spec, k_llvm, v_llvm, k_size);
         return self.dict_types[f"{k_spec}:{v_spec}"].as_pointer();
     }
-    # set[T] / frozenset[T] — bare forms default to a set of i64.
+
     if cname in ("set", "frozenset") {
         elem_llvm: ir.Type = ir.IntType(64);
         if type_args {
@@ -371,7 +360,7 @@ impl NaIRGenPass._lower_class_type(t: any) -> (ir.Type | None) {
         self._emit_set_helpers(spec, elem_llvm, esize);
         return self.set_types[spec].as_pointer();
     }
-    # tuple[T1, T2, ...] -> pointer to an LLVM literal struct.
+
     if cname == "tuple" {
         if not type_args {
             return None;
@@ -394,12 +383,13 @@ impl NaIRGenPass._lower_class_type(t: any) -> (ir.Type | None) {
     return None;
 }
 
-"""Lower a FunctionType / Callable annotation to an LLVM function-pointer type.
-
-Unresolved parameter types default to i64 (matching untyped-param handling
-for native function pointers); an unresolved return type defaults to void.
-"""
 impl NaIRGenPass._lower_function_type(t: any) -> ir.Type {
+    raw = self._lower_function_type_raw(t);
+    (_sig_name, sig_st, _fnty_env) = self._closure_sig_struct(raw.pointee);
+    return sig_st.as_pointer();
+}
+
+impl NaIRGenPass._lower_function_type_raw(t: any) -> ir.Type {
     ret_type: ir.Type = ir.VoidType();
     if t.return_type is not None {
         _r = self._lower_type(t.return_type);
@@ -419,60 +409,96 @@ impl NaIRGenPass._lower_function_type(t: any) -> ir.Type {
     return ir.FunctionType(ret_type, param_types).as_pointer();
 }
 
-"""Resolve a Jac type expression to an LLVM type.
-
-An annotation Expr carries a `.type` (TypeBase) populated by TypeCheckPass;
-_lower_type maps it to an LLVM type. Every native type now flows through the
-central checker -- primitives, user structs/enums, collections, and the
-runtime `File` (modeled by na_builtins.pyi) -- including annotations in
-imported .na.jac modules (type-checked on load, #6117). The former name-based
-fallback (struct_types / type_map lookups) is gone: with `File` modeled
-centrally (#6118) it was reached zero times across the native suite.
-
-An annotation that reaches codegen without a `.type` is an E9002 ICE: the
-typed-tree contract (Phase 0) guarantees inference ran, so a missing type
-is a pipeline bug, never a user error. A present-but-unlowerable type still
-defaults to i64 (capability gap, E5090 territory -- tightened separately).
-"""
 impl NaIRGenPass._resolve_jac_type(type_expr: (uni.UniNode | None)) -> ir.Type {
     if type_expr is None {
         return ir.IntType(64);
     }
-    # Unified path: TypeBase -> ir.Type via the central type checker.
+
+    if isinstance(type_expr, uni.SubTag) and type_expr?.tag is not None {
+        return self._resolve_jac_type(type_expr.tag);
+    }
+
     _ptb = type_expr?.type;
     if _ptb is not None and not isinstance(type_expr, uni.Expr) {
         lowered = self._lower_type(_ptb);
         if lowered is not None {
             return lowered;
         }
-        return ir.IntType(64);
+        return self._emit_unlowerable_type(type_expr, _ptb);
     }
     if isinstance(type_expr, uni.Expr) {
         if type_expr.type is None {
-            self.emit(
-                E9002,
-                node_override=type_expr,
-                details=(
-                    "native codegen found no inferred type on annotation "
-                    f"'{type_expr.unparse()}'"
-                )
-            );
-            return ir.IntType(64);
+            _sname = self._get_name(type_expr);
+            if _sname is not None and _sname in self.struct_types {
+                return self.struct_types[_sname].as_pointer();
+            }
+            return self._emit_unlowerable_type(type_expr, None);
         }
         lowered = self._lower_type(type_expr.type);
         if lowered is not None {
             return lowered;
         }
+        return self._emit_unlowerable_type(type_expr, type_expr.type);
     }
     return ir.IntType(64);
 }
 
-"""Resolve a type for C library declarations -- clib structs use value types, not pointers."""
+impl NaIRGenPass._try_resolve_field_type(var: uni.UniNode) -> tuple {
+    _ptb = var?.type;
+    if _ptb is not None {
+        try {
+            import from jaclang.compiler.type_system.types {
+                FunctionType as _FieldFnType
+            }
+            if isinstance(_ptb, _FieldFnType) {
+                return (self._lower_function_type_raw(_ptb), False);
+            }
+        } except ImportError { }
+        lowered = self._lower_type(_ptb);
+        if lowered is not None {
+            return (lowered, False);
+        }
+
+        if not self._type_base_is_unknown(_ptb) {
+            return (ir.IntType(8).as_pointer(), True);
+        }
+    }
+    return (self._resolve_jac_type(var), False);
+}
+
+impl NaIRGenPass._type_base_is_unknown(tb: any) -> bool {
+    try {
+        import from jaclang.compiler.type_system.types { UnknownType as _UnknownType }
+        return isinstance(tb, _UnknownType);
+    } except ImportError {
+        return True;
+    }
+}
+
+impl NaIRGenPass._emit_unlowerable_type(type_expr: uni.UniNode, tb: any) -> ir.Type {
+    if isinstance(type_expr, uni.Expr) {
+        _label = type_expr.unparse();
+    } else {
+        _tag = type_expr?.type_tag;
+        _label = self._get_name(_tag?.tag) or str(tb);
+    }
+    self.emit(E5092, node_override=type_expr, kind="type", name=_label);
+
+    import logging as _logging;
+    _logging.getLogger("jaclang.native").debug(
+        "[NaIRGenPass] _resolve_jac_type: unresolved type %r (type=%s) — "
+        "defaulting to i64; consider adding an explicit type annotation",
+        type_expr,
+        type(type_expr).__name__,
+    );
+    return ir.IntType(64);
+}
+
 impl NaIRGenPass._resolve_clib_type(type_expr: (uni.UniNode | None)) -> ir.Type {
     if type_expr is None {
-        return ir.IntType(64);
+        return ir.VoidType();
     }
-    # Check if this is a clib struct name -- return VALUE type (not pointer)
+
     type_name: (str | None) = None;
     if isinstance(type_expr, uni.Name) {
         type_name = type_expr.value;
@@ -480,17 +506,28 @@ impl NaIRGenPass._resolve_clib_type(type_expr: (uni.UniNode | None)) -> ir.Type 
         type_name = type_expr.value;
     }
     if type_name is not None and type_name in self.clib_struct_names {
-        # Use ABI-coerced integer type for small structs (matches C calling convention)
         if type_name in self.clib_struct_abi_types {
             return self.clib_struct_abi_types[type_name];
         }
         return self.struct_types[type_name];
     }
-    # For all other types, delegate to normal resolution
+
+    if type_name == "bytes" or type_name == "bytearray" {
+        return ir.IntType(8).as_pointer();
+    }
+
+    try {
+        import from jaclang.compiler.type_system.types {
+            FunctionType as _ClibSigFnType
+        }
+        if isinstance(type_expr?.type, _ClibSigFnType) {
+            return self._lower_function_type_raw(type_expr.type);
+        }
+    } except ImportError { }
+
     return self._resolve_jac_type(type_expr);
 }
 
-"""Extract name string from a Name or similar node."""
 impl NaIRGenPass._get_name(nd: (uni.UniNode | None)) -> (str | None) {
     if nd is None {
         return None;
@@ -507,45 +544,100 @@ impl NaIRGenPass._get_name(nd: (uni.UniNode | None)) -> (str | None) {
     return None;
 }
 
-"""Create an alloca in the function entry block (ensures dominance)."""
 impl NaIRGenPass._entry_alloca(var_type: ir.Type, name: str) -> ir.Value {
     func = self.builder.function;
+
+    _gc = self._gen_ctx;
+    if _gc is not None and func is _gc["resume_fn"] {
+        i64 = ir.IntType(64);
+        size = self._abi_sizeof(var_type);
+        offset = (_gc["cursor"] + 7) // 8 * 8;
+        _gc["cursor"] = offset + size;
+        _gc["slots"].append((name, offset, var_type));
+        cur_block = self.builder.block;
+        entry_block = func.entry_basic_block;
+        if entry_block.instructions {
+            self.builder.position_before(entry_block.instructions[0]);
+        } else {
+            self.builder.position_at_start(entry_block);
+        }
+        raw = self.builder.gep(
+            _gc["frame_i8"], [ir.Constant(i64, offset)], name=f"{name}.slot"
+        );
+        slot = self.builder.bitcast(raw, var_type.as_pointer(), name=f"{name}.frame");
+        self.builder.position_at_end(cur_block);
+        return slot;
+    }
+
     entry_block = func.entry_basic_block;
-    # Save current position
+
     cur_block = self.builder.block;
-    # Position at the start of the entry block (before all instructions)
+
     if entry_block.instructions {
         self.builder.position_before(entry_block.instructions[0]);
     } else {
         self.builder.position_at_start(entry_block);
     }
     alloca = self.builder.alloca(var_type, name=name);
-    # Restore position
+
     self.builder.position_at_end(cur_block);
     return alloca;
 }
 
-"""Convert a value to i1 (boolean)."""
+impl NaIRGenPass._stack_entry_alloca(var_type: ir.Type, name: str) -> ir.Value {
+    func = self.builder.function;
+    entry_block = func.entry_basic_block;
+    cur_block = self.builder.block;
+    if entry_block.instructions {
+        self.builder.position_before(entry_block.instructions[0]);
+    } else {
+        self.builder.position_at_start(entry_block);
+    }
+    alloca = self.builder.alloca(var_type, name=name);
+    self.builder.position_at_end(cur_block);
+    return alloca;
+}
+
+impl NaIRGenPass._abi_sizeof(t: ir.Type) -> int {
+    if isinstance(t, (ir.IntType, ir.DoubleType, ir.PointerType, ir.FloatType)) {
+        return 8;
+    }
+    if isinstance(t, ir.ArrayType) {
+        return t.count * ((self._abi_sizeof(t.element) + 7) // 8 * 8);
+    }
+    elems = t?.elements;
+    if elems {
+        total = 0;
+        for e in elems {
+            total += (self._abi_sizeof(e) + 7) // 8 * 8;
+        }
+        return total;
+    }
+    raise RuntimeError(
+        f"native codegen internal error: _abi_sizeof has no layout for {t!r}. "
+        f"A generator-frame slot of unknown size would silently corrupt "
+        f"adjacent slots; teach _abi_sizeof this type instead."
+    );
+}
+
 impl NaIRGenPass._to_bool(val: ir.Value) -> ir.Value {
     if isinstance(val.type, ir.IntType) and val.type.width == 1 {
         return val;
+    }
+    if self?.jacval_type and val.type == self.jacval_type {
+        return self._jacval_truthy(val);
     }
     if isinstance(val.type, ir.IntType) {
         return self.builder.icmp_unsigned(
             "!=", val, ir.Constant(val.type, 0), name="tobool"
         );
     }
-    if isinstance(val.type, ir.DoubleType) {
-        return self.builder.fcmp_ordered(
+    if isinstance(val.type, (ir.DoubleType, ir.FloatType)) {
+        return self.builder.fcmp_unordered(
             "!=", val, ir.Constant(val.type, 0.0), name="tobool"
         );
     }
     if isinstance(val.type, ir.PointerType) {
-        # Container truthiness (Python semantics): a list/dict/set is falsy when
-        # EMPTY, not when null. Every container struct stores its length as field
-        # 0 (i64), so test that instead of the pointer — otherwise `while stack`
-        # tests the always-non-null pointer, loops forever, and pop() runs past
-        # empty into out-of-bounds memory (see #6435 item 5).
         _is_container = False;
         for (_, _lt) in self.list_types.items() {
             if val.type == _lt.as_pointer() {
@@ -579,12 +671,114 @@ impl NaIRGenPass._to_bool(val: ir.Value) -> ir.Value {
                 "!=", _len, ir.Constant(ir.IntType(64), 0), name="tobool"
             );
         }
+
+        if self._is_bytes_value(val) {
+            return self._emit_bytes_truthy(val);
+        }
+
+        i8p = ir.IntType(8).as_pointer();
+        if val.type == i8p {
+            func = self.builder.function;
+            cur_bb = self.builder.block;
+            load_bb = func.append_basic_block(name="tobool.str.load");
+            merge_bb = func.append_basic_block(name="tobool.str.end");
+            is_null = self.builder.icmp_unsigned(
+                "==", val, ir.Constant(i8p, None), name="tobool.str.null"
+            );
+            self.builder.cbranch(is_null, merge_bb, load_bb);
+            self.builder.position_at_end(load_bb);
+            first = self.builder.load(val, name="tobool.str.ch");
+            nonempty = self.builder.icmp_unsigned(
+                "!=", first, ir.Constant(ir.IntType(8), 0), name="tobool.str.ne"
+            );
+            self.builder.branch(merge_bb);
+            self.builder.position_at_end(merge_bb);
+            phi = self.builder.phi(ir.IntType(1), name="tobool.str");
+            phi.add_incoming(ir.Constant(ir.IntType(1), 0), cur_bb);
+            phi.add_incoming(nonempty, load_bb);
+            return phi;
+        }
         null_ptr = ir.Constant(val.type, None);
         return self.builder.icmp_unsigned("!=", val, null_ptr, name="tobool");
     }
     return val;
 }
 
+
+impl NaIRGenPass._jacval_truthy(jv: ir.Value) -> ir.Value {
+    b = self.builder;
+    i1 = ir.IntType(1);
+    i8 = ir.IntType(8);
+    i64 = ir.IntType(64);
+    tag = b.extract_value(jv, 0, name="jv.truthy.tag");
+    payload = b.extract_value(jv, 1, name="jv.truthy.payload");
+    func = b.function;
+    str_bb = func.append_basic_block(name="jv.truthy.str");
+    cont_chk_bb = func.append_basic_block(name="jv.truthy.cont.chk");
+    cont_len_bb = func.append_basic_block(name="jv.truthy.cont.len");
+    scalar_bb = func.append_basic_block(name="jv.truthy.scalar");
+    merge_bb = func.append_basic_block(name="jv.truthy.end");
+
+    is_str = b.icmp_unsigned("==", tag, ir.Constant(i8, 2), name="jv.truthy.isstr");
+    b.cbranch(is_str, str_bb, cont_chk_bb);
+
+    b.position_at_end(str_bb);
+    str_ptr = b.inttoptr(payload, i8.as_pointer(), name="jv.truthy.strp");
+    str_res = self._to_bool(str_ptr);
+    str_exit_bb = b.block;
+    b.branch(merge_bb);
+
+    b.position_at_end(cont_chk_bb);
+    is_list = b.icmp_unsigned("==", tag, ir.Constant(i8, 3), name="jv.truthy.islist");
+    is_dict = b.icmp_unsigned("==", tag, ir.Constant(i8, 4), name="jv.truthy.isdict");
+    is_set = b.icmp_unsigned("==", tag, ir.Constant(i8, 5), name="jv.truthy.isset");
+    is_cont = b.or_(
+        b.or_(is_list, is_dict, name="jv.truthy.ld"), is_set, name="jv.truthy.iscont"
+    );
+    cont_nonnull = b.icmp_unsigned(
+        "!=", payload, ir.Constant(i64, 0), name="jv.truthy.cont.nn"
+    );
+    read_len = b.and_(is_cont, cont_nonnull, name="jv.truthy.readlen");
+    b.cbranch(read_len, cont_len_bb, scalar_bb);
+
+    b.position_at_end(cont_len_bb);
+    len_ptr = b.inttoptr(payload, i64.as_pointer(), name="jv.truthy.lenp");
+    cont_len = b.load(len_ptr, name="jv.truthy.len");
+    len_res = b.icmp_unsigned(
+        "!=", cont_len, ir.Constant(i64, 0), name="jv.truthy.lennz"
+    );
+    b.branch(merge_bb);
+
+    b.position_at_end(scalar_bb);
+    is_none = b.icmp_unsigned("==", tag, ir.Constant(i8, 8), name="jv.truthy.isnone");
+    is_float = b.icmp_unsigned("==", tag, ir.Constant(i8, 1), name="jv.truthy.isfloat");
+    as_f64 = b.bitcast(payload, ir.DoubleType(), name="jv.truthy.f64");
+    f_nz = b.fcmp_unordered(
+        "!=", as_f64, ir.Constant(ir.DoubleType(), 0.0), name="jv.truthy.fnz"
+    );
+    p_nz = b.icmp_unsigned("!=", payload, ir.Constant(i64, 0), name="jv.truthy.pnz");
+    num_res = b.select(is_float, f_nz, p_nz, name="jv.truthy.num");
+    scalar_res = b.select(
+        is_none, ir.Constant(i1, 0), num_res, name="jv.truthy.scalar"
+    );
+    b.branch(merge_bb);
+
+    b.position_at_end(merge_bb);
+    phi = b.phi(i1, name="jv.truthy");
+    phi.add_incoming(str_res, str_exit_bb);
+    phi.add_incoming(len_res, cont_len_bb);
+    phi.add_incoming(scalar_res, scalar_bb);
+    return phi;
+}
+
+impl NaIRGenPass._jacval_is_none(jv: ir.Value, negate: bool) -> ir.Value {
+    i8 = ir.IntType(8);
+    tag = self.builder.extract_value(jv, 0, name="jv.nonetest.tag");
+    cmp_op = "!=" if negate else "==";
+    return self.builder.icmp_unsigned(
+        cmp_op, tag, ir.Constant(i8, 8), name="jv.nonetest"
+    );
+}
 
 impl NaIRGenPass._coerce_type(val: ir.Value, target_type: ir.Type) -> ir.Value {
     _was_owned = self._is_owned(val);
@@ -595,18 +789,76 @@ impl NaIRGenPass._coerce_type(val: ir.Value, target_type: ir.Type) -> ir.Value {
     return _result;
 }
 
-"""Original coerce-type body — emits the actual cast/bitcast/inttoptr IR.
-Called only via _coerce_type so the ownership marker stays attached.
-"""
+impl NaIRGenPass._jac_optional_type(payload: ir.Type) -> ir.Type {
+    key = str(payload);
+    _existing = self._opt_struct_types.get(key);
+    if _existing is not None {
+        return _existing;
+    }
+    n = len(self._opt_struct_types) + 1;
+    st = self.llvm_module.context.get_identified_type(f"JacOpt.{n}");
+    st.set_body(ir.IntType(8), payload);
+    self._opt_struct_types[key] = st;
+    return st;
+}
+
+impl NaIRGenPass._opt_payload_of(t: ir.Type) -> (ir.Type | None) {
+    _nm: any = t?.name;
+    if isinstance(_nm, str) and _nm.startswith("JacOpt.") {
+        return t.elements[1];
+    }
+    return None;
+}
+
 impl NaIRGenPass._coerce_type_inner(val: ir.Value, target_type: ir.Type) -> ir.Value {
     if val.type == target_type {
         return val;
     }
-    # Gradual `any` boxing/unboxing — the single seam through which scalar/pointer
-    # values cross the `JacVal` (tagged-union) boundary. Routing it here means call
-    # args, returns, local assignments, and every list/dict/tuple element coercion
-    # round-trip `any` faithfully (sv parity) instead of mismatching or corrupting
-    # the value at each site. See #6449.
+
+    _opt_tgt = self._opt_payload_of(target_type);
+    if _opt_tgt is not None {
+        if isinstance(val.type, (ir.PointerType, ir.VoidType)) {
+            return ir.Constant(target_type, None);
+        }
+        _pv = self._coerce_type_inner(val, _opt_tgt);
+        _ov = self.builder.insert_value(
+            ir.Constant(target_type, None),
+            ir.Constant(ir.IntType(8), 1),
+            0,
+            name="opt.tag"
+        );
+        return self.builder.insert_value(_ov, _pv, 1, name="opt.wrap");
+    }
+    _opt_src = self._opt_payload_of(val.type);
+    if _opt_src is not None {
+        _tag = self.builder.extract_value(val, 0, name="opt.tag.rd");
+        _tag_set = self.builder.icmp_signed(
+            "!=", _tag, ir.Constant(ir.IntType(8), 0), name="opt.has"
+        );
+        if isinstance(target_type, ir.IntType) and target_type.width == 1 {
+            return _tag_set;
+        }
+        _pl = self.builder.extract_value(val, 1, name="opt.payload");
+        if self?.jacval_type and target_type == self.jacval_type {
+            _boxed = self._box_to_jacval(_pl);
+            _none_jv = self.builder.insert_value(
+                ir.Constant(self.jacval_type, None),
+                ir.Constant(ir.IntType(8), 8),
+                0,
+                name="opt.none.jv"
+            );
+            return self.builder.select(_tag_set, _boxed, _none_jv, name="opt.tojv");
+        }
+
+        _is_none = self.builder.icmp_signed(
+            "==", _tag, ir.Constant(ir.IntType(8), 0), name="opt.isnone"
+        );
+        self._emit_runtime_raise(
+            _is_none, "TypeError", "value is None where a value is required"
+        );
+        return self._coerce_type_inner(_pl, target_type);
+    }
+
     if self?.jacval_type {
         if target_type == self.jacval_type and val.type != self.jacval_type {
             return self._box_to_jacval(val);
@@ -615,69 +867,112 @@ impl NaIRGenPass._coerce_type_inner(val: ir.Value, target_type: ir.Type) -> ir.V
             return self._unbox_from_jacval(val, target_type);
         }
     }
-    # Int → Double (f64)
+
     if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.DoubleType) {
         return self.builder.sitofp(val, target_type, name="cast");
     }
-    # Int → Float (f32)
+
     if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.FloatType) {
         return self.builder.sitofp(val, target_type, name="cast.f32");
     }
-    # Double (f64) → Int
+
     if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.IntType) {
         return self.builder.fptosi(val, target_type, name="cast");
     }
-    # Float (f32) → Int
+
     if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.IntType) {
         return self.builder.fptosi(val, target_type, name="cast.i");
     }
-    # Double (f64) → Float (f32)
+
     if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType) {
         return self.builder.fptrunc(val, target_type, name="fptrunc");
     }
-    # Float (f32) → Double (f64)
+
     if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.DoubleType) {
         return self.builder.fpext(val, target_type, name="fpext");
     }
-    # Pointer-to-pointer bitcast (e.g., different struct pointer types)
+
+    _clos_tgt = self._closure_struct_of(target_type);
+    if _clos_tgt is not None {
+        _src_is_fn = isinstance(val.type, ir.FunctionType)
+            or (
+                isinstance(val.type, ir.PointerType)
+                and isinstance(val.type.pointee, ir.FunctionType)
+            );
+        if _src_is_fn {
+            if self._pending_lambda_captures is not None {
+                self._pending_lambda_captures = None;
+                self.emit(
+                    E5092,
+                    kind="expression",
+                    name="capturing lambda used as a value",
+                    help_text="This lambda captures enclosing locals that could not be promoted to shared heap cells in this frame, so it cannot escape as a value here. Bind the lambda's inputs through parameters, or use a named nested function."
+                );
+                return ir.Constant(target_type, None);
+            }
+            if self.rc_alloc_fn is None {
+                self._emit_rc_helpers();
+            }
+            _wi32 = ir.IntType(32);
+            _wi64 = ir.IntType(64);
+            _wi8p = ir.IntType(8).as_pointer();
+            _wfn = val;
+            if isinstance(_wfn.type, ir.FunctionType) {
+                _wfn = self.builder.bitcast(
+                    _wfn, _wfn.type.as_pointer(), name="clos.wrap.fnp"
+                );
+            }
+            _wclos = self._alloc_iter_struct(_clos_tgt);
+            _wfn_slot = self.builder.gep(
+                _wclos,
+                [ir.Constant(_wi32, 0), ir.Constant(_wi32, 0)],
+                name="clos.wrap.fn.slot"
+            );
+            self.builder.store(
+                self.builder.ptrtoint(_wfn, _wi64, name="clos.wrap.fn.i64"), _wfn_slot
+            );
+            _wenv_slot = self.builder.gep(
+                _wclos,
+                [ir.Constant(_wi32, 0), ir.Constant(_wi32, 1)],
+                name="clos.wrap.env.slot"
+            );
+            self.builder.store(ir.Constant(_wi8p, None), _wenv_slot);
+            self._mark_owned(_wclos);
+            return _wclos;
+        }
+    }
+
     if isinstance(val.type, ir.PointerType)
-    and isinstance(target_type, ir.PointerType) {
+        and isinstance(target_type, ir.PointerType) {
         return self.builder.bitcast(val, target_type, name="ptrcast");
     }
-    # ir.Function (type=FunctionType) → ir.PointerType(FunctionType).
-    # In LLVM IR, a function reference IS its own pointer; bitcast makes
-    # the type match when passing a named def as a Callable argument.
+
     if isinstance(val.type, ir.FunctionType)
-    and isinstance(target_type, ir.PointerType) {
+        and isinstance(target_type, ir.PointerType) {
         return self.builder.bitcast(val, target_type, name="fn.cast");
     }
-    # ir.Function (type=FunctionType) → ir.IntType (e.g. i64).
-    # C FFI callbacks declared as i64 (raw function pointer integer):
-    #   uv_timer_start(timer, cb: i64, ...)
-    # Emit: ptrtoint(bitcast(@fn to fntype*), i64)
+
     if isinstance(val.type, ir.FunctionType) and isinstance(target_type, ir.IntType) {
         fn_ptr = self.builder.bitcast(val, val.type.as_pointer(), name="fn.ptr");
         return self.builder.ptrtoint(fn_ptr, target_type, name="fn.ptrtoint");
     }
-    # PointerType(FunctionType) → IntType: fn pointer already coerced to ptr, ptrtoint it.
-    # This handles the case where _codegen_name already loaded a function reference
-    # as a function-pointer type (void(i64)*) and the C param is i64.
+
     if isinstance(val.type, ir.PointerType)
-    and isinstance(val.type.pointee, ir.FunctionType)
-    and isinstance(target_type, ir.IntType) {
+        and isinstance(val.type.pointee, ir.FunctionType)
+        and isinstance(target_type, ir.IntType) {
         return self.builder.ptrtoint(val, target_type, name="fn.ptrtoint");
     }
-    # Struct pointer → struct value (Jac pointer → C value at call boundary)
+
     if isinstance(val.type, ir.PointerType)
-    and not isinstance(target_type, ir.PointerType) {
+        and not isinstance(target_type, ir.PointerType) {
         if val.type?.pointee and val.type.pointee == target_type {
             return self.builder.load(val, name="struct.unbox");
         }
-        # Struct pointer → ABI integer (e.g., %Color* → i32 for small C structs)
+
         if isinstance(target_type, ir.IntType) and val.type?.pointee {
             for (sname, abi_type) in self.clib_struct_abi_types.items() {
                 if val.type.pointee == self.struct_types.get(sname)
-                and abi_type == target_type {
+                    and abi_type == target_type {
                     int_ptr = self.builder.bitcast(
                         val, target_type.as_pointer(), name="struct.abi.cast"
                     );
@@ -685,44 +980,42 @@ impl NaIRGenPass._coerce_type_inner(val: ir.Value, target_type: ir.Type) -> ir.V
                 }
             }
         }
-        # Null pointer → integer -1 sentinel (e.g., None for optional enum T | None)
+
         if isinstance(target_type, ir.IntType) and isinstance(val, ir.Constant) {
             return ir.Constant(target_type, -1);
         }
-        # Generic PointerType → IntType: ptrtoint.
-        # Needed for passing Jac obj references (struct pointers) or str (i8*)
-        # to C functions declared with int params, e.g. uv_fs_write(bufs: int).
+
         if isinstance(target_type, ir.IntType) {
             return self.builder.ptrtoint(val, target_type, name="ptr.toint");
         }
     }
-    # Struct value → struct pointer (C value → Jac pointer at call boundary)
+
     if not isinstance(val.type, ir.PointerType)
-    and isinstance(target_type, ir.PointerType) {
+        and isinstance(target_type, ir.PointerType) {
         if target_type?.pointee and target_type.pointee == val.type {
             null_ptr = ir.Constant(target_type, None);
             size_gep = self.builder.gep(
                 null_ptr, [ir.Constant(ir.IntType(32), 1)], name="clib.sizeof.gep"
             );
             size = self.builder.ptrtoint(size_gep, ir.IntType(64), name="clib.sizeof");
-            # Read jac_loc stamped by _codegen_tuple_val so attribution is precise.
+
             _clib_loc = getattr(val, 'jac_loc', '');
             raw_ptr = self._rc_call_with_ctx(
                 self.rc_alloc_fn, [size], op="box", loc=_clib_loc, name="clib.box.raw"
             );
             typed_ptr = self.builder.bitcast(raw_ptr, target_type, name="clib.box.ptr");
             self.builder.store(val, typed_ptr);
-            # RC: fresh alloc is owned (RC=1) — mark so callers skip extra retain.
+
             self._mark_owned(typed_ptr);
-            # Tag as "tuple" so RC debug log shows the type instead of "raw".
+
             self._emit_set_type_tag(self.builder, raw_ptr, "tuple");
             return typed_ptr;
         }
-        # ABI integer → struct pointer (e.g., i32 → %Color* for small C struct returns)
+
         if isinstance(val.type, ir.IntType) and target_type?.pointee {
             for (sname, abi_type) in self.clib_struct_abi_types.items() {
                 if target_type.pointee == self.struct_types.get(sname)
-                and abi_type == val.type {
+                    and abi_type == val.type {
                     null_ptr = ir.Constant(target_type, None);
                     size_gep = self.builder.gep(
                         null_ptr,
@@ -742,22 +1035,20 @@ impl NaIRGenPass._coerce_type_inner(val: ir.Value, target_type: ir.Type) -> ir.V
                     typed_ptr = self.builder.bitcast(
                         raw_ptr, target_type, name="clib.box.ptr"
                     );
-                    # RC: fresh alloc is owned (RC=1) — mark so callers skip extra retain.
+
                     self._mark_owned(typed_ptr);
-                    # Tag as the struct name so RC debug log shows the type.
+
                     self._emit_set_type_tag(self.builder, raw_ptr, sname);
                     return typed_ptr;
                 }
             }
         }
     }
-    # Generic IntType → PointerType: inttoptr.
-    # Needed for assigning calloc/malloc results (i64) to pointer-typed
-    # variables like str (i8*) or obj references, e.g. `txt: str = calloc_result;`
+
     if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.PointerType) {
         return self.builder.inttoptr(val, target_type, name="int.toptr");
     }
-    # Int width coercion (i1 to i64, etc.)
+
     if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType) {
         if val.type.width < target_type.width {
             return self.builder.zext(val, target_type, name="zext");
@@ -765,11 +1056,10 @@ impl NaIRGenPass._coerce_type_inner(val: ir.Value, target_type: ir.Type) -> ir.V
             return self.builder.trunc(val, target_type, name="trunc");
         }
     }
-    # Value tuple auto-boxing: box to pointer then coerce if needed.
-    # Detects tuples by checking all elements are primitive (not overflow {i64, i1} etc.)
+
     if isinstance(val.type, ir.LiteralStructType)
-    and val.type != target_type
-    and len(val.type.elements) >= 2 {
+        and val.type != target_type
+        and len(val.type.elements) >= 2 {
         _all_prim = True;
         for _el in val.type.elements {
             if not isinstance(
@@ -784,11 +1074,11 @@ impl NaIRGenPass._coerce_type_inner(val: ir.Value, target_type: ir.Type) -> ir.V
             if boxed.type == target_type {
                 return boxed;
             }
-            # Pointer-to-pointer bitcast (e.g., {i64,i64}* → i8*)
+
             if isinstance(boxed.type, ir.PointerType)
-            and isinstance(target_type, ir.PointerType) {
+                and isinstance(target_type, ir.PointerType) {
                 _cast = self.builder.bitcast(boxed, target_type, name="tuple.box.cast");
-                # RC: bitcast of owned boxed tuple is still owned.
+
                 self._mark_owned(_cast);
                 return _cast;
             }
@@ -797,41 +1087,45 @@ impl NaIRGenPass._coerce_type_inner(val: ir.Value, target_type: ir.Type) -> ir.V
     return val;
 }
 
-"""Promote both operands to float if either is float."""
 impl NaIRGenPass._promote_to_float(
     left: ir.Value, right: ir.Value
 ) -> tuple[(ir.Value, ir.Value)] {
-    if isinstance(left.type, ir.IntType) {
-        left = self.builder.sitofp(left, ir.DoubleType(), name="cast");
+    f64 = ir.DoubleType();
+    if isinstance(left.type, (ir.IntType, ir.FloatType)) {
+        left = self._coerce_type(left, f64);
     }
-    if isinstance(right.type, ir.IntType) {
-        right = self.builder.sitofp(right, ir.DoubleType(), name="cast");
+    if isinstance(right.type, (ir.IntType, ir.FloatType)) {
+        right = self._coerce_type(right, f64);
     }
     return (left, right);
 }
 
-"""Emit a binary operation."""
 impl NaIRGenPass._emit_binary_op(
     op: str, left: ir.Value, right: ir.Value
 ) -> (ir.Value | None) {
-    # String concatenation (i8* + i8*) — check before numeric dispatch
+    if isinstance(left.type, ir.PointerType)
+        or isinstance(right.type, ir.PointerType) {
+        _dunder_res = self._emit_arch_dunder_binop(op, left, right);
+        if _dunder_res is not None {
+            return _dunder_res;
+        }
+    }
+
+    if self._opt_payload_of(left.type) is not None {
+        left = self._coerce_type(left, self._opt_payload_of(left.type));
+    }
+    if self._opt_payload_of(right.type) is not None {
+        right = self._coerce_type(right, self._opt_payload_of(right.type));
+    }
     i8p_type = ir.IntType(8).as_pointer();
     if op == Tok.PLUS and left.type == i8p_type and right.type == i8p_type {
-        strlen_fn = self._get_or_declare_extern(
-            "strlen", ir.IntType(64), [ir.IntType(8).as_pointer()]
+        _i8p_cc = ir.IntType(8).as_pointer();
+        _i64_cc = ir.IntType(64);
+        memcpy_cc = self._get_or_declare_extern(
+            "memcpy", _i8p_cc, [_i8p_cc, _i8p_cc, _i64_cc]
         );
-        strcpy_fn = self._get_or_declare_extern(
-            "strcpy",
-            ir.IntType(8).as_pointer(),
-            [ir.IntType(8).as_pointer(), ir.IntType(8).as_pointer()]
-        );
-        strcat_fn = self._get_or_declare_extern(
-            "strcat",
-            ir.IntType(8).as_pointer(),
-            [ir.IntType(8).as_pointer(), ir.IntType(8).as_pointer()]
-        );
-        len1 = self.builder.call(strlen_fn, [left], name="len1");
-        len2 = self.builder.call(strlen_fn, [right], name="len2");
+        len1 = self._call_str_len(self.builder, left, name="len1");
+        len2 = self._call_str_len(self.builder, right, name="len2");
         total = self.builder.add(len1, len2, name="total_len");
         buf_size = self.builder.add(
             total, ir.Constant(ir.IntType(64), 1), name="buf_size"
@@ -844,14 +1138,48 @@ impl NaIRGenPass._emit_binary_op(
             loc=_concat_loc,
             name="concat.buf"
         );
-        self.builder.call(strcpy_fn, [buf, left]);
-        self.builder.call(strcat_fn, [buf, right]);
-        # RC: caller owns this freshly-allocated concat result (rc=1 from malloc).
-        # Mark it so the assign handler skips the extra RETAIN (avoiding rc=2 leak).
+        self.builder.call(memcpy_cc, [buf, left, len1]);
+        _cc_dst2 = self.builder.gep(buf, [len1], name="concat.dst2");
+        self.builder.call(memcpy_cc, [_cc_dst2, right, len2]);
+        _cc_end = self.builder.gep(buf, [total], name="concat.end");
+        self.builder.store(ir.Constant(ir.IntType(8), 0), _cc_end);
+        self._emit_set_type_tag(self.builder, buf, "str");
+        self._stamp_str_len(self.builder, buf, total);
+
         self._mark_owned(buf);
         return buf;
     }
-    # String repeat (i8* * i64 or i64 * i8*): allocate n*len buffer, loop-copy
+
+    if op == Tok.PLUS and self._is_bytes_value(left) and self._is_bytes_value(right) {
+        i8p = ir.IntType(8).as_pointer();
+        i64 = ir.IntType(64);
+        llen = self._bytes_len_val(left);
+        rlen = self._bytes_len_val(right);
+        total = self.builder.add(llen, rlen, name="by.cat.total");
+        result = self._bytes_alloc(total);
+        dst = self._bytes_data_ptr(result);
+        memcpy_fn = self._get_or_declare_extern("memcpy", i8p, [i8p, i8p, i64]);
+        self.builder.call(memcpy_fn, [dst, self._bytes_data_ptr(left), llen]);
+        rdst = self.builder.gep(dst, [llen], name="by.cat.rdst");
+        self.builder.call(memcpy_fn, [rdst, self._bytes_data_ptr(right), rlen]);
+        return result;
+    }
+
+    if op == Tok.STAR_MUL {
+        by_val: (ir.Value | None) = None;
+        rep_val: (ir.Value | None) = None;
+        if self._is_bytes_value(left) and isinstance(right.type, ir.IntType) {
+            by_val = left;
+            rep_val = right;
+        } elif self._is_bytes_value(right) and isinstance(left.type, ir.IntType) {
+            by_val = right;
+            rep_val = left;
+        }
+        if by_val is not None and rep_val is not None {
+            return self._emit_bytes_repeat(by_val, rep_val);
+        }
+    }
+
     if op == Tok.STAR_MUL {
         str_val: (ir.Value | None) = None;
         int_val: (ir.Value | None) = None;
@@ -866,9 +1194,15 @@ impl NaIRGenPass._emit_binary_op(
             i8 = ir.IntType(8);
             i8p = i8.as_pointer();
             i64 = ir.IntType(64);
-            strlen_fn = self._get_or_declare_extern("strlen", i64, [i8p]);
             memcpy_fn = self._get_or_declare_extern("memcpy", i8p, [i8p, i8p, i64]);
-            slen = self.builder.call(strlen_fn, [str_val], name="rep.slen");
+            slen = self._call_str_len(self.builder, str_val, name="rep.slen");
+
+            _rep_neg = self.builder.icmp_signed(
+                "<", int_val, ir.Constant(i64, 0), name="rep.neg"
+            );
+            int_val = self.builder.select(
+                _rep_neg, ir.Constant(i64, 0), int_val, name="rep.n"
+            );
             total = self.builder.mul(slen, int_val, name="rep.total");
             alloc = self.builder.add(total, ir.Constant(i64, 1), name="rep.alloc");
             self._set_rc_ctx("str_repeat", "");
@@ -898,10 +1232,12 @@ impl NaIRGenPass._emit_binary_op(
             self.builder.position_at_start(done_bb);
             null_ptr = self.builder.gep(buf, [total], name="rep.null");
             self.builder.store(ir.Constant(i8, 0), null_ptr);
+            self._emit_set_type_tag(self.builder, buf, "str");
+            self._stamp_str_len(self.builder, buf, total);
             return buf;
         }
     }
-    # List multiplication (list * int or int * list): repeat list n times
+
     if op == Tok.STAR_MUL {
         for (lmul_key, lmul_helpers) in self.list_helpers.items() {
             lmul_type = self.list_types.get(lmul_key);
@@ -911,11 +1247,11 @@ impl NaIRGenPass._emit_binary_op(
             lmul_list: (ir.Value | None) = None;
             lmul_int: (ir.Value | None) = None;
             if left.type == lmul_type.as_pointer()
-            and isinstance(right.type, ir.IntType) {
+                and isinstance(right.type, ir.IntType) {
                 lmul_list = left;
                 lmul_int = right;
             } elif right.type == lmul_type.as_pointer()
-            and isinstance(left.type, ir.IntType) {
+                and isinstance(left.type, ir.IntType) {
                 lmul_list = right;
                 lmul_int = left;
             }
@@ -969,20 +1305,20 @@ impl NaIRGenPass._emit_binary_op(
                 lmul_rep.add_incoming(lmul_nr, lmul_onext_bb);
                 self.builder.branch(lmul_outer_bb);
                 self.builder.position_at_start(lmul_done_bb);
-                return lmul_new;
+                return self._mark_owned(lmul_new);
             }
         }
     }
-    # List concatenation (list_ptr + list_ptr): create new list, append all
+
     if op == Tok.PLUS {
         for (list_key, helpers) in self.list_helpers.items() {
             list_type = self.list_types.get(list_key);
             if list_type is not None
-            and left.type == list_type.as_pointer()
-            and right.type == list_type.as_pointer() {
+                and left.type == list_type.as_pointer()
+                and right.type == list_type.as_pointer() {
                 i64 = ir.IntType(64);
                 new_list = self.builder.call(helpers["new"], [], name="lcat.new");
-                # Append all from left
+
                 left_len = self.builder.call(helpers["len"], [left], name="lcat.llen");
                 func = self.builder.basic_block.function;
                 entry_bb = self.builder.basic_block;
@@ -1006,7 +1342,7 @@ impl NaIRGenPass._emit_binary_op(
                 n1 = self.builder.add(i1, ir.Constant(i64, 1), name="lcat.n1");
                 i1.add_incoming(n1, body1_bb);
                 self.builder.branch(loop1_bb);
-                # Append all from right
+
                 self.builder.position_at_start(mid_bb);
                 right_len = self.builder.call(
                     helpers["len"], [right], name="lcat.rlen"
@@ -1028,11 +1364,11 @@ impl NaIRGenPass._emit_binary_op(
                 i2.add_incoming(n2, body2_bb);
                 self.builder.branch(loop2_bb);
                 self.builder.position_at_start(done_bb);
-                return new_list;
+                return self._mark_owned(new_list);
             }
         }
     }
-    # Set operators (set_ptr op set_ptr): |, &, -, ^
+
     for (sk, st) in self.set_types.items() {
         if left.type == st.as_pointer() and right.type == st.as_pointer() {
             self._ensure_emitters();
@@ -1055,7 +1391,7 @@ impl NaIRGenPass._emit_binary_op(
             break;
         }
     }
-    # Complex arithmetic (JacComplex* op JacComplex*)
+
     ctype_ptr = self.complex_struct_type.as_pointer();
     if left.type == ctype_ptr and right.type == ctype_ptr {
         f64 = ir.DoubleType();
@@ -1084,7 +1420,6 @@ impl NaIRGenPass._emit_binary_op(
             rr = self.builder.fsub(ar, br, name="c.sub.r");
             ri = self.builder.fsub(ai, bi, name="c.sub.i");
         } elif op == Tok.STAR_MUL {
-            # (ar*br - ai*bi, ar*bi + ai*br)
             rr = self.builder.fsub(
                 self.builder.fmul(ar, br, name="c.m1"),
                 self.builder.fmul(ai, bi, name="c.m2"),
@@ -1096,7 +1431,6 @@ impl NaIRGenPass._emit_binary_op(
                 name="c.mul.i"
             );
         } elif op == Tok.DIV {
-            # (ar*br + ai*bi)/(br*br + bi*bi), (ai*br - ar*bi)/(br*br + bi*bi)
             denom = self.builder.fadd(
                 self.builder.fmul(br, br, name="c.d1"),
                 self.builder.fmul(bi, bi, name="c.d2"),
@@ -1122,7 +1456,6 @@ impl NaIRGenPass._emit_binary_op(
             );
         }
         if rr is not None and ri is not None {
-            # Allocate result complex struct
             raw = self.builder.call(
                 self.rc_alloc_fn, [ir.Constant(i64, 16)], name="c.res.raw"
             );
@@ -1132,8 +1465,10 @@ impl NaIRGenPass._emit_binary_op(
             return ptr;
         }
     }
-    is_float = isinstance(left.type, ir.DoubleType)
-    or isinstance(right.type, ir.DoubleType);
+
+    is_float = isinstance(left.type, (ir.DoubleType, ir.FloatType))
+        or isinstance(right.type, (ir.DoubleType, ir.FloatType))
+        or op == Tok.DIV;
     if is_float {
         (left, right) = self._promote_to_float(left, right);
     }
@@ -1145,7 +1480,6 @@ impl NaIRGenPass._emit_binary_op(
         } elif op == Tok.STAR_MUL {
             return self.builder.fmul(left, right, name="fmul");
         } elif op == Tok.DIV {
-            # ZeroDivisionError check for float division
             fzero = ir.Constant(ir.DoubleType(), 0.0);
             is_zero = self.builder.fcmp_ordered(
                 "==", right, fzero, name="fdiv.zero.chk"
@@ -1155,7 +1489,6 @@ impl NaIRGenPass._emit_binary_op(
             );
             return self.builder.fdiv(left, right, name="fdiv");
         } elif op == Tok.MOD {
-            # ZeroDivisionError check for float modulo
             fzero = ir.Constant(ir.DoubleType(), 0.0);
             is_zero = self.builder.fcmp_ordered(
                 "==", right, fzero, name="fmod.zero.chk"
@@ -1165,7 +1498,6 @@ impl NaIRGenPass._emit_binary_op(
             );
             return self.builder.frem(left, right, name="fmod");
         } elif op == Tok.FLOOR_DIV {
-            # Float floor division: fdiv then floor
             fzero = ir.Constant(ir.DoubleType(), 0.0);
             is_zero = self.builder.fcmp_ordered(
                 "==", right, fzero, name="ffloordiv.zero.chk"
@@ -1180,13 +1512,18 @@ impl NaIRGenPass._emit_binary_op(
             return self.builder.call(floor_fn, [raw], name="ffloordiv");
         }
     } else {
-        i64 = ir.IntType(64);
+        if left.type.width < right.type.width {
+            left = self.builder.sext(left, right.type, name="int.sext.l");
+        } elif right.type.width < left.type.width {
+            right = self.builder.sext(right, left.type, name="int.sext.r");
+        }
+        int_ty = left.type;
+        _w = int_ty.width;
         i1 = ir.IntType(1);
         if op == Tok.PLUS {
-            # OverflowError check via LLVM intrinsic
-            overflow_ret = ir.LiteralStructType([i64, i1]);
+            overflow_ret = ir.LiteralStructType([int_ty, i1]);
             intrinsic = self._get_or_declare_extern(
-                "llvm.sadd.with.overflow.i64", overflow_ret, [i64, i64]
+                f"llvm.sadd.with.overflow.i{_w}", overflow_ret, [int_ty, int_ty]
             );
             result = self.builder.call(intrinsic, [left, right], name="add.ovf");
             val = self.builder.extract_value(result, 0, name="add.val");
@@ -1194,10 +1531,9 @@ impl NaIRGenPass._emit_binary_op(
             self._emit_runtime_raise(overflow, "OverflowError", "integer overflow");
             return val;
         } elif op == Tok.MINUS {
-            # OverflowError check via LLVM intrinsic
-            overflow_ret = ir.LiteralStructType([i64, i1]);
+            overflow_ret = ir.LiteralStructType([int_ty, i1]);
             intrinsic = self._get_or_declare_extern(
-                "llvm.ssub.with.overflow.i64", overflow_ret, [i64, i64]
+                f"llvm.ssub.with.overflow.i{_w}", overflow_ret, [int_ty, int_ty]
             );
             result = self.builder.call(intrinsic, [left, right], name="sub.ovf");
             val = self.builder.extract_value(result, 0, name="sub.val");
@@ -1205,27 +1541,17 @@ impl NaIRGenPass._emit_binary_op(
             self._emit_runtime_raise(overflow, "OverflowError", "integer overflow");
             return val;
         } elif op == Tok.STAR_MUL {
-            # OverflowError check via LLVM intrinsic
-            overflow_ret = ir.LiteralStructType([i64, i1]);
+            overflow_ret = ir.LiteralStructType([int_ty, i1]);
             intrinsic = self._get_or_declare_extern(
-                "llvm.smul.with.overflow.i64", overflow_ret, [i64, i64]
+                f"llvm.smul.with.overflow.i{_w}", overflow_ret, [int_ty, int_ty]
             );
             result = self.builder.call(intrinsic, [left, right], name="mul.ovf");
             val = self.builder.extract_value(result, 0, name="mul.val");
             overflow = self.builder.extract_value(result, 1, name="mul.overflow");
             self._emit_runtime_raise(overflow, "OverflowError", "integer overflow");
             return val;
-        } elif op == Tok.DIV {
-            # ZeroDivisionError check for integer division
-            izero = ir.Constant(i64, 0);
-            is_zero = self.builder.icmp_signed("==", right, izero, name="div.zero.chk");
-            self._emit_runtime_raise(
-                is_zero, "ZeroDivisionError", "integer division or modulo by zero"
-            );
-            return self.builder.sdiv(left, right, name="div");
         } elif op == Tok.FLOOR_DIV {
-            # ZeroDivisionError check for floor division
-            izero = ir.Constant(i64, 0);
+            izero = ir.Constant(int_ty, 0);
             is_zero = self.builder.icmp_signed(
                 "==", right, izero, name="floordiv.zero.chk"
             );
@@ -1234,8 +1560,7 @@ impl NaIRGenPass._emit_binary_op(
             );
             return self.builder.sdiv(left, right, name="floordiv");
         } elif op == Tok.MOD {
-            # ZeroDivisionError check for integer modulo
-            izero = ir.Constant(i64, 0);
+            izero = ir.Constant(int_ty, 0);
             is_zero = self.builder.icmp_signed("==", right, izero, name="mod.zero.chk");
             self._emit_runtime_raise(
                 is_zero, "ZeroDivisionError", "integer division or modulo by zero"
@@ -1243,7 +1568,7 @@ impl NaIRGenPass._emit_binary_op(
             return self.builder.srem(left, right, name="mod");
         }
     }
-    # Power operator (integer exponentiation via loop, float via pow)
+
     if op == Tok.STAR_POW {
         if is_float {
             pow_fn = self._get_or_declare_extern(
@@ -1251,11 +1576,10 @@ impl NaIRGenPass._emit_binary_op(
             );
             return self.builder.call(pow_fn, [left, right], name="pow");
         } else {
-            # Integer power: use loop-based exponentiation
             return self._codegen_int_pow(left, right);
         }
     }
-    # Bitwise operators (integer only)
+
     if op == Tok.BW_AND {
         return self.builder.and_(left, right, name="bwand");
     }
@@ -1271,32 +1595,67 @@ impl NaIRGenPass._emit_binary_op(
     if op == Tok.RSHIFT {
         return self.builder.ashr(left, right, name="ashr");
     }
-    # Logical operators
+
     if op == Tok.KW_AND {
         return self.builder.and_(left, right, name="and");
     }
     if op == Tok.KW_OR {
         return self.builder.or_(left, right, name="or");
     }
-    # Unknown operator — surface a loud error instead of silently emitting
-    # a function body that reads garbage at runtime. Catches walrus (`:=`,
-    # WALRUS_EQ), pipe-forward (`|>`), and any other binary operator the
-    # NA pass doesn't lower yet.
-    self.emit(E5090, node_override=self.cur_node, kind="binary operator", name=op);
+
+    self.emit(E5092, node_override=self.cur_node, kind="binary operator", name=op);
     return None;
 }
 
-"""Emit a comparison operation."""
+impl NaIRGenPass._emit_arch_dunder_binop(
+    op: str, left: ir.Value, right: ir.Value
+) -> (ir.Value | None) {
+    import from jaclang.compiler.type_system.operations { BINARY_OPERATOR_MAP }
+    _pair = BINARY_OPERATOR_MAP.get(op);
+    if _pair is None {
+        return None;
+    }
+    (magic, rmagic) = _pair;
+
+    def _try_dispatch(
+        pass_ref: NaIRGenPass, recv: ir.Value, arg: ir.Value, mname: str
+    ) -> (ir.Value | None) {
+        if not isinstance(recv.type, ir.PointerType) {
+            return None;
+        }
+        arch = pass_ref._infer_type_name(recv);
+        if arch is None {
+            return None;
+        }
+        mfn = pass_ref._resolve_method(arch, mname);
+        if mfn is None or len(mfn.args) != 2 {
+            return None;
+        }
+        _dargs = [
+            pass_ref._coerce_type(recv, mfn.args[0].type),
+            pass_ref._coerce_type(arg, mfn.args[1].type)
+        ];
+        _dres = pass_ref.builder.call(mfn, _dargs, name=f"dunder.{mname}");
+        pass_ref._release_owned_args(_dargs, op="call_arg");
+        return _dres;
+    }
+
+    _res = _try_dispatch(self, left, right, magic);
+    if _res is not None {
+        return _res;
+    }
+    return _try_dispatch(self, right, left, rmagic);
+}
+
 impl NaIRGenPass._emit_comparison(
     op: str, left: ir.Value, right: ir.Value, is_float: bool
 ) -> (ir.Value | None) {
-    # Tuple comparison (value/pointer/mixed): must be before pointer block
     _l_is_tval = isinstance(left.type, ir.LiteralStructType);
     _r_is_tval = isinstance(right.type, ir.LiteralStructType);
     _l_is_tptr = isinstance(left.type, ir.PointerType)
-    and isinstance(left.type.pointee, ir.LiteralStructType);
+        and isinstance(left.type.pointee, ir.LiteralStructType);
     _r_is_tptr = isinstance(right.type, ir.PointerType)
-    and isinstance(right.type.pointee, ir.LiteralStructType);
+        and isinstance(right.type.pointee, ir.LiteralStructType);
     if _l_is_tval or _r_is_tval or _l_is_tptr or _r_is_tptr {
         tcmp_struct: (ir.LiteralStructType | None) = None;
         tcmp_left_val: (ir.Value | None) = None;
@@ -1307,27 +1666,27 @@ impl NaIRGenPass._emit_comparison(
             tcmp_left_val = left;
             tcmp_right_val = right;
         } elif _l_is_tptr
-        and _r_is_tptr
-        and str(left.type.pointee) == str(right.type.pointee) {
+            and _r_is_tptr
+            and str(left.type.pointee) == str(right.type.pointee) {
             tcmp_struct = left.type.pointee;
             tcmp_left_val = self.builder.load(left, name="tcmp.l.val");
             tcmp_right_val = self.builder.load(right, name="tcmp.r.val");
         } elif _l_is_tval
-        and _r_is_tptr
-        and str(left.type) == str(right.type.pointee) {
+            and _r_is_tptr
+            and str(left.type) == str(right.type.pointee) {
             tcmp_struct = left.type;
             tcmp_left_val = left;
             tcmp_right_val = self.builder.load(right, name="tcmp.r.val");
         } elif _r_is_tval
-        and _l_is_tptr
-        and str(right.type) == str(left.type.pointee) {
+            and _l_is_tptr
+            and str(right.type) == str(left.type.pointee) {
             tcmp_struct = right.type;
             tcmp_left_val = self.builder.load(left, name="tcmp.l.val");
             tcmp_right_val = right;
         }
         if tcmp_struct is not None
-        and tcmp_left_val is not None
-        and tcmp_right_val is not None {
+            and tcmp_left_val is not None
+            and tcmp_right_val is not None {
             n = len(tcmp_struct.elements);
             i1_t = ir.IntType(1);
             if op == Tok.EE or op == Tok.NE {
@@ -1441,22 +1800,73 @@ impl NaIRGenPass._emit_comparison(
             }
         }
     }
-    # Pointer comparisons
+
     if isinstance(left.type, ir.PointerType)
-    and isinstance(right.type, ir.PointerType) {
+        and isinstance(right.type, ir.PointerType) {
         i8_ptr = ir.IntType(8).as_pointer();
-        # String comparison: both operands must be i8* (char pointers)
+
+        if self._is_bytes_value(left) and self._is_bytes_value(right) {
+            if op == Tok.EE or op == Tok.NE {
+                return self._emit_bytes_eq(left, right, negate=op == Tok.NE);
+            }
+            if op in (Tok.LT, Tok.GT, Tok.LTE, Tok.GTE) {
+                _sym = "<"
+                    if op == Tok.LT
+                    else (">" if op == Tok.GT else ("<=" if op == Tok.LTE else ">="));
+                _ord = self._emit_bytes_cmp(left, right, _sym);
+                _zero = ir.Constant(ir.IntType(32), 0);
+                if op == Tok.LT {
+                    return self.builder.icmp_signed("<", _ord, _zero, name="by.lt");
+                }
+                if op == Tok.GT {
+                    return self.builder.icmp_signed(">", _ord, _zero, name="by.gt");
+                }
+                if op == Tok.LTE {
+                    return self.builder.icmp_signed("<=", _ord, _zero, name="by.lte");
+                }
+                return self.builder.icmp_signed(">=", _ord, _zero, name="by.gte");
+            }
+        }
+
         if left.type == i8_ptr and right.type == i8_ptr {
             strcmp_fn = self._get_or_declare_extern(
                 "strcmp", ir.IntType(32), [i8_ptr, i8_ptr]
             );
-            cmp_result = self.builder.call(strcmp_fn, [left, right], name="strcmp");
+            _strcmp_null = ir.Constant(i8_ptr, None);
+            _strcmp_empty = self.builder.bitcast(
+                self._make_global_string(""), i8_ptr, name="strcmp.empty"
+            );
+            _l_is_null = self.builder.icmp_unsigned(
+                "==", left, _strcmp_null, name="strcmp.lnull"
+            );
+            _r_is_null = self.builder.icmp_unsigned(
+                "==", right, _strcmp_null, name="strcmp.rnull"
+            );
+            _either_null = self.builder.or_(
+                _l_is_null, _r_is_null, name="strcmp.anynull"
+            );
+            _safe_left = self.builder.select(
+                _l_is_null, _strcmp_empty, left, name="strcmp.lsafe"
+            );
+            _safe_right = self.builder.select(
+                _r_is_null, _strcmp_empty, right, name="strcmp.rsafe"
+            );
+            cmp_result = self.builder.call(
+                strcmp_fn, [_safe_left, _safe_right], name="strcmp"
+            );
             zero = ir.Constant(ir.IntType(32), 0);
-            if op == Tok.EE {
-                return self.builder.icmp_signed("==", cmp_result, zero, name="streq");
-            } elif op == Tok.NE {
-                return self.builder.icmp_signed("!=", cmp_result, zero, name="strne");
-            } elif op == Tok.LT {
+            if op == Tok.EE or op == Tok.NE {
+                _sym = "==" if op == Tok.EE else "!=";
+                _nm = "streq" if op == Tok.EE else "strne";
+                _ptr_cmp = self.builder.icmp_unsigned(
+                    _sym, left, right, name=f"{_nm}.ptr"
+                );
+                _val_cmp = self.builder.icmp_signed(
+                    _sym, cmp_result, zero, name=f"{_nm}.val"
+                );
+                return self.builder.select(_either_null, _ptr_cmp, _val_cmp, name=_nm);
+            }
+            if op == Tok.LT {
                 return self.builder.icmp_signed("<", cmp_result, zero, name="strlt");
             } elif op == Tok.GT {
                 return self.builder.icmp_signed(">", cmp_result, zero, name="strgt");
@@ -1467,10 +1877,10 @@ impl NaIRGenPass._emit_comparison(
             }
             return None;
         }
-        # List comparison: detect list pointer types
+
         for (lcmp_key, lcmp_type) in self.list_types.items() {
             if left.type == lcmp_type.as_pointer()
-            and right.type == lcmp_type.as_pointer() {
+                and right.type == lcmp_type.as_pointer() {
                 lcmp_h = self.list_helpers.get(lcmp_key);
                 if lcmp_h is None {
                     break;
@@ -1483,7 +1893,6 @@ impl NaIRGenPass._emit_comparison(
                 lcmp_entry_bb = self.builder.basic_block;
                 lcmp_et = lcmp_h["elem_type"];
                 if op == Tok.EE or op == Tok.NE {
-                    # == : lengths equal AND all elements equal
                     lcmp_len_eq = self.builder.icmp_unsigned(
                         "==", lcmp_la, lcmp_lb, name="lcmp.leq"
                     );
@@ -1553,9 +1962,8 @@ impl NaIRGenPass._emit_comparison(
                     }
                     return lcmp_result;
                 }
-                # Lexicographic: <, >, <=, >=
+
                 if op in (Tok.LT, Tok.GT, Tok.LTE, Tok.GTE) {
-                    # min_len = min(la, lb)
                     lcmp_lt_len = self.builder.icmp_unsigned(
                         "<", lcmp_la, lcmp_lb, name="lcmp.lex.ltl"
                     );
@@ -1614,8 +2022,7 @@ impl NaIRGenPass._emit_comparison(
                             ">", lcmp_scmp2, lcmp_zero32, name="lcmp.lex.gt"
                         );
                     }
-                    # For < and <=: ea < eb → True, ea > eb → False
-                    # For > and >=: ea > eb → True, ea < eb → False
+
                     if op == Tok.LT or op == Tok.LTE {
                         self.builder.cbranch(
                             lcmp_lex_lt, lcmp_lex_true, lcmp_lex_lbody
@@ -1640,7 +2047,7 @@ impl NaIRGenPass._emit_comparison(
                     lcmp_li.add_incoming(lcmp_lni, lcmp_lex_next);
                     self.builder.branch(lcmp_lex_loop);
                     self.builder.position_at_start(lcmp_lex_after);
-                    # All common elements equal: compare lengths
+
                     if op == Tok.LT {
                         lcmp_len_res = self.builder.icmp_unsigned(
                             "<", lcmp_la, lcmp_lb, name="lcmp.llen"
@@ -1672,7 +2079,7 @@ impl NaIRGenPass._emit_comparison(
                 break;
             }
         }
-        # Set comparison: detect set pointer types
+
         for (sk, st) in self.set_types.items() {
             if left.type == st.as_pointer() and right.type == st.as_pointer() {
                 shelpers = self.set_helpers.get(sk);
@@ -1684,20 +2091,18 @@ impl NaIRGenPass._emit_comparison(
                         i64 = ir.IntType(64);
                         i1_t = ir.IntType(1);
                         if op == Tok.LTE {
-                            # a <= b: issubset(a, b)
                             sub_val = _se.emit_issubset(_ctx, left, [right]);
                             return self.builder.icmp_unsigned(
                                 "!=", sub_val, ir.Constant(i64, 0), name="sle"
                             );
                         }
                         if op == Tok.GTE {
-                            # a >= b: issubset(b, a)
                             sub_val = _se.emit_issubset(_ctx, right, [left]);
                             return self.builder.icmp_unsigned(
                                 "!=", sub_val, ir.Constant(i64, 0), name="sge"
                             );
                         }
-                        # ==, !=, <, > need length check + issubset
+
                         len_a = self.builder.call(
                             shelpers["len"], [left], name="scmp.la"
                         );
@@ -1705,7 +2110,6 @@ impl NaIRGenPass._emit_comparison(
                             shelpers["len"], [right], name="scmp.lb"
                         );
                         if op == Tok.EE or op == Tok.NE {
-                            # == : len(a)==len(b) and issubset(a,b)
                             len_eq = self.builder.icmp_unsigned(
                                 "==", len_a, len_b, name="scmp.leq"
                             );
@@ -1733,7 +2137,6 @@ impl NaIRGenPass._emit_comparison(
                             return result;
                         }
                         if op == Tok.LT {
-                            # a < b: len(a) < len(b) and issubset(a, b)
                             len_lt = self.builder.icmp_unsigned(
                                 "<", len_a, len_b, name="slt.lcmp"
                             );
@@ -1758,7 +2161,6 @@ impl NaIRGenPass._emit_comparison(
                             return result;
                         }
                         if op == Tok.GT {
-                            # a > b: len(b) < len(a) and issubset(b, a)
                             len_gt = self.builder.icmp_unsigned(
                                 "<", len_b, len_a, name="sgt.lcmp"
                             );
@@ -1787,15 +2189,15 @@ impl NaIRGenPass._emit_comparison(
                 break;
             }
         }
-        # Range comparison: JacRange* == / != JacRange*
+
         rtype_ptr = self.range_struct_type.as_pointer();
         if left.type == rtype_ptr
-        and right.type == rtype_ptr
-        and (op == Tok.EE or op == Tok.NE) {
+            and right.type == rtype_ptr
+            and (op == Tok.EE or op == Tok.NE) {
             i1_t = ir.IntType(1);
             i32 = ir.IntType(32);
             z0 = ir.Constant(i32, 0);
-            # Compare start, stop, step
+
             as_ = self.builder.load(
                 self.builder.gep(left, [z0, ir.Constant(i32, 0)], name="rcmp.as.p"),
                 name="rcmp.as"
@@ -1831,7 +2233,7 @@ impl NaIRGenPass._emit_comparison(
             }
             return result;
         }
-        # Complex comparison: JacComplex* == / != JacComplex*
+
         ctype_ptr = self.complex_struct_type.as_pointer();
         if left.type == ctype_ptr and right.type == ctype_ptr {
             i1_t = ir.IntType(1);
@@ -1859,7 +2261,7 @@ impl NaIRGenPass._emit_comparison(
                 return self.builder.not_(result, name="ceq.ne");
             }
         }
-        # For other pointer types (structs, tuples), use pointer comparison
+
         if op == Tok.EE {
             return self.builder.icmp_unsigned("==", left, right, name="ptreq");
         } elif op == Tok.NE {
@@ -1868,8 +2270,6 @@ impl NaIRGenPass._emit_comparison(
         return None;
     }
     if is_float {
-        # IEEE 754: != must use unordered compare so NaN != NaN → true.
-        # All other comparisons use ordered (NaN → false).
         if op == Tok.NE {
             return self.builder.fcmp_unordered("!=", left, right, name="fcmp");
         }
@@ -1893,14 +2293,20 @@ impl NaIRGenPass._emit_comparison(
             Tok.GTE: ">="
         };
         if op in icmp_map {
+            if isinstance(left.type, ir.IntType)
+                and isinstance(right.type, ir.IntType) {
+                if left.type.width < right.type.width {
+                    left = self.builder.sext(left, right.type, name="sext.l");
+                } elif right.type.width < left.type.width {
+                    right = self.builder.sext(right, left.type, name="sext.r");
+                }
+            }
             return self.builder.icmp_signed(icmp_map[op], left, right, name="icmp");
         }
     }
     return None;
 }
 
-# ─── Phase 1: Enums ──────────────────────────────────────────
-"""Infer the struct type name from an LLVM value's type."""
 impl NaIRGenPass._infer_type_name(val: ir.Value) -> (str | None) {
     if not isinstance(val.type, ir.PointerType) {
         return None;
@@ -1913,7 +2319,6 @@ impl NaIRGenPass._infer_type_name(val: ir.Value) -> (str | None) {
     return None;
 }
 
-"""Infer the list element type name from an LLVM value's type."""
 impl NaIRGenPass._infer_list_elem_type(val: ir.Value) -> (str | None) {
     if not isinstance(val.type, ir.PointerType) {
         return None;
@@ -1926,16 +2331,11 @@ impl NaIRGenPass._infer_list_elem_type(val: ir.Value) -> (str | None) {
     return None;
 }
 
-"""Infer the struct type name of a comprehension loop variable from its collection.
-For `for m in piece.raw_moves(self)`, returns 'Move' from the checked type of the
-collection expression (`list[Move]`, or `list[Move | None]` via the struct member).
-The checker owns this fact (Phase 0/1); the former AST call dissection +
-method_ast_sigs MRO walk re-derived it and is gone."""
 impl NaIRGenPass._infer_compr_elem_struct(compr: object) -> (str | None) {
     _coll_tk = self._type_key_of(compr.collection);
     if _coll_tk is not None
-    and _coll_tk.startswith("list[")
-    and _coll_tk.endswith("]") {
+        and _coll_tk.startswith("list[")
+        and _coll_tk.endswith("]") {
         _inner_tk = _coll_tk[5:-1];
         if _inner_tk in self.struct_types {
             return _inner_tk;
@@ -1948,4 +2348,3 @@ impl NaIRGenPass._infer_compr_elem_struct(compr: object) -> (str | None) {
     }
     return None;
 }
-# ─── Phase 7: String Methods and Builtins ─────────────────────

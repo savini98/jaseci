@@ -1,52 +1,45 @@
-"""Initialize the JacAutoLintPass."""
 impl JacAutoLintPass.postinit -> None {
-    import from jaclang.project.config { get_config }
-    config = get_config();
-    if config is not None and config.check?.lint {
+    import from jaclang.project.config {
+        JacConfig,
+        get_config_for_path,
+        get_explicit_config
+    }
+    import from pathlib { Path }
+
+    mod_path = self.ir_in.loc.mod_path if self.ir_in?.loc else None;
+    config = (
+        get_config_for_path(Path(mod_path)) if mod_path else get_explicit_config()
+    )
+        or JacConfig();
+    self._project_config = config;
+    if config.check?.lint {
         self._exclude_patterns = config.check.lint.exclude;
         self._project_root = str(config.project_root) if config.project_root else "";
     }
     super.postinit();
 }
 
-"""Check if a file path matches any exclude pattern."""
 impl JacAutoLintPass._is_file_excluded(file_path: str) -> bool {
-    import fnmatch;
-    import os;
-    if not self._exclude_patterns {
-        return False;
-    }
-    rel_path = file_path;
-    if self._project_root and file_path.startswith(self._project_root) {
-        rel_path = file_path[len(self._project_root):].lstrip(os.sep);
-    }
-    for pattern in self._exclude_patterns {
-        if fnmatch.fnmatch(rel_path, pattern)
-        or fnmatch.fnmatch(os.path.basename(file_path), pattern) {
-            return True;
-        }
-    }
-    return False;
+    import from jaclang.jac0core.helpers { path_matches_exclude }
+    return path_matches_exclude(file_path, self._exclude_patterns, self._project_root);
 }
 
-"""Remove empty parentheses from function signatures with no parameters."""
 impl JacAutoLintPass.exit_ability(ability_node: uni.Ability) -> None {
     if not self.lint_enabled {
         return;
     }
-    # Pop setter map pushed by _convert_usestate_vars.
-    # Only pops when not report_only — matches the push guard in enter_ability.
+
     if not self.report_only and self._pending_setters {
         self._pending_setters.pop();
     }
-    if not self.report_only and not self._is_suppressed(W3005) {
+    if not self._is_suppressed(W3005) {
         sig = ability_node.signature;
         if isinstance(sig, uni.FuncSignature) {
             self._remove_empty_parens_from_sig(ability_node, sig, "signature");
         }
     }
     if ability_node.body is not None and isinstance(ability_node.body, list) {
-        self._check_unnecessary_pass(list(ability_node.body), ability_node);
+        self._check_unnecessary_pass(list(ability_node.body));
     }
     name = ability_node.name_spec.sym_name if ability_node.name_spec else "<anonymous>";
     self._check_unnecessary_none_return(
@@ -55,11 +48,6 @@ impl JacAutoLintPass.exit_ability(ability_node: uni.Ability) -> None {
     self._check_stale_has_read(ability_node);
 }
 
-"""Remove @staticmethod decorator tokens and add static keyword to ability's kid list.
-
-This preserves original token objects (for comment associations) while
-removing only the @staticmethod decorator tokens and inserting the static keyword.
-"""
 impl JacAutoLintPass._remove_staticmethod_from_kids(ability_node: uni.Ability) -> None {
     new_kids: list[uni.UniNode] = [];
     i = 0;
@@ -118,8 +106,6 @@ impl JacAutoLintPass._remove_staticmethod_from_kids(ability_node: uni.Ability) -
     ability_node._invalidate_sub_node_tab();
 }
 
-"""Process ability to convert @staticmethod decorator to static keyword, __init__/__post_init__ to init/postinit,
-and combine consecutive has statements in function bodies."""
 impl JacAutoLintPass.enter_ability(ability_node: uni.Ability) -> None {
     if not self.lint_enabled or self.report_only {
         return;
@@ -147,33 +133,16 @@ impl JacAutoLintPass.enter_ability(ability_node: uni.Ability) -> None {
     if not self._is_suppressed(W3001) and ability_node.is_static {
         self._remove_staticmethod_from_kids(ability_node);
     }
-    # W3038: Convert useState hooks to has declarations before combining has statements
+
     if not self._is_suppressed(W3038) {
         self._convert_usestate_vars(ability_node);
     }
-    if ability_node.body is not None and isinstance(ability_node.body, list) {
-        old_body = list(ability_node.body);
-        new_body = self.combine_consecutive_has(old_body);
-        if len(new_body) != len(old_body)
-        and self.emit(W3002, node_override=ability_node) {
-            ability_node.body = new_body;
-            self.recalculate_parents(ability_node);
-            new_body_set = set(id(s) for s in new_body);
-            new_kid: list[uni.UniNode] = [];
-            for kid in ability_node.kid {
-                if not isinstance(kid, uni.ArchHas) or id(kid) in new_body_set {
-                    new_kid.append(kid);
-                }
-            }
-            ability_node.kid = new_kid;
-            ability_node._invalidate_sub_node_tab();
-        }
-    }
+    self._combine_has_in_node(ability_node);
     if not ability_node.is_method {
         return;
     }
     if not isinstance(ability_node.name_ref, uni.Name)
-    or isinstance(ability_node.name_ref, uni.SpecialVarRef) {
+        or isinstance(ability_node.name_ref, uni.SpecialVarRef) {
         return;
     }
     new_tok: Tok | None = None;
@@ -203,16 +172,17 @@ impl JacAutoLintPass.enter_ability(ability_node: uni.Ability) -> None {
     }
 }
 
-"""Process ImplDef to combine consecutive has statements."""
 impl JacAutoLintPass.enter_impl_def(nd: uni.ImplDef) -> None {
-    if not self.lint_enabled or self.report_only {
+    if not self.lint_enabled {
         return;
     }
     impl_node = nd;
-    # W3043: rewrite `impl Cls.prop` -> `impl Cls.prop.getter/.setter/.deleter`
-    # when the matched declaration is a @property accessor.
+
     if not self._is_suppressed(W3043) {
         self._convert_property_impl(impl_node);
+    }
+    if self.report_only {
+        return;
     }
     if not self._is_suppressed(W3010) {
         self._fix_impl_signature_mismatch(impl_node);
@@ -220,16 +190,15 @@ impl JacAutoLintPass.enter_impl_def(nd: uni.ImplDef) -> None {
     if impl_node.body is not None and isinstance(impl_node.body, list) {
         new_body = self.combine_consecutive_has(list(impl_node.body));
         if len(new_body) != len(impl_node.body)
-        and self.emit(W3002, node_override=impl_node) {
+            and self.emit(W3002, node_override=impl_node) {
             impl_node.body = new_body;
             self.recalculate_parents(impl_node);
         }
     }
 }
 
-"""Remove empty parentheses from impl signatures with no parameters."""
 impl JacAutoLintPass.exit_impl_def(nd: uni.ImplDef) -> None {
-    if not self.lint_enabled or self.report_only or self._is_suppressed(W3005) {
+    if not self.lint_enabled or self._is_suppressed(W3005) {
         return;
     }
     spec = nd.spec;
@@ -239,78 +208,31 @@ impl JacAutoLintPass.exit_impl_def(nd: uni.ImplDef) -> None {
     self._remove_empty_parens_from_sig(nd, spec, "spec");
 }
 
-"""Process Enum to combine consecutive has statements.
-
-This implementation avoids calling normalize() to preserve comment associations.
-We update the kid list by removing merged statements and keeping the combined ones.
-"""
 impl JacAutoLintPass.enter_enum(nd: uni.Enum) -> None {
     if not self.lint_enabled or self.report_only {
         return;
     }
     enum_node = nd;
-    if enum_node.body is not None and isinstance(enum_node.body, list) {
-        old_body = list(enum_node.body);
-        new_body = self.combine_consecutive_has(old_body);
-        if len(new_body) != len(old_body)
-        and self.emit(W3002, node_override=enum_node) {
-            enum_node.body = new_body;
-            self.recalculate_parents(enum_node);
-            new_body_set = set(id(s) for s in new_body);
-            new_kid: list[uni.UniNode] = [];
-            for kid in enum_node.kid {
-                if not isinstance(kid, uni.ArchHas) or id(kid) in new_body_set {
-                    new_kid.append(kid);
-                }
-            }
-            enum_node.kid = new_kid;
-            enum_node._invalidate_sub_node_tab();
-        }
-    }
+    self._combine_has_in_node(enum_node);
 }
 
-"""Process Archetype to combine consecutive has statements.
-
-This implementation avoids calling normalize() to preserve comment associations.
-We update the kid list by removing merged statements and keeping the combined ones.
-"""
 impl JacAutoLintPass.enter_archetype(nd: uni.Archetype) -> None {
-    if not self.lint_enabled or self.report_only {
+    if not self.lint_enabled {
         return;
     }
     arch = nd;
-    # W3043: convert @property/@x.setter/@x.deleter ability groups into a single
-    # native `has name: T { getter; setter; deleter; }` property declaration.
+
     if not self._is_suppressed(W3043)
-    and arch.body is not None
-    and isinstance(arch.body, list) {
+        and arch.body is not None
+        and isinstance(arch.body, list) {
         self._convert_properties(arch);
     }
-    if arch.body is not None and isinstance(arch.body, list) {
-        old_body = list(arch.body);
-        new_body = self.combine_consecutive_has(old_body);
-        if len(new_body) != len(old_body) and self.emit(W3002, node_override=arch) {
-            arch.body = new_body;
-            self.recalculate_parents(arch);
-            new_body_set = set(id(s) for s in new_body);
-            new_kid: list[uni.UniNode] = [];
-            for kid in arch.kid {
-                if not isinstance(kid, uni.ArchHas) or id(kid) in new_body_set {
-                    new_kid.append(kid);
-                }
-            }
-            arch.kid = new_kid;
-            arch._invalidate_sub_node_tab();
-        }
+    if self.report_only {
+        return;
     }
+    self._combine_has_in_node(arch);
 }
 
-"""Combine consecutive glob statements in a body list.
-
-This implementation avoids calling normalize() to preserve comment associations.
-Instead of creating a new node, we modify the first statement in place and
-manually build the kid list to include assignments from merged statements.
-"""
 impl JacAutoLintPass.combine_consecutive_glob(body: list) -> list {
     if len(body) <= 1 {
         return body;
@@ -328,7 +250,7 @@ impl JacAutoLintPass.combine_consecutive_glob(body: list) -> list {
                 next_stmt = body[j];
 
                 if isinstance(next_stmt, uni.GlobalVars)
-                and self.can_combine_glob(base_glob, next_stmt) {
+                    and self.can_combine_glob(base_glob, next_stmt) {
                     merged_globs.append(next_stmt);
                     j += 1;
                 } else {
@@ -337,8 +259,8 @@ impl JacAutoLintPass.combine_consecutive_glob(body: list) -> list {
             }
             all_single = all(len(g.assignments) == 1 for g in merged_globs);
             if len(merged_globs) > 1
-            and all_single
-            and self.emit(W3003, node_override=base_glob) {
+                and all_single
+                and self.emit(W3003, node_override=base_glob) {
                 combined_assignments: list[uni.Assignment] = [];
                 for glob in merged_globs {
                     combined_assignments.extend(glob.assignments);
@@ -379,12 +301,6 @@ impl JacAutoLintPass.combine_consecutive_glob(body: list) -> list {
     return new_body;
 }
 
-"""Combine consecutive has statements in a body list.
-
-This implementation avoids calling normalize() to preserve comment associations.
-Instead of creating a new node, we modify the first statement in place and
-manually build the kid list to include vars from merged statements.
-"""
 impl JacAutoLintPass.combine_consecutive_has(body: list) -> list {
     if len(body) <= 1 {
         return body;
@@ -402,7 +318,7 @@ impl JacAutoLintPass.combine_consecutive_has(body: list) -> list {
                 next_stmt = body[j];
 
                 if isinstance(next_stmt, uni.ArchHas)
-                and self.can_combine_has(base_has, next_stmt) {
+                    and self.can_combine_has(base_has, next_stmt) {
                     merged_has_list.append(next_stmt);
                     j += 1;
                 } else {
@@ -443,7 +359,28 @@ impl JacAutoLintPass.combine_consecutive_has(body: list) -> list {
     return new_body;
 }
 
-"""Check if two GlobalVars nodes can be combined (same access, frozen, no docstrings)."""
+impl JacAutoLintPass._combine_has_in_node(
+    nd: uni.Archetype | uni.Enum | uni.Ability
+) -> None {
+    if nd.body is not None and isinstance(nd.body, list) {
+        old_body = list(nd.body);
+        new_body = self.combine_consecutive_has(old_body);
+        if len(new_body) != len(old_body) and self.emit(W3002, node_override=nd) {
+            nd.body = new_body;
+            self.recalculate_parents(nd);
+            new_body_set = set(id(s) for s in new_body);
+            new_kid: list[uni.UniNode] = [];
+            for kid in nd.kid {
+                if not isinstance(kid, uni.ArchHas) or id(kid) in new_body_set {
+                    new_kid.append(kid);
+                }
+            }
+            nd.kid = new_kid;
+            nd._invalidate_sub_node_tab();
+        }
+    }
+}
+
 impl JacAutoLintPass.can_combine_glob(
     glob1: uni.GlobalVars, glob2: uni.GlobalVars
 ) -> bool {
@@ -461,9 +398,7 @@ impl JacAutoLintPass.can_combine_glob(
     return True;
 }
 
-"""Check if two ArchHas nodes can be combined (same static, access, frozen)."""
 impl JacAutoLintPass.can_combine_has(has1: uni.ArchHas, has2: uni.ArchHas) -> bool {
-    # Property has-vars (with accessor blocks) can never share a `has a, b;` line.
     for hv in list(has1.vars) + list(has2.vars) {
         if hv.accessors is not None {
             return False;
@@ -483,11 +418,6 @@ impl JacAutoLintPass.can_combine_has(has1: uni.ArchHas, has2: uni.ArchHas) -> bo
     return True;
 }
 
-"""Create a new ModuleCode (with entry) block from a list of statements.
-
-This implementation avoids calling normalize() to preserve comment associations.
-We manually build the kid list with required tokens.
-"""
 impl JacAutoLintPass.create_entry_block(stmts: list) -> uni.ModuleCode {
     entry_block = uni.ModuleCode(name=None, body=stmts, kid=stmts, doc=None);
     new_kid: list[uni.UniNode] = [];
@@ -502,11 +432,6 @@ impl JacAutoLintPass.create_entry_block(stmts: list) -> uni.ModuleCode {
     return entry_block;
 }
 
-"""Create a GlobalVars node from an assignment.
-
-This implementation avoids calling normalize() to preserve comment associations.
-We manually build the kid list with required tokens.
-"""
 impl JacAutoLintPass.create_glob_from_assignment(
     assignment: uni.Assignment
 ) -> uni.GlobalVars {
@@ -524,7 +449,6 @@ impl JacAutoLintPass.create_glob_from_assignment(
     return glob_node;
 }
 
-"""Check if a statement is a module-level construct that can be extracted."""
 impl JacAutoLintPass.is_module_level_construct(stmt: uni.UniNode) -> bool {
     return isinstance(
         stmt,
@@ -540,7 +464,6 @@ impl JacAutoLintPass.is_module_level_construct(stmt: uni.UniNode) -> bool {
     );
 }
 
-"""Check if an assignment can be converted to glob."""
 impl JacAutoLintPass.can_convert_to_glob(assignment: uni.Assignment) -> bool {
     if assignment.value is None {
         return False;
@@ -553,10 +476,62 @@ impl JacAutoLintPass.can_convert_to_glob(assignment: uni.Assignment) -> bool {
             return False;
         }
     }
+    if isinstance(assignment.value, uni.FuncCall)
+        or len(assignment.value.get_all_sub_nodes(uni.FuncCall)) > 0 {
+        return False;
+    }
     return True;
 }
 
-"""Process module to transform with entry blocks in-place."""
+impl JacAutoLintPass.names_unsafe_to_globalize(module: uni.Module) -> set[str] {
+    counts: dict[str, int] = {};
+    for stmt in module.body {
+        target_lists: list = [];
+        if isinstance(stmt, uni.GlobalVars) {
+            for assign in stmt.assignments {
+                target_lists.append(assign.target);
+            }
+        } elif isinstance(stmt, uni.ModuleCode) and stmt.name is None {
+            for inner_stmt in stmt.body {
+                for assign in inner_stmt.get_all_sub_nodes(uni.Assignment) {
+                    target_lists.append(assign.target);
+                }
+                if isinstance(inner_stmt, uni.Assignment) {
+                    target_lists.append(inner_stmt.target);
+                }
+            }
+        }
+        for targets in target_lists {
+            for target in targets {
+                if isinstance(target, uni.Name) {
+                    counts[target.value] = counts.get(target.value, 0) + 1;
+                }
+            }
+        }
+    }
+    return {
+        name
+        for (name, count) in counts.items()
+        if count > 1
+    };
+}
+
+impl JacAutoLintPass.entry_written_names(module: uni.Module) -> set[str] {
+    written: set[str] = set();
+    for stmt in module.body {
+        if isinstance(stmt, uni.ModuleCode) and stmt.name is None {
+            for assign in stmt.get_all_sub_nodes(uni.Assignment) {
+                for target in assign.target {
+                    if isinstance(target, uni.Name) {
+                        written.add(target.value);
+                    }
+                }
+            }
+        }
+    }
+    return written;
+}
+
 impl JacAutoLintPass.enter_module(nd: uni.Module) -> None {
     if not self.lint_enabled or self.report_only {
         return;
@@ -564,14 +539,13 @@ impl JacAutoLintPass.enter_module(nd: uni.Module) -> None {
     module = nd;
     if self.main_module is None {
         self.main_module = module;
-        for impl_mod in module.impl_mod {
-            self.traverse(impl_mod);
-        }
     }
+    unsafe_globalize = self.names_unsafe_to_globalize(module);
+    entry_written = self.entry_written_names(module);
     new_body: list[uni.UniNode] = [];
     for stmt in module.body {
         if self._is_future_annotations_import(stmt)
-        and self.emit(W3009, node_override=stmt) {
+            and self.emit(W3009, node_override=stmt) {
             continue;
         }
 
@@ -581,7 +555,18 @@ impl JacAutoLintPass.enter_module(nd: uni.Module) -> None {
                 extracted_stmt: uni.UniNode | None = None;
 
                 if isinstance(inner_stmt, uni.Assignment)
-                and self.can_convert_to_glob(inner_stmt) {
+                    and self.can_convert_to_glob(inner_stmt)
+                    and not any(
+                        target.value in unsafe_globalize for target in inner_stmt.target
+                    )
+                    and not (
+                        isinstance(inner_stmt.value, uni.Name)
+                        and inner_stmt.value.value in entry_written
+                    )
+                    and not any(
+                        nm.value in entry_written
+                        for nm in inner_stmt.value.get_all_sub_nodes(uni.Name)
+                    ) {
                     extracted_stmt = self.create_glob_from_assignment(inner_stmt);
                 } elif self.is_module_level_construct(inner_stmt) {
                     extracted_stmt = inner_stmt;
@@ -617,17 +602,8 @@ impl JacAutoLintPass.enter_module(nd: uni.Module) -> None {
     module.set_kids(nodes=new_kid if len(new_kid) else [uni.EmptyToken()]);
 }
 
-"""Remove unnecessary backtick escaping from names that are not actual keywords.
-
-Names only need backtick escaping if they conflict with:
-- Python keywords (and, or, if, else, etc.)
-- Jac reserved keywords from the grammar
-
-This also handles SpecialVarRef where the underlying name should
-never have backtick escaping since it's already recognized as a special keyword.
-"""
 impl JacAutoLintPass.enter_name(nd: uni.Name) -> None {
-    if not self.lint_enabled or self.report_only {
+    if not self.lint_enabled {
         return;
     }
     if not nd.is_kwesc or isinstance(nd, uni.SpecialVarRef) {
@@ -638,7 +614,8 @@ impl JacAutoLintPass.enter_name(nd: uni.Name) -> None {
     reserved = jac_keywords | python_keywords;
     raw_value = nd.value[1:] if nd.value.startswith("`") else nd.value;
     if raw_value not in reserved
-    and self.emit(W3006, node_override=nd, name=raw_value) {
+        and self.emit(W3006, node_override=nd, name=raw_value)
+        and not self.report_only {
         nd.is_kwesc = False;
         if nd.name == Tok.KWESC_NAME {
             nd.name = Tok.NAME;
@@ -646,54 +623,40 @@ impl JacAutoLintPass.enter_name(nd: uni.Name) -> None {
     }
 }
 
-"""Remove backtick escaping from SpecialVarRef's underlying name.
-
-SpecialVarRef wraps special keywords like init, postinit, self, super,
-root, here, visitor. The underlying Name should never have backtick escaping
-since these are already recognized as special tokens in the grammar.
-"""
 impl JacAutoLintPass.enter_special_var_ref(nd: uni.SpecialVarRef) -> None {
-    if not self.lint_enabled or self.report_only {
+    if not self.lint_enabled {
         return;
     }
     if nd.orig.is_kwesc and self.emit(W3006, node_override=nd, name=nd.orig.value) {
-        nd.orig.is_kwesc = False;
-        if nd.orig.name == Tok.KWESC_NAME {
-            nd.orig.name = Tok.NAME;
+        if not self.report_only {
+            nd.orig.is_kwesc = False;
+            if nd.orig.name == Tok.KWESC_NAME {
+                nd.orig.name = Tok.NAME;
+            }
         }
+    }
+    if self.report_only {
+        return;
     }
     if nd.is_kwesc {
         nd.is_kwesc = False;
     }
 }
 
-"""Remove backtick escaping from BuiltinType nodes.
-
-BuiltinType represents built-in types like str, int, float, bool, etc.
-These should never have backtick escaping since they are recognized as
-built-in type tokens in the grammar.
-"""
 impl JacAutoLintPass.enter_builtin_type(nd: uni.BuiltinType) -> None {
-    if not self.lint_enabled or self.report_only {
+    if not self.lint_enabled {
         return;
     }
     if nd.is_kwesc and self.emit(W3006, node_override=nd, name=nd.value) {
-        nd.is_kwesc = False;
-        if nd.name == Tok.KWESC_NAME {
-            nd.name = Tok.NAME;
+        if not self.report_only {
+            nd.is_kwesc = False;
+            if nd.name == Tok.KWESC_NAME {
+                nd.name = Tok.NAME;
+            }
         }
     }
 }
 
-"""Convert hasattr(obj, "attr") to null-safe access.
-
-This helper checks if a FuncCall is a hasattr call with exactly two arguments:
-- First arg: any expression (the object)
-- Second arg: a string literal (the attribute name)
-
-If valid, creates and returns an AtomTrailer with is_null_ok=True.
-Returns None if the call doesn't match the hasattr pattern.
-"""
 impl JacAutoLintPass._convert_hasattr_to_null_ok(
     nd: uni.FuncCall
 ) -> (uni.AtomTrailer | None) {
@@ -706,61 +669,9 @@ impl JacAutoLintPass._convert_hasattr_to_null_ok(
     if len(nd.params) != 2 {
         return None;
     }
-    obj_expr = nd.params[0];
-    attr_expr = nd.params[1];
-    attr_value: str | None = None;
-    string_node: uni.String | None = None;
-    if isinstance(attr_expr, uni.String) {
-        attr_value = attr_expr.value;
-        string_node = attr_expr;
-    } elif isinstance(attr_expr, uni.MultiString) {
-        if len(attr_expr.strings) == 1
-        and isinstance(attr_expr.strings[0], uni.String) {
-            attr_value = attr_expr.strings[0].value;
-            string_node = attr_expr.strings[0];
-        }
-    }
-    if attr_value is None or string_node is None {
-        return None;
-    }
-    if (attr_value.startswith('"') and attr_value.endswith('"'))
-    or (attr_value.startswith("'") and attr_value.endswith("'")) {
-        attr_name = attr_value[1:-1];
-    } else {
-        return None;
-    }
-    attr_name_node = uni.Name(
-        orig_src=string_node.loc.orig_src,
-        name=Tok.NAME.name,
-        value=attr_name,
-        line=string_node.loc.first_line,
-        end_line=string_node.loc.last_line,
-        col_start=string_node.loc.col_start,
-        col_end=string_node.loc.col_end,
-        pos_start=string_node.loc.pos_start,
-        pos_end=string_node.loc.pos_end,
-        is_kwesc=False
-    );
-    null_ok_access = uni.AtomTrailer(
-        target=obj_expr,
-        right=attr_name_node,
-        is_attr=True,
-        is_null_ok=True,
-        kid=[obj_expr, attr_name_node]
-    );
-    new_kid: list[uni.UniNode] = [obj_expr];
-    new_kid.append(null_ok_access.gen_token(Tok.NULL_OK));
-    new_kid.append(null_ok_access.gen_token(Tok.DOT));
-    new_kid.append(attr_name_node);
-    null_ok_access.set_kids(nodes=new_kid);
-    return null_ok_access;
+    return self._funccall_to_null_safe(nd, False);
 }
 
-"""Check if an AtomTrailer matches an object and attribute name.
-
-Returns True if the AtomTrailer represents obj.attr where obj matches
-the given object expression and attr matches the given attribute name.
-"""
 impl JacAutoLintPass._is_matching_attr_access(
     trailer: uni.AtomTrailer, obj_expr: uni.Expr, attr_name: str
 ) -> bool {
@@ -776,12 +687,6 @@ impl JacAutoLintPass._is_matching_attr_access(
     return self._exprs_are_identical(obj_expr, trailer.target);
 }
 
-"""Convert an AtomTrailer to use null-safe access.
-
-Takes an existing obj.attr AtomTrailer and converts it to use null-safe access
-by setting is_null_ok=True. We surgically insert the NULL_OK token instead of
-calling normalize() to preserve comment associations.
-"""
 impl JacAutoLintPass._make_null_ok(trailer: uni.AtomTrailer) -> None {
     if not trailer.is_null_ok {
         trailer.is_null_ok = True;
@@ -799,11 +704,6 @@ impl JacAutoLintPass._make_null_ok(trailer: uni.AtomTrailer) -> None {
     }
 }
 
-"""Check if a BoolExpr has a matching obj.attr access in any operand other than the hasattr call.
-
-This determines whether hasattr is being used as a guard before accessing the attribute
-(safe to convert) vs a standalone existence check (not safe to convert).
-"""
 impl JacAutoLintPass._bool_expr_has_matching_access(
     parent: uni.BoolExpr, hasattr_node: uni.FuncCall, obj_expr: uni.Expr, attr_name: str
 ) -> bool {
@@ -822,22 +722,6 @@ impl JacAutoLintPass._bool_expr_has_matching_access(
     return False;
 }
 
-"""Convert getattr(obj, "attr", None) to null-safe access.
-
-Matches the 3-arg form with explicit `None` default, which is exactly the
-runtime behavior of `obj?.attr` (missing attribute or None base both yield
-None). The 2-arg form `getattr(obj, "attr")` raises AttributeError on miss,
-so it is not rewritten.
-
-Requirements:
-- First arg: any expression (the object)
-- Second arg: a string literal that is a valid Python identifier and not a keyword
-- Third arg: the literal `None`
-
-Unlike hasattr, getattr(obj, "attr", None) returns the attribute value (not
-a bool), so `obj?.attr` is a drop-in replacement in every expression context.
-No parent-type guard is needed.
-"""
 impl JacAutoLintPass._convert_getattr_to_null_ok(
     nd: uni.FuncCall
 ) -> (uni.AtomTrailer | None) {
@@ -854,13 +738,21 @@ impl JacAutoLintPass._convert_getattr_to_null_ok(
     attr_expr = nd.params[1];
     default_expr = nd.params[2];
     if isinstance(obj_expr, uni.KWPair)
-    or isinstance(attr_expr, uni.KWPair)
-    or isinstance(default_expr, uni.KWPair) {
+        or isinstance(attr_expr, uni.KWPair)
+        or isinstance(default_expr, uni.KWPair) {
         return None;
     }
     if not isinstance(default_expr, uni.Null) {
         return None;
     }
+    return self._funccall_to_null_safe(nd, True);
+}
+
+impl JacAutoLintPass._funccall_to_null_safe(
+    fc: uni.FuncCall, require_valid_identifier: bool
+) -> (uni.AtomTrailer | None) {
+    obj_expr = fc.params[0];
+    attr_expr = fc.params[1];
     attr_value: str | None = None;
     string_node: uni.String | None = None;
     if isinstance(attr_expr, uni.String) {
@@ -868,7 +760,7 @@ impl JacAutoLintPass._convert_getattr_to_null_ok(
         string_node = attr_expr;
     } elif isinstance(attr_expr, uni.MultiString) {
         if len(attr_expr.strings) == 1
-        and isinstance(attr_expr.strings[0], uni.String) {
+            and isinstance(attr_expr.strings[0], uni.String) {
             attr_value = attr_expr.strings[0].value;
             string_node = attr_expr.strings[0];
         }
@@ -877,12 +769,13 @@ impl JacAutoLintPass._convert_getattr_to_null_ok(
         return None;
     }
     if (attr_value.startswith('"') and attr_value.endswith('"'))
-    or (attr_value.startswith("'") and attr_value.endswith("'")) {
+        or (attr_value.startswith("'") and attr_value.endswith("'")) {
         attr_name = attr_value[1:-1];
     } else {
         return None;
     }
-    if not attr_name.isidentifier() or keyword.iskeyword(attr_name) {
+    if require_valid_identifier
+        and (not attr_name.isidentifier() or keyword.iskeyword(attr_name)) {
         return None;
     }
     attr_name_node = uni.Name(
@@ -912,13 +805,6 @@ impl JacAutoLintPass._convert_getattr_to_null_ok(
     return null_ok_access;
 }
 
-"""Replace child `old` with `new` inside `parent`.
-
-Updates both `parent.kid` (authoritative for pretty-printing and DocIR) and
-the typed fields for common parent node types so later passes that read the
-typed fields see the rewrite. Parent types not covered here fall through to
-just the kid update, which is sufficient for formatter output.
-"""
 impl JacAutoLintPass._replace_child_in_parent(
     parent: uni.UniNode, old: uni.UniNode, new: uni.Expr
 ) -> None {
@@ -994,26 +880,105 @@ impl JacAutoLintPass._replace_child_in_parent(
     }
 }
 
-"""Process FuncCall to convert hasattr/getattr to null-safe access.
-
-Handles two rewrites at the FuncCall exit:
-- hasattr(obj, "attr")         -> obj?.attr  (W3007; restricted to safe patterns)
-- getattr(obj, "attr", None)   -> obj?.attr  (W3039; safe in any expr context)
-
-hasattr is only safe to rewrite in IfElseExpr / BoolExpr guard patterns
-because hasattr() returns bool while obj?.attr returns the value (may be
-falsy). getattr's 3-arg form already returns the value, so it rewrites
-unconditionally.
-"""
 impl JacAutoLintPass.exit_func_call(nd: uni.FuncCall) -> None {
     if not self.lint_enabled {
         return;
     }
     self._check_no_print(nd);
-    if self.report_only {
-        return;
+
+    if not self._is_suppressed(W3007) {
+        replacement = self._convert_hasattr_to_null_ok(nd);
+        if replacement is not None {
+            obj_expr = nd.params[0];
+            attr_expr = nd.params[1];
+            attr_name = self._extract_string_literal_value(attr_expr);
+
+            cfg_wrapper: uni.CfgExpr | None = None;
+            parent = nd.parent;
+            if isinstance(parent, uni.CfgExpr) {
+                cfg_wrapper = parent;
+                parent = parent.parent;
+            }
+            if parent is None {
+                return;
+            }
+
+            if isinstance(parent, uni.IfElseExpr) { } elif isinstance(
+                parent, uni.BoolExpr
+            ) {
+                if attr_name is None
+                    or not self._bool_expr_has_matching_access(
+                        parent, nd, obj_expr, attr_name
+                    ) {
+                    return;
+                }
+            } else {
+                return;
+            }
+            if not self.emit(W3007, node_override=nd) {
+                return;
+            }
+            if self.report_only {
+                return;
+            }
+            if cfg_wrapper is not None {
+                replacement.parent = cfg_wrapper;
+                cfg_wrapper.expr = replacement;
+                cfg_wrapper.kid = [replacement];
+                cfg_wrapper._invalidate_sub_node_tab();
+                if isinstance(parent, uni.IfElseExpr)
+                    and parent.condition is cfg_wrapper
+                    and attr_name is not None
+                    and isinstance(parent.value.expr, uni.AtomTrailer)
+                    and self._is_matching_attr_access(
+                        parent.value.expr, obj_expr, attr_name
+                    ) {
+                    self._make_null_ok(parent.value.expr);
+                }
+                return;
+            }
+            replacement.parent = parent;
+            if isinstance(parent, uni.IfElseExpr) {
+                if parent.condition is nd {
+                    parent.condition = replacement;
+                    if attr_name is not None
+                        and isinstance(parent.value, uni.AtomTrailer) {
+                        if self._is_matching_attr_access(
+                            parent.value, obj_expr, attr_name
+                        ) {
+                            self._make_null_ok(parent.value);
+                        }
+                    }
+                } elif parent.value is nd {
+                    parent.value = replacement;
+                } elif parent.else_value is nd {
+                    parent.else_value = replacement;
+                }
+            } elif isinstance(parent, uni.BoolExpr) {
+                new_values: list[uni.Expr] = [];
+                for val in parent.values {
+                    if val is nd {
+                        new_values.append(replacement);
+                    } else {
+                        new_values.append(val);
+                    }
+                }
+                parent.values = new_values;
+            }
+            new_kids: list[uni.UniNode] = [];
+            for kid in parent.kid {
+                if kid is nd {
+                    new_kids.append(replacement);
+                } else {
+                    new_kids.append(kid);
+                }
+            }
+            parent.kid = new_kids;
+            parent._invalidate_sub_node_tab();
+            return;
+        }
     }
-    # W3042: convert arr.map(lambda item -> any { return <jsx>; }) to comprehension
+
     if self._convert_map_to_comprehension(nd) {
         return;
     }
@@ -1022,105 +987,17 @@ impl JacAutoLintPass.exit_func_call(nd: uni.FuncCall) -> None {
         if getattr_replacement is not None {
             parent = nd.parent;
             if parent is not None and self.emit(W3039, node_override=nd) {
+                if self.report_only {
+                    return;
+                }
                 getattr_replacement.parent = parent;
                 self._replace_child_in_parent(parent, nd, getattr_replacement);
                 return;
             }
         }
     }
-    if self._is_suppressed(W3007) {
-        return;
-    }
-    replacement = self._convert_hasattr_to_null_ok(nd);
-    if replacement is None {
-        return;
-    }
-    obj_expr = nd.params[0];
-    attr_expr = nd.params[1];
-    attr_name = self._extract_string_literal_value(attr_expr);
-    # Since BoolExpr operands and IfElseExpr branches are now CfgExpr nodes,
-    # the FuncCall's direct parent is the CfgExpr wrapper, not the enclosing
-    # BoolExpr/IfElseExpr. Step through the wrapper to reach the semantic
-    # parent so the hasattr→obj?.attr rewrite still fires.
-    cfg_wrapper: uni.CfgExpr | None = None;
-    parent = nd.parent;
-    if isinstance(parent, uni.CfgExpr) {
-        cfg_wrapper = parent;
-        parent = parent.parent;
-    }
-    if parent is None {
-        return;
-    }
-    # Only convert in semantically safe patterns.
-    # hasattr() returns bool (existence check), obj?.attr returns the value.
-    # These differ when the attribute value is falsy ([], 0, "", None).
-    if isinstance(parent, uni.IfElseExpr) {
-        # Safe: ternary guard pattern
-    } elif isinstance(parent, uni.BoolExpr) {
-        # Only safe when another operand accesses the same obj.attr (guard-then-use)
-        if attr_name is None
-        or not self._bool_expr_has_matching_access(parent, nd, obj_expr, attr_name) {
-            return;
-        }
-    } else {
-        # IfStmt, WhileStmt, UnaryExpr, BinaryExpr — standalone boolean check, not safe
-        return;
-    }
-    if not self.emit(W3007, node_override=nd) {
-        return;
-    }
-    if cfg_wrapper is not None {
-        replacement.parent = cfg_wrapper;
-        cfg_wrapper.expr = replacement;
-        cfg_wrapper.kid = [replacement];
-        cfg_wrapper._invalidate_sub_node_tab();
-        if isinstance(parent, uni.IfElseExpr)
-        and parent.condition is cfg_wrapper
-        and attr_name is not None
-        and isinstance(parent.value.expr, uni.AtomTrailer)
-        and self._is_matching_attr_access(parent.value.expr, obj_expr, attr_name) {
-            self._make_null_ok(parent.value.expr);
-        }
-        return;
-    }
-    replacement.parent = parent;
-    if isinstance(parent, uni.IfElseExpr) {
-        if parent.condition is nd {
-            parent.condition = replacement;
-            if attr_name is not None and isinstance(parent.value, uni.AtomTrailer) {
-                if self._is_matching_attr_access(parent.value, obj_expr, attr_name) {
-                    self._make_null_ok(parent.value);
-                }
-            }
-        } elif parent.value is nd {
-            parent.value = replacement;
-        } elif parent.else_value is nd {
-            parent.else_value = replacement;
-        }
-    } elif isinstance(parent, uni.BoolExpr) {
-        new_values: list[uni.Expr] = [];
-        for val in parent.values {
-            if val is nd {
-                new_values.append(replacement);
-            } else {
-                new_values.append(val);
-            }
-        }
-        parent.values = new_values;
-    }
-    new_kids: list[uni.UniNode] = [];
-    for kid in parent.kid {
-        if kid is nd {
-            new_kids.append(replacement);
-        } else {
-            new_kids.append(kid);
-        }
-    }
-    parent.kid = new_kids;
-    parent._invalidate_sub_node_tab();
 }
 
-"""Recursively collect all AtomTrailer nodes from a subtree."""
 impl JacAutoLintPass._collect_atom_trailers(
     uni_node: uni.UniNode, results: list
 ) -> None {
@@ -1136,11 +1013,6 @@ impl JacAutoLintPass._collect_atom_trailers(
     }
 }
 
-"""Build a string key from an expression without calling unparse().
-
-This avoids triggering normalize() which corrupts token locations.
-Returns None if the expression is too complex to build a key from.
-"""
 impl JacAutoLintPass._expr_to_key(expr: uni.Expr) -> (str | None) {
     if isinstance(expr, uni.Name) {
         return expr.value;
@@ -1158,11 +1030,11 @@ impl JacAutoLintPass._expr_to_key(expr: uni.Expr) -> (str | None) {
     if isinstance(expr, uni.SpecialVarRef) {
         return expr.name.value if expr.name else None;
     }
-    # Literals
+
     if isinstance(expr, (uni.Int, uni.Float, uni.String, uni.Bool, uni.Null)) {
         return str(expr.value);
     }
-    # Comparison expressions: x > 0
+
     if isinstance(expr, uni.CompareExpr) {
         left_key = self._expr_to_key(expr.left);
         if left_key is None {
@@ -1181,7 +1053,7 @@ impl JacAutoLintPass._expr_to_key(expr: uni.Expr) -> (str | None) {
         }
         return " ".join(parts);
     }
-    # Binary expressions: a + b
+
     if isinstance(expr, uni.BinaryExpr) and expr.op is not None {
         left_key = self._expr_to_key(expr.left);
         right_key = self._expr_to_key(expr.right);
@@ -1190,7 +1062,7 @@ impl JacAutoLintPass._expr_to_key(expr: uni.Expr) -> (str | None) {
             return f"{left_key} {op_val} {right_key}";
         }
     }
-    # Unary expressions: not x
+
     if isinstance(expr, uni.UnaryExpr) and expr.op is not None {
         operand_key = self._expr_to_key(expr.operand);
         if operand_key is not None {
@@ -1201,40 +1073,12 @@ impl JacAutoLintPass._expr_to_key(expr: uni.Expr) -> (str | None) {
     return None;
 }
 
-"""Get a unique key for an AtomTrailer based on its target and attribute.
-
-Returns a string like "obj.attr" that can be used to identify matching accesses.
-Returns None if the trailer is not a simple attribute access.
-"""
-impl JacAutoLintPass._get_trailer_key(trailer: uni.AtomTrailer) -> (str | None) {
-    if not trailer.is_attr {
-        return None;
-    }
-    if not isinstance(trailer.right, uni.Name) {
-        return None;
-    }
-    attr_name = trailer.right.value;
-    target_key = self._expr_to_key(trailer.target);
-    if target_key is not None {
-        null_ok = "?" if trailer.is_null_ok else "";
-        return f"{target_key}{null_ok}.{attr_name}";
-    }
-    return None;
-}
-
-"""Check if two expressions are structurally identical without calling unparse().
-
-This avoids triggering normalize() which corrupts token locations.
-"""
 impl JacAutoLintPass._exprs_are_identical(expr1: uni.Expr, expr2: uni.Expr) -> bool {
     if expr1 is expr2 {
         return True;
     }
     if type(expr1) != type(expr2) {
         return False;
-    }
-    if isinstance(expr1, uni.Name) and isinstance(expr2, uni.Name) {
-        return expr1.value == expr2.value;
     }
     if isinstance(expr1, uni.AtomTrailer) and isinstance(expr2, uni.AtomTrailer) {
         if expr1.is_attr != expr2.is_attr {
@@ -1251,12 +1095,6 @@ impl JacAutoLintPass._exprs_are_identical(expr1: uni.Expr, expr2: uni.Expr) -> b
         }
         return self._exprs_are_identical(expr1.right, expr2.right);
     }
-    if isinstance(expr1, uni.SpecialVarRef) and isinstance(expr2, uni.SpecialVarRef) {
-        if expr1.name and expr2.name {
-            return expr1.name.value == expr2.name.value;
-        }
-        return expr1.name is None and expr2.name is None;
-    }
     key1 = self._expr_to_key(expr1);
     key2 = self._expr_to_key(expr2);
     if key1 is not None and key2 is not None {
@@ -1265,15 +1103,6 @@ impl JacAutoLintPass._exprs_are_identical(expr1: uni.Expr, expr2: uni.Expr) -> b
     return False;
 }
 
-"""Convert IfElseExpr to simplified form when value equals condition.
-
-Transforms:
-- x?.attr if x?.attr else None -> x?.attr (since null-safe already returns None)
-- x?.attr if x?.attr else default -> x?.attr or default
-
-This only applies when the value and condition are identical expressions.
-This implementation avoids calling normalize() to preserve comment associations.
-"""
 impl JacAutoLintPass._convert_ternary_to_or(if_else_node: uni.IfElseExpr) -> bool {
     if not self._exprs_are_identical(
         if_else_node.value.expr, if_else_node.condition.expr
@@ -1351,15 +1180,6 @@ impl JacAutoLintPass._convert_ternary_to_or(if_else_node: uni.IfElseExpr) -> boo
     return True;
 }
 
-"""Propagate null-safe access within IfElseExpr and simplify ternary to or.
-
-When an expression contains both null-safe and regular accesses for the same
-object and attribute, convert the regular accesses to null-safe.
-
-Also converts patterns like:
-- x?.attr if x?.attr else None -> x?.attr (since null-safe already returns None)
-- x?.attr if x?.attr else default -> x?.attr or default
-"""
 impl JacAutoLintPass.exit_if_else_expr(if_else_node: uni.IfElseExpr) -> None {
     if not self.lint_enabled or self.report_only {
         return;
@@ -1378,7 +1198,7 @@ impl JacAutoLintPass.exit_if_else_expr(if_else_node: uni.IfElseExpr) -> None {
     null_ok_keys: set = set();
     for trailer in trailers {
         if isinstance(trailer, uni.AtomTrailer) and trailer.is_null_ok {
-            key = self._get_trailer_key(trailer);
+            key = self._expr_to_key(trailer);
             if key is not None {
                 null_ok_keys.add(key);
             }
@@ -1389,7 +1209,7 @@ impl JacAutoLintPass.exit_if_else_expr(if_else_node: uni.IfElseExpr) -> None {
     }
     for trailer in trailers {
         if isinstance(trailer, uni.AtomTrailer) and not trailer.is_null_ok {
-            key = self._get_trailer_key(trailer);
+            key = self._expr_to_key(trailer);
             if key is not None and key in null_ok_keys {
                 self._make_null_ok(trailer);
             }
@@ -1397,11 +1217,6 @@ impl JacAutoLintPass.exit_if_else_expr(if_else_node: uni.IfElseExpr) -> None {
     }
 }
 
-"""Propagate null-safe access within BoolExpr (and/or expressions).
-
-When an expression contains both null-safe and regular accesses for the same
-object and attribute, convert the regular accesses to null-safe.
-"""
 impl JacAutoLintPass.exit_bool_expr(bool_node: uni.BoolExpr) -> None {
     if not self.lint_enabled or self.report_only or self._is_suppressed(W3007) {
         return;
@@ -1414,7 +1229,7 @@ impl JacAutoLintPass.exit_bool_expr(bool_node: uni.BoolExpr) -> None {
     null_ok_keys: set = set();
     for trailer in trailers {
         if isinstance(trailer, uni.AtomTrailer) and trailer.is_null_ok {
-            key = self._get_trailer_key(trailer);
+            key = self._expr_to_key(trailer);
             if key is not None {
                 null_ok_keys.add(key);
             }
@@ -1425,7 +1240,7 @@ impl JacAutoLintPass.exit_bool_expr(bool_node: uni.BoolExpr) -> None {
     }
     for trailer in trailers {
         if isinstance(trailer, uni.AtomTrailer) and not trailer.is_null_ok {
-            key = self._get_trailer_key(trailer);
+            key = self._expr_to_key(trailer);
             if key is not None and key in null_ok_keys {
                 self._make_null_ok(trailer);
             }
@@ -1433,11 +1248,6 @@ impl JacAutoLintPass.exit_bool_expr(bool_node: uni.BoolExpr) -> None {
     }
 }
 
-"""Check if a statement is an `import from __future__ { annotations }` import.
-
-This import is not needed in Jac since Jac already uses deferred annotation
-evaluation by default. Removing it cleans up code converted from Python.
-"""
 impl JacAutoLintPass._is_future_annotations_import(stmt: uni.UniNode) -> bool {
     if not isinstance(stmt, uni.Import) {
         return False;
@@ -1467,77 +1277,21 @@ impl JacAutoLintPass._is_future_annotations_import(stmt: uni.UniNode) -> bool {
     return False;
 }
 
-"""Fix signature mismatch between declaration and implementation.
-
-When an impl's signature doesn't match its declaration, copy the declaration's
-signature to the implementation to ensure consistency.
-
-This works by looking up the declaration via symbol table since decl_link may
-not be set yet when this pass runs during formatting.
-
-Supports nested classes: for `impl OuterClass.InnerClass.method`, it navigates
-through OuterClass -> InnerClass -> method to find the correct declaration.
-"""
 impl JacAutoLintPass._fix_impl_signature_mismatch(impl_node: uni.ImplDef) -> None {
+    if self._is_file_excluded(impl_node.loc.mod_path) {
+        return;
+    }
     decl: uni.Ability | None = None;
     if isinstance(impl_node.decl_link, uni.Ability) {
         decl = impl_node.decl_link;
     } else {
-        if not impl_node.target or len(impl_node.target) < 2 {
-            return;
-        }
-        root_arch_name = impl_node.target[0].sym_name if impl_node.target[0] else None;
-        ability_name = impl_node.target[-1].sym_name if impl_node.target[-1] else None;
-        if not root_arch_name or not ability_name {
-            return;
-        }
-        if self.main_module is None {
-            return;
-        }
-        arch_node: uni.Archetype | None = None;
-        if self.main_module.sym_tab {
-            arch_sym = self.main_module.sym_tab.lookup(root_arch_name);
-            if arch_sym and arch_sym.decl {
-                candidate = arch_sym.decl.name_of;
-                if isinstance(candidate, uni.Archetype) {
-                    arch_node = candidate;
-                }
-            }
-        }
+        arch_node = self._impl_owner_archetype(impl_node);
         if arch_node is None {
-            for stmt in self.main_module.body {
-                if isinstance(stmt, uni.Archetype) {
-                    if stmt.name_spec and stmt.name_spec.sym_name == root_arch_name {
-                        arch_node = stmt;
-                        break;
-                    }
-                }
-            }
-        }
-        if arch_node is None or not arch_node.body {
             return;
         }
-        for i in range(1, len(impl_node.target) - 1) {
-            nested_name = impl_node.target[i].sym_name if impl_node.target[i] else None;
-
-            if not nested_name {
-                return;
-            }
-            found_nested = False;
-
-            for member in arch_node.body {
-                if isinstance(member, uni.Archetype) {
-                    if member.name_spec and member.name_spec.sym_name == nested_name {
-                        arch_node = member;
-                        found_nested = True;
-                        break;
-                    }
-                }
-            }
-
-            if not found_nested or not arch_node.body {
-                return;
-            }
+        ability_name = impl_node.target[-1].sym_name if impl_node.target[-1] else None;
+        if not ability_name {
+            return;
         }
         for member in arch_node.body {
             if isinstance(member, uni.Ability) {
@@ -1563,15 +1317,14 @@ impl JacAutoLintPass._fix_impl_signature_mismatch(impl_node: uni.ImplDef) -> Non
         return;
     }
     import copy;
-    # Temporarily detach parent to prevent deepcopy from cloning the entire AST
+
     saved_parent = decl.signature.parent;
     decl.signature.parent = None;
     new_sig = copy.deepcopy(decl.signature);
     decl.signature.parent = saved_parent;
     new_sig.parent = impl_node;
     old_spec = impl_node.spec;
-    # Copy position info from old spec's tokens to new spec's tokens
-    # so the formatter places comments correctly relative to the signature
+
     old_first_tok = old_spec.loc.first_tok;
     old_last_tok = old_spec.loc.last_tok;
     def _fix_token_positions(nd: uni.UniNode) {
@@ -1604,10 +1357,101 @@ impl JacAutoLintPass._fix_impl_signature_mismatch(impl_node: uni.ImplDef) -> Non
     impl_node._invalidate_sub_node_tab();
 }
 
-"""Check if two FuncSignatures match structurally without calling unparse().
+impl JacAutoLintPass._impl_owner_archetype(
+    impl_node: uni.ImplDef
+) -> (uni.Archetype | None) {
+    if not impl_node.target or len(impl_node.target) < 2 {
+        return None;
+    }
+    root_arch_name = impl_node.target[0].sym_name if impl_node.target[0] else None;
+    if not root_arch_name or self.main_module is None {
+        return None;
+    }
+    arch_node: uni.Archetype | None = None;
+    if self.main_module.sym_tab {
+        arch_sym = self.main_module.sym_tab.lookup(root_arch_name);
+        if arch_sym and arch_sym.decl {
+            candidate = arch_sym.decl.name_of;
+            if isinstance(candidate, uni.Archetype) {
+                arch_node = candidate;
+            }
+        }
+    }
+    if arch_node is None {
+        for stmt in self.main_module.body {
+            if isinstance(stmt, uni.Archetype) {
+                if stmt.name_spec and stmt.name_spec.sym_name == root_arch_name {
+                    arch_node = stmt;
+                    break;
+                }
+            }
+        }
+    }
 
-Compares parameter counts and names to determine if signatures are equivalent.
-"""
+    if arch_node is None {
+        for stmt in self._base_decl_archetypes(impl_node.loc.mod_path) {
+            if stmt.name_spec and stmt.name_spec.sym_name == root_arch_name {
+                arch_node = stmt;
+                break;
+            }
+        }
+    }
+    if arch_node is None or not arch_node.body {
+        return None;
+    }
+    for i in range(1, len(impl_node.target) - 1) {
+        nested_name = impl_node.target[i].sym_name if impl_node.target[i] else None;
+
+        if not nested_name {
+            return None;
+        }
+        nested: uni.Archetype | None = None;
+
+        for member in arch_node.body {
+            if isinstance(member, uni.Archetype) {
+                if member.name_spec and member.name_spec.sym_name == nested_name {
+                    nested = member;
+                    break;
+                }
+            }
+        }
+
+        if nested is None or not nested.body {
+            return None;
+        }
+        arch_node = nested;
+    }
+    return arch_node;
+}
+
+impl JacAutoLintPass._base_decl_archetypes(annex_path: str) -> list[uni.Archetype] {
+    if self._base_decls_loaded {
+        return self._base_decl_cache;
+    }
+    self._base_decls_loaded = True;
+    import from jaclang.jac0core.bccache { discover_base_file }
+    import from jaclang.jac0core.parser { parse as rd_parse }
+    import from jaclang.jac0core.helpers { read_file_with_encoding }
+    import from jaclang.jac0core.program { JacProgram }
+    base_path = discover_base_file(annex_path);
+    if base_path is None {
+        return self._base_decl_cache;
+    }
+    try {
+        source_str = read_file_with_encoding(base_path);
+
+        (base_mod, _had_error) = rd_parse(source_str, base_path, prog=JacProgram());
+    } except Exception {
+        return self._base_decl_cache;
+    }
+    self._base_decl_cache = [
+        stmt
+        for stmt in base_mod.body
+        if isinstance(stmt, uni.Archetype)
+    ];
+    return self._base_decl_cache;
+}
+
 impl JacAutoLintPass._signatures_match(
     decl_sig: uni.FuncSignature, impl_sig: uni.FuncSignature
 ) -> bool {
@@ -1645,11 +1489,6 @@ impl JacAutoLintPass._signatures_match(
     return True;
 }
 
-"""Remove standalone semicolons after `import from X { ... }` inside code blocks.
-
-When users write `import from X { ... };` inside a function/ability, the semicolon
-is parsed as a separate Semi statement. This removes those unnecessary semicolons.
-"""
 impl JacAutoLintPass.enter_import(import_node: uni.Import) -> None {
     if not self.lint_enabled or self.report_only or import_node.from_loc is None {
         return;
@@ -1665,8 +1504,8 @@ impl JacAutoLintPass.enter_import(import_node: uni.Import) -> None {
         return;
     }
     if idx + 1 < len(body)
-    and isinstance(body[idx + 1], uni.Semi)
-    and self.emit(W3011, node_override=import_node) {
+        and isinstance(body[idx + 1], uni.Semi)
+        and self.emit(W3011, node_override=import_node) {
         semi = body[idx + 1];
         parent.body = [
             s
@@ -1682,19 +1521,6 @@ impl JacAutoLintPass.enter_import(import_node: uni.Import) -> None {
     }
 }
 
-"""Remove empty parentheses from a function signature with no parameters.
-
-This is a shared helper used by both exit_ability and exit_impl_def.
-Handles both cases:
-- No params, no return type: Remove the entire signature
-- No params, with return type: Remove just LPAREN/RPAREN, keep return type
-
-Args:
-    target_node: The parent node (Ability or ImplDef)
-    sig: The FuncSignature to modify
-    sig_attr: The attribute name on the node that holds the signature
-              ("signature" for Ability, "spec" for ImplDef)
-"""
 impl JacAutoLintPass._remove_empty_parens_from_sig(
     target_node: uni.UniNode, sig: uni.FuncSignature, sig_attr: str
 ) -> None {
@@ -1704,8 +1530,18 @@ impl JacAutoLintPass._remove_empty_parens_from_sig(
     if has_params {
         return;
     }
+    has_parens = any(
+        isinstance(kid, uni.Token) and kid.name in (Tok.LPAREN, Tok.RPAREN)
+        for kid in sig.kid
+    );
+    if not has_parens {
+        return;
+    }
     if sig.return_type is None {
         if not self.emit(W3005, node_override=target_node) {
+            return;
+        }
+        if self.report_only {
             return;
         }
         setattr(target_node, sig_attr, None);
@@ -1718,14 +1554,10 @@ impl JacAutoLintPass._remove_empty_parens_from_sig(
         target_node.kid = new_kid;
         target_node._invalidate_sub_node_tab();
     } else {
-        has_parens = any(
-            isinstance(kid, uni.Token) and kid.name in (Tok.LPAREN, Tok.RPAREN)
-            for kid in sig.kid
-        );
-        if not has_parens {
+        if not self.emit(W3005, node_override=target_node) {
             return;
         }
-        if not self.emit(W3005, node_override=target_node) {
+        if self.report_only {
             return;
         }
         new_kid: list[uni.UniNode] = [];
@@ -1741,13 +1573,8 @@ impl JacAutoLintPass._remove_empty_parens_from_sig(
     }
 }
 
-"""Check for bare print() calls and report a warning.
-
-Bare print() calls should use the console abstraction instead.
-Only flags calls where the target is a simple Name "print" (not console.print, etc.).
-"""
 impl JacAutoLintPass._check_no_print(nd: uni.FuncCall) -> None {
-    if self.report_only or not isinstance(nd.target, uni.Name) {
+    if not isinstance(nd.target, uni.Name) {
         return;
     }
     if nd.target.value != "print" {
@@ -1759,11 +1586,6 @@ impl JacAutoLintPass._check_no_print(nd: uni.FuncCall) -> None {
     self.emit(E3012, node_override=nd);
 }
 
-"""Extract the string value from a String or MultiString expression.
-
-Returns the unquoted string value, or None if the expression is not a simple string literal.
-Used by hasattr conversion to extract attribute names.
-"""
 impl JacAutoLintPass._extract_string_literal_value(expr: uni.Expr) -> (str | None) {
     attr_value: str | None = None;
     if isinstance(expr, uni.String) {
@@ -1777,17 +1599,13 @@ impl JacAutoLintPass._extract_string_literal_value(expr: uni.Expr) -> (str | Non
         return None;
     }
     if (attr_value.startswith('"') and attr_value.endswith('"'))
-    or (attr_value.startswith("'") and attr_value.endswith("'")) {
+        or (attr_value.startswith("'") and attr_value.endswith("'")) {
         return attr_value[1:-1];
     }
     return None;
 }
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# New lint checks (W3020-W3036)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""W3020: Warn on unnecessary 'pass' in a body that has other statements."""
-impl JacAutoLintPass._check_unnecessary_pass(body: list, `node: uni.UniNode) -> None {
+impl JacAutoLintPass._check_unnecessary_pass(body: list) -> None {
     if self._is_suppressed(W3020) {
         return;
     }
@@ -1800,14 +1618,13 @@ impl JacAutoLintPass._check_unnecessary_pass(body: list, `node: uni.UniNode) -> 
         return;
     }
     for stmt in body {
-        # CtrlStmt form (legacy / Python-originated AST)
         if isinstance(stmt, uni.CtrlStmt)
-        and stmt.ctrl
-        and isinstance(stmt.ctrl, uni.Token)
-        and stmt.ctrl.value == "pass" {
+            and stmt.ctrl
+            and isinstance(stmt.ctrl, uni.Token)
+            and stmt.ctrl.value == "pass" {
             self.emit(W3020, node_override=stmt);
         }
-        # ExprStmt > Name("pass") form (RD parser)
+
         if isinstance(stmt, uni.ExprStmt) {
             for k in stmt.kid {
                 if isinstance(k, uni.Name) and k.value == "pass" {
@@ -1819,12 +1636,11 @@ impl JacAutoLintPass._check_unnecessary_pass(body: list, `node: uni.UniNode) -> 
     }
 }
 
-"""W3021: Warn when else block follows an if that always returns."""
 impl JacAutoLintPass._check_unnecessary_else_after_return(nd: uni.IfStmt) -> None {
     if self._is_suppressed(W3021) {
         return;
     }
-    # Check if the if-body ends with a return
+
     if not nd.body {
         return;
     }
@@ -1840,14 +1656,13 @@ impl JacAutoLintPass._check_unnecessary_else_after_return(nd: uni.IfStmt) -> Non
     if not isinstance(last_stmt, (uni.ReturnStmt, uni.RaiseStmt)) {
         return;
     }
-    # Check if there's an else clause
+
     else_node = nd.else_body;
     if else_node is not None and isinstance(else_node, uni.ElseStmt) {
         self.emit(W3021, node_override=else_node);
     }
 }
 
-"""W3022: Warn when else contains a single if that could be elif."""
 impl JacAutoLintPass._check_nested_if_to_elif(nd: uni.ElseStmt) -> None {
     if self._is_suppressed(W3022) {
         return;
@@ -1865,7 +1680,6 @@ impl JacAutoLintPass._check_nested_if_to_elif(nd: uni.ElseStmt) -> None {
     }
 }
 
-"""W3023: Warn on 'if cond { return True; } else { return False; }' pattern."""
 impl JacAutoLintPass._check_return_bool_simplification(nd: uni.IfStmt) -> None {
     if self._is_suppressed(W3023) {
         return;
@@ -1889,7 +1703,7 @@ impl JacAutoLintPass._check_return_bool_simplification(nd: uni.IfStmt) -> None {
     if_ret = if_body[0];
     else_ret = else_body[0];
     if not isinstance(if_ret, uni.ReturnStmt)
-    or not isinstance(else_ret, uni.ReturnStmt) {
+        or not isinstance(else_ret, uni.ReturnStmt) {
         return;
     }
     if (
@@ -1901,7 +1715,6 @@ impl JacAutoLintPass._check_return_bool_simplification(nd: uni.IfStmt) -> None {
     }
 }
 
-"""W3024: Warn on repeated conditions in if/elif chain."""
 impl JacAutoLintPass._check_repeated_condition(nd: uni.IfStmt) -> None {
     if self._is_suppressed(W3024) {
         return;
@@ -1911,7 +1724,7 @@ impl JacAutoLintPass._check_repeated_condition(nd: uni.IfStmt) -> None {
     if cond_key is not None {
         conditions.append(cond_key);
     }
-    # Walk elif chain
+
     current = nd.else_body;
     while current is not None and isinstance(current, uni.ElseIf) {
         elif_key = self._expr_to_key(current.condition);
@@ -1925,7 +1738,6 @@ impl JacAutoLintPass._check_repeated_condition(nd: uni.IfStmt) -> None {
     }
 }
 
-"""W3025: Warn when if and else branches are identical."""
 impl JacAutoLintPass._check_identical_branches(nd: uni.IfStmt) -> None {
     if self._is_suppressed(W3025) {
         return;
@@ -1946,13 +1758,13 @@ impl JacAutoLintPass._check_identical_branches(nd: uni.IfStmt) -> None {
     if not if_body or len(if_body) != len(else_body) {
         return;
     }
-    # Cheap guard: bail if top-level statement kinds differ.
+
     for (a, b) in zip(if_body, else_body) {
         if type(a) is not type(b) {
             return;
         }
     }
-    # Definitive comparison: canonical unparse of each branch must match.
+
     if_src = "".join(s.unparse() for s in if_body);
     else_src = "".join(s.unparse() for s in else_body);
     if if_src == else_src {
@@ -1960,7 +1772,6 @@ impl JacAutoLintPass._check_identical_branches(nd: uni.IfStmt) -> None {
     }
 }
 
-"""W3030: Warn when a function has too many parameters."""
 impl JacAutoLintPass._check_too_many_params(nd: uni.FuncSignature) -> None {
     if self._is_suppressed(W3030) {
         return;
@@ -1977,7 +1788,7 @@ impl JacAutoLintPass._check_too_many_params(nd: uni.FuncSignature) -> None {
     if nd.kwargs {
         count += 1;
     }
-    # Subtract 'self' parameter if present
+
     all_params: list[uni.ParamVar] = list(nd.posonly_params);
     if nd.params {
         all_params.extend(nd.params);
@@ -1990,7 +1801,6 @@ impl JacAutoLintPass._check_too_many_params(nd: uni.FuncSignature) -> None {
     }
 }
 
-"""W3035: Warn on 'is' comparison with a literal (except None/True/False)."""
 impl JacAutoLintPass._check_is_with_literal(nd: uni.CompareExpr) -> None {
     if self._is_suppressed(W3035) {
         return;
@@ -2003,7 +1813,7 @@ impl JacAutoLintPass._check_is_with_literal(nd: uni.CompareExpr) -> None {
         if right is None {
             continue;
         }
-        # None, True, False are singletons — 'is' is correct for them
+
         if isinstance(right, (uni.Null, uni.Bool)) {
             continue;
         }
@@ -2013,19 +1823,12 @@ impl JacAutoLintPass._check_is_with_literal(nd: uni.CompareExpr) -> None {
     }
 }
 
-"""W3040: Warn when a filter comparison has identical LHS and RHS names.
-
-In a filter expression like [?:Type, field == field], the LHS is resolved
-as a node field and the RHS — intended to reference an enclosing-scope
-variable — silently rebinds to the same node field, making the comparison
-a tautology (always true).
-"""
 impl JacAutoLintPass._check_filter_compare_tautology(nd: uni.CompareExpr) -> None {
     import from jaclang.jac0core.diagnostics { W3040 }
     if self._is_suppressed(W3040) {
         return;
     }
-    # Only applies inside a FilterCompr context
+
     if not nd.find_parent_of_type(uni.FilterCompr) {
         return;
     }
@@ -2038,26 +1841,11 @@ impl JacAutoLintPass._check_filter_compare_tautology(nd: uni.CompareExpr) -> Non
         ) {
             self.emit(W3040, node_override=nd, name=left.value);
         }
-        # For chained comparisons, next left is the current right
+
         left = right;
     }
 }
 
-"""W3041: Warn when a reactive `has` field is read after assignment in the same `can with entry` body.
-
-The body lowers (in client codespace) to a useEffect callback whose closure
-captures `has` field values at render time. After an assignment to a reactive
-field within the body, the field's setter is queued for the next render — but
-reads of that field within the same effect run still resolve to the captured
-pre-update value. Branching on the just-assigned value silently does the wrong
-thing. This is the textbook React stale-closure bug; it has historically been
-the most expensive client-code failure mode for AI-generated Jac because it
-compiles cleanly and only manifests at runtime.
-
-Only entry abilities in client context are checked: `can with exit` runs at
-unmount with no re-render scheduling, and server-side `has` is a real mutable
-property where reads after writes return the new value.
-"""
 impl JacAutoLintPass._check_stale_has_read(ability_node: uni.Ability) -> None {
     if self._is_suppressed(W3041) {
         return;
@@ -2111,11 +1899,6 @@ impl JacAutoLintPass._check_stale_has_read(ability_node: uni.Ability) -> None {
     }
 }
 
-"""Collect the set of `has` field names that are reactive in the enclosing client scope.
-
-Reactive fields are `has` declarations on the nearest enclosing client-context
-container — either a `def:pub` function (cl component) or an Archetype.
-"""
 impl JacAutoLintPass._collect_reactive_has_names(
     ability_node: uni.Ability
 ) -> set[str] {
@@ -2140,19 +1923,13 @@ impl JacAutoLintPass._collect_reactive_has_names(
     return names;
 }
 
-"""Recursively collect (write, read) sites for reactive `has` fields.
-
-Skips nested deferred-execution scopes (lambdas, nested abilities, archetypes):
-their bodies execute in their own contexts and aren't subject to the same
-closure capture as the enclosing effect run.
-"""
 impl JacAutoLintPass._walk_for_has_uses(
     nd: uni.UniNode,
     reactive: set[str],
     writes: list[tuple[int, int, str]],
     reads: list[tuple[int, int, str, uni.Name]]
 ) -> None {
-    import ast as ast3;
+    import from jaclang.jac0core.constant { ExprCtx }
     if isinstance(nd, (uni.LambdaExpr, uni.Ability, uni.Archetype)) {
         return;
     }
@@ -2171,7 +1948,7 @@ impl JacAutoLintPass._walk_for_has_uses(
         return;
     }
     if isinstance(nd, uni.Name) {
-        if nd.value in reactive and nd._py_ctx_func == ast3.Load {
+        if nd.value in reactive and nd.expr_ctx == ExprCtx.LOAD {
             parent = nd.parent;
             if not (isinstance(parent, uni.AtomTrailer) and parent.is_attr) {
                 reads.append((nd.loc.first_line, nd.loc.col_start, nd.value, nd));
@@ -2184,7 +1961,6 @@ impl JacAutoLintPass._walk_for_has_uses(
     }
 }
 
-"""W3036: Warn on mutable default argument (list, dict, set)."""
 impl JacAutoLintPass._check_mutable_default(nd: uni.ParamVar) -> None {
     if self._is_suppressed(W3036) {
         return;
@@ -2202,28 +1978,25 @@ impl JacAutoLintPass._check_mutable_default(nd: uni.ParamVar) -> None {
     }
 }
 
-"""Visitor: check if-statement lint rules on exit."""
 impl JacAutoLintPass.exit_if_stmt(nd: uni.IfStmt) -> None {
     if not self.lint_enabled {
         return;
     }
-    self._check_unnecessary_pass(list(nd.body), nd);
+    self._check_unnecessary_pass(list(nd.body));
     self._check_unnecessary_else_after_return(nd);
     self._check_return_bool_simplification(nd);
     self._check_repeated_condition(nd);
     self._check_identical_branches(nd);
 }
 
-"""Visitor: check else-statement lint rules."""
 impl JacAutoLintPass.enter_else_stmt(nd: uni.ElseStmt) -> None {
     if not self.lint_enabled {
         return;
     }
-    self._check_unnecessary_pass(list(nd.body), nd);
+    self._check_unnecessary_pass(list(nd.body));
     self._check_nested_if_to_elif(nd);
 }
 
-"""Visitor: check compare expressions for 'is' with literal."""
 impl JacAutoLintPass.exit_compare_expr(nd: uni.CompareExpr) -> None {
     if not self.lint_enabled {
         return;
@@ -2232,7 +2005,6 @@ impl JacAutoLintPass.exit_compare_expr(nd: uni.CompareExpr) -> None {
     self._check_filter_compare_tautology(nd);
 }
 
-"""Visitor: check function signatures for too many params."""
 impl JacAutoLintPass.exit_func_signature(nd: uni.FuncSignature) -> None {
     if not self.lint_enabled {
         return;
@@ -2240,7 +2012,6 @@ impl JacAutoLintPass.exit_func_signature(nd: uni.FuncSignature) -> None {
     self._check_too_many_params(nd);
 }
 
-"""Visitor: check parameter variables for mutable defaults."""
 impl JacAutoLintPass.enter_param_var(nd: uni.ParamVar) -> None {
     if not self.lint_enabled {
         return;
@@ -2248,17 +2019,15 @@ impl JacAutoLintPass.enter_param_var(nd: uni.ParamVar) -> None {
     self._check_mutable_default(nd);
 }
 
-"""Visitor: check archetype bodies for unnecessary pass."""
 impl JacAutoLintPass.exit_archetype(nd: uni.Archetype) -> None {
     if not self.lint_enabled {
         return;
     }
     if nd.body is not None and isinstance(nd.body, list) {
-        self._check_unnecessary_pass(list(nd.body), nd);
+        self._check_unnecessary_pass(list(nd.body));
     }
 }
 
-"""Visitor: check lambda bodies for unnecessary -> None."""
 impl JacAutoLintPass.exit_lambda_expr(nd: uni.LambdaExpr) -> None {
     if not self.lint_enabled {
         return;
@@ -2266,7 +2035,6 @@ impl JacAutoLintPass.exit_lambda_expr(nd: uni.LambdaExpr) -> None {
     self._check_unnecessary_none_return(nd, nd.body, nd.signature, "lambda");
 }
 
-"""W3037: Warn on unnecessary '-> None' return type annotation."""
 impl JacAutoLintPass._check_unnecessary_none_return(
     nd: (uni.Ability | uni.LambdaExpr),
     body: (list | uni.Expr),
@@ -2276,11 +2044,11 @@ impl JacAutoLintPass._check_unnecessary_none_return(
     if self._is_suppressed(W3037) {
         return;
     }
-    # Must have a FuncSignature with an explicit return_type
+
     if not isinstance(sig, uni.FuncSignature) or sig.return_type is None {
         return;
     }
-    # Check if return type is explicitly 'None'
+
     ret = sig.return_type;
     is_none_return = (
         isinstance(ret, uni.Null)
@@ -2290,11 +2058,11 @@ impl JacAutoLintPass._check_unnecessary_none_return(
     if not is_none_return {
         return;
     }
-    # Only check block bodies (list of statements), not expression bodies
+
     if not isinstance(body, list) {
         return;
     }
-    # If body has no return statements, -> None is unnecessary
+
     if not self._body_has_return_stmt(body) {
         if not self.emit(W3037, node_override=sig.return_type, name=name) {
             return;
@@ -2302,7 +2070,7 @@ impl JacAutoLintPass._check_unnecessary_none_return(
         if self.report_only {
             return;
         }
-        # Auto-fix: remove '-> None' from FuncSignature
+
         sig.return_type = None;
         new_kid: list[uni.UniNode] = [];
         skip_next = False;
@@ -2320,9 +2088,6 @@ impl JacAutoLintPass._check_unnecessary_none_return(
         if len(new_kid) > 0 {
             sig.set_kids(nodes=new_kid);
         } else {
-            # Signature had only -> None (no params): remove it entirely.
-            # All downstream passes (pyast_gen, esast_gen, unparse, normalize,
-            # doc_ir_gen) already guard .signature access with None/isinstance checks.
             if isinstance(nd, uni.LambdaExpr) {
                 nd.signature = None;
             } elif isinstance(nd, uni.Ability) {
@@ -2338,13 +2103,12 @@ impl JacAutoLintPass._check_unnecessary_none_return(
     }
 }
 
-"""Check if a body contains any return statements (not in nested functions/lambdas)."""
 impl JacAutoLintPass._body_has_return_stmt(body: list) -> bool {
     for stmt in body {
         if isinstance(stmt, uni.ReturnStmt) {
             return True;
         }
-        # Recurse into control flow but NOT into nested Ability/LambdaExpr
+
         if isinstance(stmt, uni.IfStmt) {
             if self._body_has_return_stmt(list(stmt.body)) {
                 return True;
@@ -2366,7 +2130,10 @@ impl JacAutoLintPass._body_has_return_stmt(body: list) -> bool {
                 }
             }
         }
-        if isinstance(stmt, uni.InForStmt) or isinstance(stmt, uni.WhileStmt) {
+        if isinstance(stmt, uni.InForStmt)
+            or isinstance(stmt, uni.IterForStmt)
+            or isinstance(stmt, uni.WhileStmt)
+            or isinstance(stmt, uni.ForeverStmt) {
             if self._body_has_return_stmt(list(stmt.body)) {
                 return True;
             }
@@ -2402,22 +2169,13 @@ impl JacAutoLintPass._body_has_return_stmt(body: list) -> bool {
     return False;
 }
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# useState-to-has conversion (W3038)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""Check if a statement is a useState destructuring assignment.
-
-Matches: [varName, setterName] = useState(initialValue)
-
-Returns (var_name, setter_name, initial_value_node) tuple if matched, else None.
-"""
 impl JacAutoLintPass._is_usestate_assignment(
     stmt: uni.UniNode
 ) -> (tuple[str, str, uni.Expr | None] | None) {
     if not isinstance(stmt, uni.Assignment) {
         return None;
     }
-    # Right side must be a FuncCall to useState
+
     rhs = stmt.value;
     if not isinstance(rhs, uni.FuncCall) {
         return None;
@@ -2425,7 +2183,7 @@ impl JacAutoLintPass._is_usestate_assignment(
     if not isinstance(rhs.target, uni.Name) or rhs.target.value != "useState" {
         return None;
     }
-    # Left side must be a single ListVal with exactly two Name elements
+
     if len(stmt.target) != 1 {
         return None;
     }
@@ -2451,12 +2209,6 @@ impl JacAutoLintPass._is_usestate_assignment(
     return (name_node.value, setter_node.value, initial_value);
 }
 
-"""Infer a Jac type string from the initial useState value.
-
-Maps common literal types to their Jac equivalents.
-Falls back to 'any' for complex expressions.
-TODO: this is ad-hoc, need to do proper type inference.
-"""
 impl JacAutoLintPass._infer_type_from_usestate_value(value: (uni.Expr | None)) -> str {
     if value is None {
         return "any";
@@ -2485,15 +2237,9 @@ impl JacAutoLintPass._infer_type_from_usestate_value(value: (uni.Expr | None)) -
     return "any";
 }
 
-"""Create an ArchHas (has declaration) node from useState info.
-
-Produces: has var_name: type_str = init_value;
-Uses ref_node for source-location metadata on generated tokens.
-"""
 impl JacAutoLintPass._create_has_from_usestate(
     ref_node: uni.UniNode, var_name: str, type_str: str, init_value: (uni.Expr | None)
 ) -> uni.ArchHas {
-    # Build the Name node for the variable
     name_node = uni.Name(
         orig_src=ref_node.loc.orig_src,
         name=Tok.NAME.value,
@@ -2506,7 +2252,7 @@ impl JacAutoLintPass._create_has_from_usestate(
         pos_end=ref_node.loc.pos_end,
         is_kwesc=False
     );
-    # Build the type Name node
+
     type_name_node = uni.Name(
         orig_src=ref_node.loc.orig_src,
         name=Tok.NAME.value,
@@ -2519,7 +2265,7 @@ impl JacAutoLintPass._create_has_from_usestate(
         pos_end=ref_node.loc.pos_end,
         is_kwesc=False
     );
-    colon_tok = ref_node.gen_token(Tok.COLON);  # Use ref_node to generate tokens
+    colon_tok = ref_node.gen_token(Tok.COLON);
     type_tag = uni.SubTag(tag=type_name_node, kid=[colon_tok, type_name_node]);
     has_var_kids: list[uni.UniNode] = [name_node, type_tag];
     if init_value is not None {
@@ -2534,7 +2280,7 @@ impl JacAutoLintPass._create_has_from_usestate(
         defer=False,
         kid=has_var_kids
     );
-    # ArchHas kid: [has_kw, has_var, semi] — must be non-empty at construction
+
     has_kw = ref_node.gen_token(Tok.KW_HAS);
     semi_tok = ref_node.gen_token(Tok.SEMI);
     arch_has = uni.ArchHas(
@@ -2549,19 +2295,13 @@ impl JacAutoLintPass._create_has_from_usestate(
 }
 
 
-"""Convert useState hooks inside an ability to has declarations.
-
-Detects useState assignments, creates has nodes in their place, and pushes
-the setter→var mapping onto _pending_setters so that exit_expr_stmt can
-replace setter calls as the visitor naturally walks into child nodes.
-"""
 impl JacAutoLintPass._convert_usestate_vars(ability_node: uni.Ability) -> None {
     if not ability_node.body or not isinstance(ability_node.body, list) {
         return;
     }
     new_body: list[uni.UniNode] = [];
-    replaced: dict[int, uni.ArchHas] = {};  # old stmt id -> new ArchHas for kid rebuild
-    setters: dict[str, str] = {};  # setter_name -> var_name for this ability
+    replaced: dict[int, uni.ArchHas] = {};
+    setters: dict[str, str] = {};
     for stmt in ability_node.body {
         match_result = self._is_usestate_assignment(stmt);
         if match_result is None {
@@ -2592,14 +2332,10 @@ impl JacAutoLintPass._convert_usestate_vars(ability_node: uni.Ability) -> None {
         ability_node.kid = [replaced.get(id(k), k) for k in ability_node.kid];
         ability_node._invalidate_sub_node_tab();
     }
-    # Always push (even if empty) so exit_ability can always pop safely.
-    # Without this, a nested def exiting would pop the outer ability's map.
+
     self._pending_setters.append(setters);
 }
 
-"""W3038: rewrite setterName(expr) → varName = expr for each ExprStmt.
-_pending_setters is a per-ability stack so nested abilities don't interfere.
-"""
 impl JacAutoLintPass.exit_expr_stmt(nd: uni.ExprStmt) -> None {
     if not self.lint_enabled or self.report_only or not self._pending_setters {
         return;
@@ -2653,7 +2389,7 @@ impl JacAutoLintPass.exit_expr_stmt(nd: uni.ExprStmt) -> None {
         ]
     );
     assign.parent = parent;
-    # Swap nd -> assign in parent.body and parent.kid
+
     if isinstance(parent?.body, list) {
         parent.body = [assign if s is nd else s for s in parent.body];
     }
@@ -2661,8 +2397,6 @@ impl JacAutoLintPass.exit_expr_stmt(nd: uni.ExprStmt) -> None {
     parent._invalidate_sub_node_tab();
 }
 
-"""Remove useState from each import statement in the module, dropping the whole statement
-if useState was the only item, or rebuilding kids with correct commas if it was partial."""
 impl JacAutoLintPass._strip_usestate_imports(nd: uni.Module) -> None {
     if not self.lint_enabled or self.report_only or not self._did_convert_usestate {
         return;
@@ -2678,8 +2412,8 @@ impl JacAutoLintPass._strip_usestate_imports(nd: uni.Module) -> None {
             item
             for item in stmt.items
             if isinstance(item, uni.ModuleItem)
-            and isinstance(item.name, uni.Name)
-            and item.name.value == "useState"
+                and isinstance(item.name, uni.Name)
+                and item.name.value == "useState"
         };
         if not usestate_items {
             new_body.append(stmt);
@@ -2691,11 +2425,10 @@ impl JacAutoLintPass._strip_usestate_imports(nd: uni.Module) -> None {
             if item not in usestate_items
         ];
         if not stmt.items {
-            removed.add(id(stmt));  # useState was the only import — drop whole stmt
+            removed.add(id(stmt));
             continue;
         }
-        # Partial removal — strip useState items then fix orphaned commas.
-        # Handles all 3 positions: ({ useState, X }), ({ X, useState }), ({ X, useState, Y })
+
         new_kid = [
             kid
             for kid in stmt.kid
@@ -2739,21 +2472,84 @@ impl JacAutoLintPass._strip_usestate_imports(nd: uni.Module) -> None {
                 for k in nd.kid
                 if id(k) not in removed
             ]
-            or [uni.EmptyToken()]
+                or [uni.EmptyToken()]
         );
     }
     self.recalculate_parents(nd);
 }
 
-"""W3038: drop useState from imports after all useState hooks have been converted."""
 impl JacAutoLintPass.exit_module(nd: uni.Module) -> None {
     self._strip_usestate_imports(nd);
+    self._strip_noise(nd);
 }
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# map-lambda-to-comprehension conversion (W3042)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-"""Build a synthetic Name node anchored to ref_node's source location."""
+impl JacAutoLintPass._strip_noise(nd: uni.Module) -> None {
+    if not self.lint_enabled {
+        return;
+    }
+
+    if self._is_file_excluded(nd.loc.mod_path) {
+        return;
+    }
+
+    if not self._is_suppressed(W3050) and nd.source.comments {
+        kept: list = [];
+        suppression_lines = nd.source.inline_suppressions;
+        for comment in list(nd.source.comments) {
+            if comment.line_no in suppression_lines {
+                kept.append(comment);
+                continue;
+            }
+            self.emit(W3050, node_override=comment);
+        }
+        if not self.report_only {
+            nd.source.comments = kept;
+        }
+    }
+
+    if not self._is_suppressed(W3051) {
+        self._strip_docstrings(nd);
+    }
+}
+
+impl JacAutoLintPass._strip_docstrings(start: uni.UniNode) -> None {
+    doc_nodes: list[uni.UniNode] = [];
+    self._collect_doc_nodes(start, doc_nodes);
+    for `node in doc_nodes {
+        doc_str = `node.doc;
+        if doc_str is None {
+            continue;
+        }
+        self.emit(W3051, node_override=doc_str);
+        if self.report_only {
+            continue;
+        }
+        `node.doc = None;
+        new_kid: list[uni.UniNode] = [
+            k
+            for k in `node.kid
+            if k is not doc_str
+        ];
+        `node.set_kids(nodes=new_kid if len(new_kid) else [uni.EmptyToken()]);
+        `node._invalidate_sub_node_tab();
+    }
+}
+
+impl JacAutoLintPass._collect_doc_nodes(`node: uni.UniNode, results: list) -> None {
+    stack: list[uni.UniNode] = [`node];
+    while stack {
+        current = stack.pop();
+        if isinstance(current, uni.AstDocNode) and current.doc is not None {
+            results.append(current);
+        }
+        for kid in current.kid {
+            if kid is not None {
+                stack.append(kid);
+            }
+        }
+    }
+}
+
 impl JacAutoLintPass._make_name_node(ref_node: uni.UniNode, value: str) -> uni.Name {
     return uni.Name(
         orig_src=ref_node.loc.orig_src,
@@ -2769,7 +2565,6 @@ impl JacAutoLintPass._make_name_node(ref_node: uni.UniNode, value: str) -> uni.N
     );
 }
 
-"""Match <expr>.map(lambda item -> JSX) and return (item, jsx, collection), or None."""
 impl JacAutoLintPass._detect_map_lambda_jsx(
     nd: uni.FuncCall
 ) -> (tuple[str, uni.JsxElement, uni.Expr] | None) {
@@ -2778,11 +2573,11 @@ impl JacAutoLintPass._detect_map_lambda_jsx(
     }
     trailer = nd.target;
     if not trailer.is_attr
-    or not isinstance(trailer.right, uni.Name)
-    or trailer.right.value != "map"
-    or nd.params is None
-    or len(nd.params) != 1
-    or not isinstance(nd.params[0], uni.LambdaExpr) {
+        or not isinstance(trailer.right, uni.Name)
+        or trailer.right.value != "map"
+        or nd.params is None
+        or len(nd.params) != 1
+        or not isinstance(nd.params[0], uni.LambdaExpr) {
         return None;
     }
     lam: uni.LambdaExpr = nd.params[0];
@@ -2797,7 +2592,7 @@ impl JacAutoLintPass._detect_map_lambda_jsx(
     if len(real_stmts) != 1 or not isinstance(real_stmts[0], uni.ReturnStmt) {
         return None;
     }
-    # Unwrap `return (<jsx>)` — parentheses produce AtomUnit(value=JsxElement)
+
     jsx: uni.Expr = real_stmts[0].expr;
     if isinstance(jsx, uni.AtomUnit) and isinstance(jsx.value, uni.JsxElement) {
         jsx = jsx.value;
@@ -2810,9 +2605,8 @@ impl JacAutoLintPass._detect_map_lambda_jsx(
     if sig is None {
         return None;
     }
-    all_params: list[uni.ParamVar] = list(sig.posonly_params or []) + list(
-        sig.params or []
-    );
+    all_params: list[uni.ParamVar] = list(sig.posonly_params or [])
+        + list(sig.params or []);
     if len(all_params) != 1 {
         return None;
     }
@@ -2821,23 +2615,20 @@ impl JacAutoLintPass._detect_map_lambda_jsx(
     return (item_name, jsx, trailer.target);
 }
 
-"""Check whether collection is arr.filter(lambda -> bool { return <cond>; }).
-Returns (cond_expr, real_collection) when the pattern matches, else None.
-"""
 impl JacAutoLintPass._extract_filter_cond(
     collection: uni.Expr
 ) -> (tuple[uni.Expr, uni.Expr] | None) {
     if not isinstance(collection, uni.FuncCall)
-    or not isinstance(collection.target, uni.AtomTrailer) {
+        or not isinstance(collection.target, uni.AtomTrailer) {
         return None;
     }
     ft = collection.target;
     if not ft.is_attr
-    or not isinstance(ft.right, uni.Name)
-    or ft.right.value != "filter"
-    or collection.params is None
-    or len(collection.params) != 1
-    or not isinstance(collection.params[0], uni.LambdaExpr) {
+        or not isinstance(ft.right, uni.Name)
+        or ft.right.value != "filter"
+        or collection.params is None
+        or len(collection.params) != 1
+        or not isinstance(collection.params[0], uni.LambdaExpr) {
         return None;
     }
     filter_lam: uni.LambdaExpr = collection.params[0];
@@ -2850,18 +2641,13 @@ impl JacAutoLintPass._extract_filter_cond(
         if not isinstance(s, uni.Semi)
     ];
     if len(filter_stmts) != 1
-    or not isinstance(filter_stmts[0], uni.ReturnStmt)
-    or filter_stmts[0].expr is None {
+        or not isinstance(filter_stmts[0], uni.ReturnStmt)
+        or filter_stmts[0].expr is None {
         return None;
     }
     return (filter_stmts[0].expr, ft.target);
 }
 
-"""W3042: Replace arr.map(lambda -> JSX) with a list comprehension.
-
-Detect-and-validate first, emit second, mutate last — so a warning is never
-reported for a case the auto-fix can't actually rewrite.
-"""
 impl JacAutoLintPass._convert_map_to_comprehension(nd: uni.FuncCall) -> bool {
     if self._is_suppressed(W3042) {
         return False;
@@ -2878,8 +2664,6 @@ impl JacAutoLintPass._convert_map_to_comprehension(nd: uni.FuncCall) -> bool {
         (filter_cond, collection) = filter_result;
     }
 
-    # Verify the parent slot we'd write into supports the rewrite *before*
-    # emitting, so we never warn without fixing.
     parent = nd.parent;
     if parent is None {
         return False;
@@ -2894,6 +2678,9 @@ impl JacAutoLintPass._convert_map_to_comprehension(nd: uni.FuncCall) -> bool {
 
     if not self.emit(W3042, node_override=nd, name=item_name) {
         return False;
+    }
+    if self.report_only {
+        return True;
     }
 
     target_node: uni.Expr = self._make_name_node(nd, item_name);
@@ -2938,7 +2725,6 @@ impl JacAutoLintPass._convert_map_to_comprehension(nd: uni.FuncCall) -> bool {
     } elif isinstance(parent, uni.Assignment) {
         parent.value = list_compr;
     } else {
-        # uni.ReturnStmt — only reachable case left
         parent.expr = list_compr;
     }
     parent.kid = [list_compr if k is nd else k for k in parent.kid];
@@ -2947,23 +2733,24 @@ impl JacAutoLintPass._convert_map_to_comprehension(nd: uni.FuncCall) -> bool {
 }
 
 
-"""W3043: classify an ability as a property accessor by its decorators.
-
-Returns "property" for a `@property` getter, "setter" for `@<name>.setter`,
-"deleter" for `@<name>.deleter`, and "" for anything else (including
-`@cached_property`, whose caching semantics have no native equivalent).
-"""
 impl JacAutoLintPass._property_role_of_ability(ab: uni.Ability) -> str {
     if not ab.decorators {
         return "";
     }
+    own_name = ab.name_ref.value if isinstance(ab.name_ref, uni.Name) else "";
     for dec in ab.decorators {
         if isinstance(dec, uni.Name) and dec.value == "property" {
             return "property";
         }
+
         if isinstance(dec, uni.AtomTrailer)
-        and dec.is_attr
-        and isinstance(dec.right, uni.Name) {
+            and dec.is_attr
+            and isinstance(dec.right, uni.Name)
+            and isinstance(dec.target, uni.Name)
+            and dec.target.value == own_name {
+            if dec.right.value == "getter" {
+                return "property";
+            }
             if dec.right.value == "setter" {
                 return "setter";
             }
@@ -2975,13 +2762,6 @@ impl JacAutoLintPass._property_role_of_ability(ab: uni.Ability) -> str {
     return "";
 }
 
-"""W3043: build a single native-property accessor Ability from a decorated one.
-
-`kind` is the accessor_kind ("property"/"setter"/"deleter"). The getter drops
-its return type (the property's declared type carries it on the `has`); the
-setter keeps its `(value: T)` signature. A signature-only declaration (no body)
-becomes a `getter;`/`setter;`/`deleter;` stub whose body lives in an impl file.
-"""
 impl JacAutoLintPass._make_accessor_from_ability(
     src: uni.Ability, kind: str
 ) -> uni.Ability {
@@ -3023,7 +2803,6 @@ impl JacAutoLintPass._make_accessor_from_ability(
     );
 }
 
-"""W3043: assemble `has <name>: <type> { <accessors> }` as an ArchHas node."""
 impl JacAutoLintPass._build_property_has(
     ref_node: uni.UniNode, prop_name: str, type_expr: (uni.Expr | None), accessors: list
 ) -> uni.ArchHas {
@@ -3054,16 +2833,17 @@ impl JacAutoLintPass._build_property_has(
     );
 }
 
-"""W3043: convert @property accessor abilities in an archetype body to native
-`has name: T { getter; setter; deleter; }` declarations, mutating body + kid.
-"""
 impl JacAutoLintPass._convert_properties(container: uni.Archetype) -> None {
+    if self._is_file_excluded(container.loc.mod_path) {
+        return;
+    }
     body = container.body;
     if not isinstance(body, list) {
         return;
     }
     groups: dict[str, dict[str, uni.Ability]] = {};
     group_indices: dict[str, list[int]] = {};
+    prop_types: dict[str, uni.Expr] = {};
     order: list[str] = [];
     for (idx, item) in enumerate(body) {
         if not isinstance(item, uni.Ability) {
@@ -3079,25 +2859,38 @@ impl JacAutoLintPass._convert_properties(container: uni.Archetype) -> None {
             group_indices[pname] = [];
             order.append(pname);
         }
+
+        if role == "property" and pname not in prop_types {
+            declared = item.signature.return_type if item.signature else None;
+            if declared is not None {
+                prop_types[pname] = declared;
+            }
+        }
         groups[pname][role] = item;
         group_indices[pname].append(idx);
     }
-    replaced: dict[int, uni.ArchHas] = {};  # first body index -> new ArchHas
+    replaced: dict[int, uni.ArchHas] = {};
     dropped_ids: set[int] = set();
     for pname in order {
         g = groups[pname];
         if "property" not in g {
-            continue;  # a property must have a getter to convert
+            continue;
         }
         getter_ab = g["property"];
         type_expr = getter_ab.signature.return_type if getter_ab.signature else None;
         if type_expr is None {
-            continue;  # native `has name: T` requires a declared type
+            type_expr = prop_types.get(pname);
+        }
+        if type_expr is None {
+            continue;
         }
         type_name = type_expr.value if isinstance(type_expr, uni.Name) else "...";
         if not self.emit(
             W3043, node_override=getter_ab, name=pname, type_name=type_name
         ) {
+            continue;
+        }
+        if self.report_only {
             continue;
         }
         accessors: list[uni.Ability] = [
@@ -3147,38 +2940,119 @@ impl JacAutoLintPass._convert_properties(container: uni.Archetype) -> None {
     self.recalculate_parents(container);
 }
 
-"""W3043: determine the accessor kind for an impl whose target is a property.
+impl JacAutoLintPass._property_impl_roles(
+    arch: uni.Archetype, prop_name: str
+) -> dict[str, list[uni.Ability]] {
+    roles: dict[str, list[uni.Ability]] = {};
 
-Uses the matched declaration (decl_link) to classify: a getter impl when the
-decl is `@property`, a setter/deleter impl for the respective decorators.
-Returns "" when the impl is not a property accessor or is already native.
-"""
+    for member in arch.body {
+        if not isinstance(member, uni.ArchHas) {
+            continue;
+        }
+        for var in member.vars {
+            if var.name.sym_name != prop_name or not var.accessors {
+                continue;
+            }
+            for acc in var.accessors {
+                roles.setdefault(acc.accessor_kind, []).append(acc);
+            }
+        }
+    }
+    if roles {
+        return roles;
+    }
+    for member in arch.body {
+        if not isinstance(member, uni.Ability) {
+            continue;
+        }
+        if not member.name_ref or member.name_ref.sym_name != prop_name {
+            continue;
+        }
+        role = self._property_role_of_ability(member);
+        if role {
+            roles.setdefault(role, []).append(member);
+        }
+    }
+
+    for getter in roles.get("property", []) {
+        if getter.signature
+            and (getter.signature.return_type is not None)
+            and not self._is_suppressed(W3043, getter.loc) {
+            return roles;
+        }
+    }
+    return {};
+}
+
 impl JacAutoLintPass._impl_property_kind(nd: uni.ImplDef) -> str {
     if not nd.target {
         return "";
     }
     last = nd.target[-1];
     if isinstance(last, uni.Name) and last.value in ["getter", "setter", "deleter"] {
-        return "";  # already native dotted-accessor impl
+        return "";
     }
     decl = nd.decl_link;
     if isinstance(decl, uni.Ability) {
         return self._property_role_of_ability(decl);
     }
-    # Fallback for the parse-only format pipeline (no decl_link): consult the
-    # driver-populated dotted-target map.
-    dotted = ".".join(
-        [
-            t.value
-            for t in nd.target
-            if isinstance(t, uni.Name)
-        ]
-    );
-    return PROPERTY_IMPL_TARGETS.get(dotted, "");
+
+    arch = self._impl_owner_archetype(nd);
+    prop_name = last.sym_name if last else "";
+    if arch is None or not prop_name {
+        return "";
+    }
+    roles = self._property_impl_roles(arch, prop_name);
+    if "property" not in roles {
+        return "";
+    }
+
+    pending: dict[str, uni.Ability] = {};
+    for (role, accessors) in roles.items() {
+        for acc in accessors {
+            if acc.body is None and role not in pending {
+                pending[role] = acc;
+            }
+        }
+    }
+    if not pending {
+        return "";
+    }
+    if len(pending) == 1 {
+        return list(pending.keys())[0];
+    }
+
+    spec = nd.spec if isinstance(nd.spec, uni.FuncSignature) else None;
+    for role in ["property", "setter", "deleter"] {
+        acc = pending.get(role);
+        if (
+            (acc is not None)
+            and (acc.signature is not None)
+            and (spec is not None)
+            and self._signatures_match(acc.signature, spec)
+        ) {
+            return role;
+        }
+    }
+
+    takes_value = (spec is not None) and len(spec.params) > 0;
+    returns_value = (spec is not None) and (spec.return_type is not None);
+    if takes_value and "setter" in pending {
+        return "setter";
+    }
+    if not takes_value and not returns_value and "deleter" in pending {
+        return "deleter";
+    }
+    if "property" in pending {
+        return "property";
+    }
+    return list(pending.keys())[0];
 }
 
-"""W3043: rewrite `impl Cls.prop` -> `impl Cls.prop.getter/.setter/.deleter`."""
 impl JacAutoLintPass._convert_property_impl(nd: uni.ImplDef) -> None {
+    if self._is_file_excluded(nd.loc.mod_path) {
+        return;
+    }
     kind = self._impl_property_kind(nd);
     if kind == "" {
         return;
@@ -3188,12 +3062,19 @@ impl JacAutoLintPass._convert_property_impl(nd: uni.ImplDef) -> None {
     if not self.emit(W3043, node_override=nd, name=prop_name, type_name="...") {
         return;
     }
-    # Anchor the synthetic `.getter` tokens at the last target name's position
-    # (not the impl keyword's) so the kid position sequence stays monotonic and
-    # the position-based comment injector keeps body comments attached.
+    if self.report_only {
+        return;
+    }
+
     kw = "getter" if kind == "property" else kind;
     acc_name = self._make_name_node(last_target, kw);
     dot_tok = last_target.gen_token(Tok.DOT);
+
+    end_col = last_target.loc.col_end;
+    dot_tok.c_start = end_col;
+    dot_tok.c_end = end_col;
+    acc_name.c_start = end_col;
+    acc_name.c_end = end_col;
     nd.target = list(nd.target) + [acc_name];
     new_kid: list[uni.UniNode] = [];
     for k in nd.kid {
@@ -3205,10 +3086,7 @@ impl JacAutoLintPass._convert_property_impl(nd: uni.ImplDef) -> None {
     }
     nd.kid = new_kid;
     nd._invalidate_sub_node_tab();
-    # Strip any redundant `@property`/`@x.setter`/`@x.deleter` decorator from the
-    # impl itself: the dotted `.getter/.setter/.deleter` target already marks it
-    # as a property accessor (jac0core impls historically carried the decorator
-    # on both the decl and the impl).
+
     if nd.decorators {
         drop_ids: set[int] = set();
         for dec in nd.decorators {
@@ -3216,12 +3094,12 @@ impl JacAutoLintPass._convert_property_impl(nd: uni.ImplDef) -> None {
                 isinstance(dec, uni.Name)
                 and dec.value in ["property", "cached_property"]
             )
-            or (
-                isinstance(dec, uni.AtomTrailer)
-                and dec.is_attr
-                and isinstance(dec.right, uni.Name)
-                and dec.right.value in ["setter", "deleter"]
-            );
+                or (
+                    isinstance(dec, uni.AtomTrailer)
+                    and dec.is_attr
+                    and isinstance(dec.right, uni.Name)
+                    and dec.right.value in ["setter", "deleter"]
+                );
             if is_prop {
                 drop_ids.add(id(dec));
             }
@@ -3232,7 +3110,7 @@ impl JacAutoLintPass._convert_property_impl(nd: uni.ImplDef) -> None {
                 for d in nd.decorators
                 if id(d) not in drop_ids
             ]
-            or None;
+                or None;
             stripped_kid: list[uni.UniNode] = [];
             for k in nd.kid {
                 if id(k) in drop_ids {

@@ -1,4 +1,3 @@
-"""Tree Printing Helpers for Jac."""
 import ast as ast3;
 import builtins;
 import html;
@@ -6,7 +5,7 @@ import jaclang.jac0core.unitree as uni;
 import type from jaclang.jac0core.unitree { UniNode, UniScopeNode }
 
 glob id_bag: dict = {},
-     id_used: int = 0,
+     id_state: dict = {"used": 0},
      CLASS_COLOR_MAP: dict[(str, str)] = {
          'Expr': '#fbeb93',
          'AtomExpr': '#fbeb93',
@@ -66,8 +65,6 @@ glob id_bag: dict = {},
          'DisengageStmt': '#d8f3dc',
          'AwaitExpr': '#fbeb93',
          'CastExpr': '#fbeb93',
-         'GlobalStmt': '#ffc596',
-         'NonLocalStmt': '#ffc596',
          'Assignment': '#ffc596',
          'BinaryExpr': '#fbeb93',
          'CompareExpr': '#fbeb93',
@@ -128,7 +125,6 @@ glob id_bag: dict = {},
          'Semi': '#f1cfc4'
      };
 
-"""Recursively generate ast tree in dot format."""
 def printgraph_ast_tree(
     root_node: UniNode, dot_lines: (list[str] | None) = None
 ) -> str {
@@ -139,10 +135,9 @@ def printgraph_ast_tree(
     }
     """Generate number for each nodes.""";
     def gen_node_id(nd: uni.UniNode) -> int {
-        global id_used;
         if (id(nd) not in id_bag) {
-            id_bag[id(nd)] = id_used;
-            id_used += 1;
+            id_bag[id(nd)] = id_state["used"];
+            id_state["used"] += 1;
         }
         return id_bag[id(nd)];
     }
@@ -186,7 +181,6 @@ def printgraph_ast_tree(
     return ' ';
 }
 
-"""Recursively print ast tree."""
 def print_ast_tree(
     root_node: (UniNode | ast3.AST),
     marker: str = '+-- ',
@@ -217,7 +211,6 @@ def print_ast_tree(
             name_str = nd.name.sym_name
                 if isinstance(nd.name, uni.Name)
                 else nd.name.value;
-            # Resolve the path dynamically using the new resolve_relative_path method
             try {
                 resolved_path = nd.resolve_relative_path();
             } except Exception {
@@ -226,7 +219,6 @@ def print_ast_tree(
             out = f"{nd.__class__.__name__} - {name_str} - abs_path: {resolved_path}";
             return out;
         } elif isinstance(nd, uni.ModulePath) {
-            # Resolve the path dynamically
             try {
                 resolved_path = nd.resolve_relative_path();
             } except Exception {
@@ -353,9 +345,7 @@ def print_ast_tree(
     return tree_str;
 }
 
-"""Symbol Tree Node."""
 class SymbolTree {
-    """Initialize Symbol Tree Node."""
     def init(
         self: SymbolTree,
         node_name: str,
@@ -412,7 +402,6 @@ def _build_symbol_tree_common(
     return root_node;
 }
 
-"""Recursively print symbol table tree."""
 def print_symtab_tree(
     root_node: UniScopeNode,
     marker: str = '+-- ',
@@ -425,7 +414,6 @@ def print_symtab_tree(
     );
 }
 
-"""Recursively print symbol table tree."""
 def get_symtab_tree_str(
     root_node: SymbolTree,
     marker: str = '+-- ',
@@ -443,7 +431,8 @@ def get_symtab_tree_str(
                 ('|' + (' ' * (len(marker) - 1))) if draw else (' ' * len(marker))
                 for draw in level_markers[:-1]
             ]
-        ) + marker
+        )
+            + marker
             if level_markers
             else ''
     );
@@ -454,7 +443,8 @@ def get_symtab_tree_str(
         }
     }
     return (
-        line + ''.join(
+        line
+        + ''.join(
             get_symtab_tree_str(
                 child,
                 marker,
@@ -466,16 +456,14 @@ def get_symtab_tree_str(
     );
 }
 
-"""Generate DOT graph representation of a symbol table tree."""
 def printgraph_symtab_tree(nd: UniScopeNode) -> str {
     dot_lines = [];
     id_map = {};
-    last_id_used = 0;
+    last_id_state = {"used": 0};
     def gen_node_id(nd: SymbolTree) -> int {
-        nonlocal last_id_used;
         if (id(nd) not in id_map) {
-            id_map[id(nd)] = last_id_used;
-            last_id_used += 1;
+            id_map[id(nd)] = last_id_state["used"];
+            last_id_state["used"] += 1;
         }
         return id_map[id(nd)];
     }

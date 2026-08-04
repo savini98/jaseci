@@ -6,11 +6,8 @@ guestbook endpoints are reached purely through the client's `sv import`
 consumer of the analytics service.
 """
 
-to cl:
-
 import from .dualrole_frontend { Panel as ClientPanel }
 
 def:pub app -> JsxElement {
-    return
-        <ClientPanel/>;
+    <ClientPanel/>
 }

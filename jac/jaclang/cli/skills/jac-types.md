@@ -3,7 +3,7 @@ name: jac-types
 description: The Jac type system - annotations, unions, optionals, inference, `as` casts, any-boundary fixes, import type, ambient typing names, generics, and common type errors. Load before writing any non-trivial typed function or when debugging a type-check failure.
 ---
 
-Jac is statically typed at **annotation boundaries** and inferred inside function bodies. Every `def` parameter and every `has` field needs an explicit type; a `def` that returns a value needs an explicit return type (a `def` with no `return` infers `None` - don't write `-> None`, it warns W3037). Local variables get their type from the right-hand side. Types are unified across client (`.cl.jac`) and server code.
+Jac is statically typed at **annotation boundaries** and inferred inside function bodies. Every `def` parameter and every `has` field needs an explicit type; a `def` that returns a value needs an explicit return type (a `def` with no `return` infers `None` - don't write `-> None`, it warns W3037). Local variables get their type from the right-hand side. Types are unified across client and server code.
 
 ```jac
 obj User {
@@ -57,7 +57,7 @@ An `any` value cannot silently flow into a declared non-`any` destination (annot
 
 The 3-step playbook for an untyped boundary (PyPI call, `json.loads`, walker report):
 
-1. **Type the source** - add a return annotation, a `.pyi` stub next to the Python file, or a typed `has reports: list[T] = [];` on the walker. Best: downstream code stays clean.
+1. **Type the source** - add a return annotation, a `.pyi` stub next to the Python file, install a third-party lib's stub package (`jac install types-requests` - only stdlib stubs ship in the binary, so third-party `types-*` are PEP 561-resolved from `.jac/venv`), or a typed `has reports: list[T] = [];` on the walker. Best: downstream code stays clean.
 2. **Accept-and-narrow** - take it into an inferred/`any` local, then `isinstance`-narrow before flowing into typed destinations.
 3. **Cast at the use site** - `value as Type` when you know the runtime shape (see above).
 

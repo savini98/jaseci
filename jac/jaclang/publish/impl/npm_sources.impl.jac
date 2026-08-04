@@ -1,5 +1,3 @@
-"""Implementation of the npm client-module collector."""
-
 import re;
 import fnmatch;
 import from pathlib { Path }
@@ -30,8 +28,6 @@ def _top_level_decls(js: str) -> set {
     return names;
 }
 
-"""Prepend a runtime import for any runtime symbols the module uses, and report
-   the npm packages it depends on (runtime + react/react-dom)."""
 def _wire_externals(js: str, runtime_pkg: str) -> tuple[str, list[str]] {
     externals: list[str] = [];
     local = _top_level_decls(js);
@@ -52,7 +48,6 @@ def _wire_externals(js: str, runtime_pkg: str) -> tuple[str, list[str]] {
         externals.append(runtime_pkg);
     }
 
-    # Detect bare-package imports of react / react-dom (peerDependencies).
     for m in re.finditer(r'from\s+["\']([^"\']+)["\']', js) {
         spec = m.group(1);
         base = spec;
@@ -70,9 +65,6 @@ def _wire_externals(js: str, runtime_pkg: str) -> tuple[str, list[str]] {
 
 impl npm_js_path(rel_path: str) -> str {
     p = rel_path.replace("\\", "/");
-    if p.endswith(".cl.jac") {
-        return p[:-7] + ".js";
-    }
     if p.endswith(".jac") {
         return p[:-4] + ".js";
     }
@@ -129,9 +121,13 @@ def _crosses_server_boundary(mod: any) -> bool {
 }
 
 def _compile_module(program: any, path: Path) -> any {
+    import from jaclang.jac0core.compile_options { CompileOptions }
     source_key = str(path);
     prev = len(program.errors_had);
-    mod = program.compile(source_key);
+
+    mod = program.compile(
+        source_key, options=CompileOptions(force_codespace='client', type_check=False)
+    );
     new_errors = program.errors_had[prev:];
     if new_errors {
         formatted = "\n".join(str(err) for err in new_errors);
@@ -172,9 +168,7 @@ impl collect_npm_sources(
             if not src.is_file() or _in_excluded_dir(src, pkg_dir) {
                 continue;
             }
-            if any(src.name.endswith(suf) for suf in NON_CLIENT_SUFFIXES) {
-                continue;
-            }
+
             rel = str(src.relative_to(proj_root)).replace("\\", "/");
             npm_path = npm_js_path(rel);
             if npm_path in seen {
@@ -184,13 +178,13 @@ impl collect_npm_sources(
             mod = _compile_module(program, src);
             js = (mod.gen.js if mod and mod.gen else "") or "";
             if not js.strip() {
-                continue;  # no client output (e.g. a server-only plain .jac)
+                continue;
             }
             if _crosses_server_boundary(mod) {
                 raise NpmBoundaryError(
                     f"'{rel}' crosses a server boundary and cannot be published as a "
                     "standalone npm package. npm packages must be pure client code "
-                    "(no `sv` imports/calls)."
+                    "(no server-bound imports/calls)."
                 );
             }
             blocks = jsdoc_for_module(mod);
@@ -228,14 +222,13 @@ impl resolve_npm_entry(config: JacConfig, files: list[NpmSourceFile],) -> str | 
         }
     }
 
-    # Prefer the shallowest index.js (fewest path segments).
     index_files = sorted(
         [
             p
             for p in paths
             if p.endswith("index.js")
         ],
-        key=lambda p: any : p.count("/")
+        key=lambda (p: any) { p.count("/"); }
     );
     if index_files {
         return index_files[0];

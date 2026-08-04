@@ -1,40 +1,44 @@
-"""Set type codegen and operations."""
-"""Emit LLVM IR helper functions for a set with given element type.
-
-Uses a simple linear-search set: {len, cap, elems*}
-This is O(n) for lookups but sufficient for small sets.
-
-For pointer types with known size (e.g., tuples), uses memcmp for comparison.
-"""
 impl NaIRGenPass._emit_set_helpers(
     elem_type_name: str, elem_type: ir.Type, elem_size: int = 0
 ) -> None {
     if elem_type_name in self.set_helpers {
         return;
     }
-    # Create set struct type: { i64 len, i64 cap, elem_type* elems }
+
     set_struct = self.llvm_module.context.get_identified_type(f"Set.{elem_type_name}");
-    set_struct.set_body(ir.IntType(64), ir.IntType(64), elem_type.as_pointer());
+    if self._gc_mode() == "none" {
+        set_struct.set_body(
+            ir.IntType(64),
+            ir.IntType(64),
+            elem_type.as_pointer(),
+            self._nogc_elem_drop_slot_ty()
+        );
+    } else {
+        set_struct.set_body(ir.IntType(64), ir.IntType(64), elem_type.as_pointer());
+    }
     self.set_types[elem_type_name] = set_struct;
     set_ptr_type = set_struct.as_pointer();
     i64 = ir.IntType(64);
     i32 = ir.IntType(32);
-    # --- Forward-declare __rc_release_set_T so new_fn can store its address as dtor_fn_ptr.
-    _rel_fn_name_s = f"__rc_release_set_{elem_type_name}";
-    _rel_fnty_s = ir.FunctionType(ir.VoidType(), [set_ptr_type]);
-    try {
-        _rel_fn_decl_s = self.llvm_module.get_global(_rel_fn_name_s);
-    } except KeyError {
-        _rel_fn_decl_s = ir.Function(
-            self.llvm_module, _rel_fnty_s, name=_rel_fn_name_s
-        );
-        _rel_fn_decl_s.linkage = "private";
+
+    _rel_fn_decl_s = None;
+    if not self._nogc_headerless() {
+        _rel_fn_name_s = f"__rc_release_set_{elem_type_name}";
+        _rel_fnty_s = ir.FunctionType(ir.VoidType(), [set_ptr_type]);
+        try {
+            _rel_fn_decl_s = self.llvm_module.get_global(_rel_fn_name_s);
+        } except KeyError {
+            _rel_fn_decl_s = ir.Function(
+                self.llvm_module, _rel_fnty_s, name=_rel_fn_name_s
+            );
+            _rel_fn_decl_s.linkage = "private";
+        }
     }
-    # --- __set_new: create an empty set with capacity 8 ---
+
     new_fn = self._emit_container_new_fn(
         f"__set_new_{elem_type_name}", set_ptr_type, [elem_type], dtor_fn=_rel_fn_decl_s
     );
-    # --- __set_add: add element if not already present ---
+
     add_fnty = ir.FunctionType(ir.VoidType(), [set_ptr_type, elem_type]);
     add_fn = ir.Function(
         self.llvm_module, add_fnty, name=f"__set_add_{elem_type_name}"
@@ -53,29 +57,55 @@ impl NaIRGenPass._emit_set_helpers(
     );
     cur_len = b.load(len_p2, name="len");
     elems_arr = b.load(elems_p2, name="elems");
-    # Search for existing element
+
     (found_b, not_found_b, _) = self._emit_linear_search_loop(
         add_fn, b, e_arg, elems_arr, cur_len, elem_type, elem_size
     );
-    # Found: already exists, return
-    found_b.ret_void();
-    # Not found: check capacity and append
+
+    if self._nogc_headerless()
+        and isinstance(elem_type, ir.PointerType)
+        and isinstance(elem_type.pointee, ir.IntType)
+        and elem_type.pointee.width == 8 {
+        _i8p_dup = ir.IntType(8).as_pointer();
+        _sslot_p = found_b.gep(
+            s_arg, [ir.Constant(i32, 0), ir.Constant(i32, 3)], name="sadd.dup.slot.p"
+        );
+        _sslot = found_b.load(_sslot_p, name="sadd.dup.slot");
+        _shave = found_b.icmp_unsigned(
+            "!=",
+            _sslot,
+            ir.Constant(self._nogc_elem_drop_slot_ty(), None),
+            name="sadd.dup.have"
+        );
+        _dup_free_bb = add_fn.append_basic_block("dup.free");
+        _dup_done_bb = add_fn.append_basic_block("dup.done");
+        found_b.cbranch(_shave, _dup_free_bb, _dup_done_bb);
+        _fb = ir.IRBuilder(_dup_free_bb);
+        _e_i8_dup = _fb.bitcast(e_arg, _i8p_dup, name="sadd.dup.i8");
+        _fb.call(_sslot, [_e_i8_dup]);
+        _fb.branch(_dup_done_bb);
+        _db = ir.IRBuilder(_dup_done_bb);
+        _db.ret_void();
+    } else {
+        found_b.ret_void();
+    }
+
     grow_bb = add_fn.append_basic_block("grow");
     append_bb = add_fn.append_basic_block("append");
     cur_cap = not_found_b.load(cap_p2, name="cap");
     need_grow = not_found_b.icmp_unsigned(">=", cur_len, cur_cap, name="need.grow");
     not_found_b.cbranch(need_grow, grow_bb, append_bb);
-    # Grow block
+
     b = ir.IRBuilder(grow_bb);
     self._emit_grow_array(b, elems_p2, elem_type, cur_len, cap_p2, cur_cap);
     b.branch(append_bb);
-    # Append block
+
     b = ir.IRBuilder(append_bb);
     elems_arr_app = b.load(elems_p2, name="elems.app");
     cur_len_app = b.load(len_p2, name="len.app");
     elem_slot = b.gep(elems_arr_app, [cur_len_app], name="elem.slot");
-    # retain element before storing (symmetric with __list_append_T)
-    if isinstance(elem_type, ir.PointerType) {
+
+    if isinstance(elem_type, ir.PointerType) and not self._nogc_headerless() {
         if self.rc_retain_fn is None {
             self._emit_rc_helpers();
         }
@@ -88,7 +118,7 @@ impl NaIRGenPass._emit_set_helpers(
     new_len = b.add(cur_len_app, ir.Constant(i64, 1), name="new.len");
     b.store(new_len, len_p2);
     b.ret_void();
-    # --- __set_contains: return 1 if element exists, 0 otherwise ---
+
     contains_fnty = ir.FunctionType(ir.IntType(1), [set_ptr_type, elem_type]);
     contains_fn = ir.Function(
         self.llvm_module, contains_fnty, name=f"__set_contains_{elem_type_name}"
@@ -113,14 +143,18 @@ impl NaIRGenPass._emit_set_helpers(
     );
     found_b_c.ret(ir.Constant(ir.IntType(1), 1));
     not_found_b_c.ret(ir.Constant(ir.IntType(1), 0));
-    # --- __set_len: return len field ---
+
     len_fn = self._emit_container_len_fn(f"__set_len_{elem_type_name}", set_ptr_type);
-    # --- __rc_release_set_T: type-specific destructor ---
-    release_fn = self._emit_container_release_fn(
-        f"__rc_release_set_{elem_type_name}", set_ptr_type, [(2, elem_type)]
-    );
-    self.set_release_fns[elem_type_name] = release_fn;
-    # Store helpers
+
+    if self._nogc_headerless() {
+        self._emit_container_drop_fn(f"Set.{elem_type_name}");
+    } else {
+        release_fn = self._emit_container_release_fn(
+            f"__rc_release_set_{elem_type_name}", set_ptr_type, [(2, elem_type)]
+        );
+        self.set_release_fns[elem_type_name] = release_fn;
+    }
+
     self.set_helpers[elem_type_name] = {
         "new": new_fn,
         "add": add_fn,
@@ -131,25 +165,21 @@ impl NaIRGenPass._emit_set_helpers(
     };
 }
 
-"""Generate code for a set literal {a, b, c, ...}."""
 impl NaIRGenPass._codegen_set_val(nd: uni.SetVal) -> (ir.Value | None) {
     if not nd.values {
-        # Empty set: the checker stamps the literal with the expected type
-        # (bidirectional inference); lowering it registers the set helpers.
         _sk = self._set_spec_of(nd);
         _helpers = self.set_helpers.get(_sk) if _sk is not None else None;
         if _helpers is not None {
-            # Fresh allocation: ownership applied at the _codegen_expr seam.
             return self.builder.call(_helpers["new"], [], name="set.empty");
         }
         return None;
     }
-    # Get first element to determine type
+
     first_val = self._codegen_expr(nd.values[0]);
     if first_val is None {
         return None;
     }
-    # Determine type name and size for pointer types (e.g., tuples)
+
     elem_type = first_val.type;
     elem_type_name = "i64";
     elem_size = 0;
@@ -157,44 +187,46 @@ impl NaIRGenPass._codegen_set_val(nd: uni.SetVal) -> (ir.Value | None) {
         elem_type_name = "f64";
     } elif isinstance(elem_type, ir.PointerType) {
         elem_type_name = "ptr";
-        # Check if this is a tuple (pointer to LiteralStructType)
         if isinstance(elem_type.pointee, ir.LiteralStructType) {
             elem_size = self._get_struct_size(elem_type.pointee);
             elem_type_name = f"tuple{elem_size}";
         }
     }
-    # Ensure helpers exist
+
     self._emit_set_helpers(elem_type_name, elem_type, elem_size);
     helpers = self.set_helpers[elem_type_name];
-    # Create new set
+
     _set_new_loc = f"{os.path.basename(self.ir_in.loc.mod_path)}:{nd.loc.first_line
         if nd.loc
         else 0}";
     set_val = self._rc_call_with_ctx(
         helpers["new"], [], op="new", loc=_set_new_loc, name="set.new"
     );
+    self._nogc_stamp_elem_drops(set_val, self._nogc_type_arg_mangles(nd), "set");
     _sinit_loc = f"{os.path.basename(self.ir_in.loc.mod_path)}:{nd.loc.first_line
         if nd.loc
         else 0}";
-    # Add first element
+
+    first_val = self._nogc_elem_prep(nd.values[0], first_val);
     self._rc_call_with_ctx(
         helpers["add"], [set_val, first_val], op="set_init", loc=_sinit_loc
     );
-    # Add remaining elements
+
     for i in range(1, len(nd.values)) {
         val = self._codegen_expr(nd.values[i]);
         if val is not None {
+            val = self._nogc_elem_prep(nd.values[i], val);
             _orig_sv = val;
             val = self._coerce_type(val, elem_type);
             self._rc_call_with_ctx(
                 helpers["add"], [set_val, val], op="set_init", loc=_sinit_loc
             );
-            # release owned ref after add retained it
+
             if isinstance(_orig_sv.type, ir.PointerType) and self._is_owned(_orig_sv) {
                 self._emit_rc_release_simple(_orig_sv, op="set_init", loc=_sinit_loc);
             }
         }
     }
-    # Fresh allocation: ownership applied at the _codegen_expr seam.
+
     return set_val;
 }
