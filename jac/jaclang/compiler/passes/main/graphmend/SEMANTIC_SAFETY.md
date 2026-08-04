@@ -136,7 +136,7 @@ Legend: `[≡]` = value-equivalence of a lowered check.
             ┌─────────────────▼─────────────────┐  No (escaping
             │ Hoisted setups effect-neutral?     ├─non-idemp. ► ⛔ DECLINE
             │ pure-local / idemp. .to() /        │  write)
-            │ *licensed* hasattr init (G1-G4) /  │
+            │ *licensed* hasattr init (G1-G5) /  │
             │ lowered assert              [INV3] │
             └─────────────────┬─────────────────┘
                               │ Yes

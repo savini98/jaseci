@@ -9,6 +9,12 @@
 not address it, and the word the paper uses ("idempotent") answers a different
 question than the one being asked. This document covers only this issue.
 
+**Status:** both halves of the fix are now implemented and the rewrite still
+fires on the real Phi-4 code. The hoist is licensed by *confinement* rather than
+idempotency (`G4`, §4), and the speculated initializer is checked pure and
+non-raising (`G5`, §5.2). §5.2 also corrects an earlier claim in this document
+that the second half was impossible without dropping Phi-4 from the results.
+
 ---
 
 ## 1. The difference, concretely
@@ -110,20 +116,64 @@ place. Phi-4 satisfies all four and still transforms exactly as before.
 
 ## 5. What remains an assumption
 
-Two things are stated rather than proved, and should be presented that way:
+### 5.1 Observers outside the module
 
-1. **Observers outside the module.** Confinement is checked over the compiled
-   module. Code in another file -- an external `hasattr`, a `state_dict()` or
-   `__dict__` walk, a subclass -- could still see the attribute existing earlier
-   than it otherwise would. For a private cache (not a registered buffer or
-   parameter) this is invisible in normal use, but it is not a proof.
+Confinement is checked over the compiled module. Code in another file -- an
+external `hasattr`, a `state_dict()` or `__dict__` walk, a subclass -- could
+still see the attribute existing earlier than it otherwise would. For a private
+cache (not a registered buffer or parameter) this is invisible in normal use, but
+it is not a proof.
 
-2. **The initializer's own behavior.** The hoisted call (`self.rope_init_fn`) is
-   not inspected. If it performed I/O or consumed randomness, hoisting would make
-   that happen on executions the original avoided. Requiring the compiler to
-   resolve and verify this call would close the argument, but the callee is
-   looked up dynamically and cannot be resolved -- so that requirement would make
-   Phi-4 untransformable and remove it from the results.
+### 5.2 The initializer's own behavior -- now checked
+
+An earlier version of this document claimed the hoisted call was uninspectable:
+that `self.rope_init_fn` "is looked up dynamically and cannot be resolved," so
+requiring purity "would make Phi-4 untransformable and remove it from the
+results." **That conclusion was wrong**, and the requirement is now enforced as
+`G5` in `predicate_ctrl_flow_pass.jac` with Phi-4 still transforming.
+
+The binding really is not resolvable from the module holding the call. In
+transformers 4.52.4 the call site is `longrope_frequency_update` in
+`modeling_rope_utils.py`, while the binding
+`self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]` sits in
+`models/phi3/modeling_phi3.py`. What the earlier argument missed is that the
+*binding* does not have to be resolved for the *call* to be decided:
+
+1. **Candidate set.** Every function reachable through a module-level dispatch
+   table (a dict literal whose values are all local function names). The callee
+   is one of them or the rule declines.
+2. **Signature narrowing.** A function the call would fail on with `TypeError`
+   cannot be the function being called, so it is excluded. This is what
+   distinguishes `ROPE_INIT_FUNCTIONS` from the identically-shaped
+   `ROPE_VALIDATION_FUNCTIONS`, whose entries take `(config, ignore_keys)` and
+   cannot accept this call's `seq_len=` keyword. Without this step the candidate
+   set includes the validators, which call `logger.warning`, and the rule
+   correctly declines -- so this step is exactly what keeps Phi-4.
+3. **Transitive purity.** Every surviving candidate must be pure, recursing into
+   locally-defined helpers. Necessary in practice: the `yarn`, `llama3` and
+   `linear` initializers are clean only once their own helpers
+   (`find_correction_dim`, `get_mscale`, `_compute_default_rope_parameters`, …)
+   are checked too.
+4. **Unreachable raises.** Each of the five raising initializers guards its
+   `raise` with the varkwargs-validation idiom `if len(rope_kwargs) > 0:`. That
+   guard is false whenever the call passes no keyword outside the callee's named
+   parameters, which is a reachability argument rather than an exemption.
+
+Measured on real transformers 4.52.4 with a cold compiler cache:
+`longrope_frequency_update` still rewrites to `torch.where`, and the reproduction
+harness reports Phi-4-mini at 5 breaks to 0 with bit-identical output.
+
+**What is still assumed** is much narrower: that the attribute is bound from a
+dispatch table *in this module* at all. A binding to an unrelated callable
+defined elsewhere would not be seen. So the guarantee is still best phrased as
+equivalence modulo private memoization state -- but "deterministic and
+non-raising" is now a checked condition, not a hope.
+
+> A caution for anyone re-measuring this. GraphMend caches transformed bytecode
+> in variant-keyed `.jir` files, so a stale cache reports the *previous*
+> behavior. Clear `~/Library/Caches/jac/jir/modules` before trusting a result;
+> `JAC_CACHE_MODE=rebuild` was not sufficient. An intermediate version of this
+> work appeared to pass for that reason alone.
 
 ## 6. Why local temporaries are not a better answer
 
@@ -167,10 +217,15 @@ qualification. Suggested replacement:
 > order, and raised exceptions with their type and message. A memoized
 > initialization may be populated earlier than in the original program; this is
 > permitted only when the analysis establishes that the memoized value is read
-> nowhere outside the rewritten region, so no observer can distinguish the two
-> schedules.
+> nowhere outside the rewritten region, and that the initializer itself is pure
+> and cannot raise on the arguments it is given, so no observer can distinguish
+> the two schedules.
 
-Table 1's `[Where]` row should also be reconciled with §5.2 above: it states that
-every call in the region resolves through UniiR and is validated free of
-observable effects, which is not true of the initializer call in the guard body --
-the call appearing in Figure 3, the paper's own worked example.
+Table 1's `[Where]` row is now accurate as written for the initializer call as
+well: every call in the region, including the one in the guard body, is resolved
+and validated free of observable effects and exceptions. The one caveat worth
+carrying into the text is *how* an attribute callee is resolved -- through the
+module's dispatch tables narrowed by signature compatibility, with every
+surviving candidate required to be clean -- since that is what makes Figure 3's
+`self.rope_init_fn` decidable without resolving its cross-module binding. §5.2
+gives the argument and the residual assumption.

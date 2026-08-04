@@ -38,9 +38,9 @@ it unsoundly.
 
 The `hasattr`-guarded init is the one licensed hoist that creates state earlier
 than the original would; the `hasattr` *shape* alone does not make it safe. See
-`_is_existence_guard` for the four conditions (memoizing write, neutral body,
-module-scope confinement) and SEMANTIC_SAFETY.md §6.1 for what remains an
-assumption.
+`_is_existence_guard` for the five conditions (memoizing write, neutral body,
+module-scope confinement, and a pure non-raising initializer) and
+SEMANTIC_SAFETY.md §6.1 for what remains an assumption.
 
 Anything more complex (differing targets, deeper multi-statement branches, elif
 chains) is left untouched. Gated by --graphmend.
@@ -178,7 +178,7 @@ obj PredicateCtrlFlowPass(UniPass) {
 
     The `hasattr` shape alone is NOT sufficient. Speculating the guard body makes
     the initialized state exist on runs where the original program never created
-    it, so four conditions must hold for that state change to be unobservable:
+    it, so five conditions must hold for that state change to be unobservable:
 
       G1. shape -- `if not hasattr(<recv>, "<literal>")` with no `else` branch;
       G2. memoization -- the body definitely assigns `<recv>.<literal>`, so the
@@ -191,7 +191,12 @@ obj PredicateCtrlFlowPass(UniPass) {
           under a `hasattr` header are declined;
       G4. confinement -- the initialized attribute is read nowhere in the module
           outside this branch region (`_attr_confined`), so its earlier existence
-          cannot be observed by any other code we compile.
+          cannot be observed by any other code we compile;
+      G5. initializer safety -- every call in the memoizing write is resolved and
+          shown pure and non-raising for the arguments it is given
+          (`_init_value_safe`). G3 lets the initializer be a call; G5 is what
+          makes that licence sound, since the call now runs on paths the
+          original never took.
 
     G4 is a module-scope check: state escaping to *other* modules (an external
     `hasattr`, `__dict__`/`state_dict` inspection, a subclass) is outside what
