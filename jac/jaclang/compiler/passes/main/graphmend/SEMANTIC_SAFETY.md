@@ -206,28 +206,47 @@ and exactly what INV3 forbids. The two mechanisms differ here:
 | path | normal exit | exceptional exit |
 |---|---|---|
 | `logger.*` in a `forward` (slot + forward hook) | hook flushes | **flushes** -- hook registered `always_call=True` |
-| `print` / non-forward (local buffer + trailing flush) | trailing flush | **does not flush** -- open gap |
+| `print` / other, in a `@torch.compile` fn (global buffer) | trailing flush | **flushes** -- `@__jac_se_guard__` boundary |
+| `print` / other, in an `nn.Module` `forward` | trailing flush | flushes via the same `always_call` hook |
 
-For the hook path, `always_call=True` makes PyTorch run the hook even when
-`forward` raises, so buffered calls are replayed in FIFO order before the
-exception propagates. Covered by
-`test_deferred_logger_flushes_on_exceptional_exit` and
-`test_flush_hook_registered_with_always_call`.
+Both paths now hold, by the same principle: **the flush must be driven from
+outside the traced region.** Deferral moves *when* an effect is emitted, so any
+exit that never reaches the flush would convert deferred output into lost output,
+violating INV3.
 
-**Why the buffered path is not fixed with `try`/`finally`.** The natural fix --
-wrapping the body so the flush sits in a `finally` -- is not available. The flush
-is deliberately untraceable (it performs the real I/O), and TorchDynamo 2.12
-responds to an untraceable call inside a `finally` by abandoning the **entire
-frame**: the function compiles to zero FX graphs instead of one, i.e. full eager
-fallback. Measured on torch 2.12 on the `side_effect*` fixtures (1 graph → 0).
-That trades the graph break being removed for something strictly worse, so it is
-rejected.
+- **Hook path.** `always_call=True` makes PyTorch run the forward hook even when
+  `forward` raises.
+- **Guard path.** `__jac_se_guard__` is *prepended*, so it sits above
+  `@torch.compile` and wraps the compiled callable from the eager side. Its
+  `finally` is plain Python that Dynamo never sees. This requires the buffer to
+  outlive the frame, which is why `_gm_se_buffer` is a process-global in
+  `runtime.jac` rather than a function-local list; a global list append traces
+  identically, so it costs no additional break.
 
-Closing this gap requires the buffer to outlive the frame: a module-level buffer
-plus an eager boundary guard wrapping the compiled callable, which is the shape
-`[Trap]` already uses for `__jac_trap_guard__`. Until then the buffered path
-preserves output on normal and early-return exits only, and that limit is stated
-rather than implied.
+`se_flush` snapshots and clears before replaying, making it idempotent: on a
+normal exit the in-function flush has already drained the buffer and the guard's
+`finally` is a no-op, and a deferred call that itself raises cannot cause its
+predecessors to be replayed twice.
+
+**Why the flush is not simply put in a `finally` inside the function.** Because
+it cannot be. The flush is deliberately untraceable (it performs the real I/O),
+and TorchDynamo 2.12 answers an untraceable call inside a `finally` by abandoning
+the **entire frame**: the function compiles to zero FX graphs instead of one,
+i.e. full eager fallback. Measured on torch 2.12 on the `side_effect*` fixtures
+(1 graph → 0). The boundary guard achieves the same semantics -- a real `finally`,
+FIFO replay, exception re-raised unchanged -- by relocating it outside the traced
+frame rather than by giving it up.
+
+Covered by `test_deferred_logger_flushes_on_exceptional_exit`,
+`test_flush_hook_registered_with_always_call`,
+`test_deferred_print_flushes_on_exceptional_exit`,
+`test_se_guard_is_outside_the_compiled_region` and
+`test_se_guard_does_not_split_the_graph`. Each was confirmed to fail with its
+mechanism removed.
+
+**Residual scope.** A non-`forward` method that is neither decorated with
+`@torch.compile` nor reached through a compiled module has no boundary to attach
+to; such calls are not traced in the first place, so they are left unmodified.
 
 ### 4.3 Predicated Trap Lowering (`if not C: raise → torch._assert_async`)
 
@@ -478,14 +497,12 @@ rather than proved:
 
 ### Known limitations (honest scope)
 
-- **[Defer] on exceptional exits: fixed for logger, open for print.** The
-  forward-hook (logger-in-`forward`) path flushes on a raising forward because
-  the hook is registered `always_call=True`. The buffered `print` / non-forward
-  path still flushes only on normal and early-return exits, so an exception
-  escaping that function drops its buffered output. A `try`/`finally` cannot fix
-  it -- an untraceable call in a `finally` makes Dynamo 2.12 abandon the frame
-  (1 FX graph becomes 0). See 4.2.1 for the measurement and the boundary-guard
-  design that would close it.
+- **[Defer] on exceptional exits: closed.** Both paths flush when the compiled
+  region exits by raising -- the logger-in-`forward` path via a forward hook
+  registered `always_call=True`, the `@torch.compile`-function path via the
+  `@__jac_se_guard__` eager boundary decorator. Both mechanisms live outside the
+  traced region by necessity: an untraceable call in a `finally` *inside* it
+  makes Dynamo 2.12 abandon the frame (1 FX graph becomes 0). See 4.2.1.
 - **Exception type -- restored within scope.** The original exception type and
   message are restored when the guard sits in a `@torch.compile`-decorated
   function and the message is a string literal: the type is folded into a marker

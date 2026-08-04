@@ -148,6 +148,16 @@ the buffer after the graph runs. See JacBuiltin.log_register/log_emit/log_flush_
 glob _gm_log_registry: list = [];
 glob _gm_log_buffer: list = [];
 
+"""GraphMend deferred side-effect buffer (process-global).
+
+Holds `(callee, args, kwargs)` triples appended by `se_emit` during a compiled
+region and replayed by `se_flush`. It is a module global rather than a
+function-local list so it OUTLIVES the compiled frame: that is what lets the
+eager `se_guard` boundary drain it when the function exits by raising, a path on
+which no in-frame flush and no forward hook can run. A global list append traces
+identically to a local one (no extra graph break)."""
+glob _gm_se_buffer: list = [];
+
 class JacClassReferences {
     with entry {
         TYPE_CHECKING: bool = TYPE_CHECKING;
@@ -469,7 +479,6 @@ class JacBuiltin {
     ) -> JsxElement;
 
     static def log_report(expr: any, custom: bool = False) -> None;
-
     """GraphMend: flush a deferred side-effect buffer.
 
     Each entry is a (callee, args, kwargs) triple captured at the original call
@@ -477,6 +486,30 @@ class JacBuiltin {
     after the compiled graph has executed.
     """
     static def flush_se_buffer(buf: list) -> None;
+
+    """GraphMend: buffer a deferred side-effect call in the process-global buffer.
+
+    Replaces `print(...)` inside a compiled region. Traces as a plain list append
+    (the callee and its already-snapshotted arguments are ordinary values), so it
+    adds no graph break."""
+    static def se_emit(callee: any, args: tuple, kwargs: dict) -> None;
+
+    """GraphMend: replay and clear the global deferred side-effect buffer.
+
+    FIFO, so effects are emitted in their original program order. Draining makes
+    it idempotent: a second flush on the same path is a no-op, which is what lets
+    the normal-path flush and the `se_guard` boundary coexist."""
+    static def se_flush -> None;
+
+    """GraphMend: eager boundary guard that flushes deferred effects on EVERY exit.
+
+    Wraps a `@torch.compile`d callable from OUTSIDE the traced region, so its
+    `finally` is plain Python that Dynamo never sees. This is what makes deferral
+    correct on an exceptional exit: the buffered calls are replayed in FIFO order
+    before the exception continues to propagate, and the exception is re-raised
+    unchanged. An in-frame `try`/`finally` cannot do this -- an untraceable call
+    inside a `finally` makes Dynamo abandon the frame (1 FX graph becomes 0)."""
+    static def se_guard(fn: any) -> any;
 
     """GraphMend: graph-native equivalent of `assert torch.equal(a, b), msg`.
 
@@ -519,6 +552,7 @@ class JacBuiltin {
     graph executes, replaying each buffered logger call in program order. Returns
     `output` unchanged so it is a transparent forward hook."""
     static def log_flush_hook(module: any, inputs: any, output: any) -> any;
+
     static def safe_subscript(`obj: any, key: any) -> any;
     static def get_console -> ConsoleImpl;
 }

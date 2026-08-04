@@ -849,6 +849,16 @@ impl PyastGenPass.exit_module(nd: uni.Module) -> None {
     if getattr(nd, '_gm_needs_se_flush', False) {
         self.jaclib_obj('__jac_flush_se_buffer__');
     }
+    # The deferred side-effect buffer is process-global so it outlives the
+    # compiled frame: se_emit appends, se_flush drains on the normal path, and
+    # the se_guard boundary decorator drains it on an exceptional exit.
+    if getattr(nd, '_gm_needs_se_emit', False) {
+        self.jaclib_obj('__jac_se_emit__');
+        self.jaclib_obj('__jac_se_flush__');
+    }
+    if getattr(nd, '_gm_needs_se_guard', False) {
+        self.jaclib_obj('__jac_se_guard__');
+    }
     # GraphMend's TrapLoweringPass may inject __jac_tensor_eq_assert__ and the
     # boundary __jac_trap_guard__ decorator that restores the guard's original
     # exception type at the entry boundary.

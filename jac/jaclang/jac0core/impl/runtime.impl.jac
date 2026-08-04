@@ -888,6 +888,38 @@ impl JacBuiltin.flush_se_buffer(buf: list) -> None {
     buf.clear();
 }
 
+impl JacBuiltin.se_emit(callee: any, args: tuple, kwargs: dict) -> None {
+    _gm_se_buffer.append((callee, args, kwargs));
+}
+
+impl JacBuiltin.se_flush -> None {
+    # Snapshot then clear BEFORE replaying: a deferred call that itself raises
+    # must not leave the drained entries behind to be replayed a second time by
+    # the enclosing se_guard.
+    pending = list(_gm_se_buffer);
+    _gm_se_buffer.clear();
+    for entry in pending {
+        (fn, args, kwargs) = entry;
+        fn(*args, **kwargs);
+    }
+}
+
+impl JacBuiltin.se_guard(fn: any) -> any {
+    import functools;
+    @functools.wraps(fn)
+    def _gm_se_wrapper(*args: any, **kwargs: any) -> any {
+        try {
+            return fn(*args, **kwargs);
+        } finally {
+            # Runs on normal AND exceptional exits. On the normal path the
+            # in-frame flush already drained the buffer, so this is a no-op; on
+            # the exceptional path it is the only flush that runs.
+            JacBuiltin.se_flush();
+        }
+    }
+    return _gm_se_wrapper;
+}
+
 impl JacBuiltin.tensor_eq_assert(a: any, b: any, msg: str) -> None {
     import torch;
     meta_ok = (a.shape == b.shape) and (a.dtype == b.dtype);

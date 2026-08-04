@@ -332,14 +332,30 @@ obj DeferSideEffectPass(UniPass) {
         }
         mod = nd.find_parent_of_type(uni.Module);
         if mod is not None {
-            mod._gm_needs_se_flush = True;
+            mod._gm_needs_se_emit = True;
         }
-        self._insert_front(nd, self._buffer_init(nd));
         # If control can fall off the end, flush there too (returns are handled
-        # in exit_return_stmt; flush_se_buffer clears, so double-flush is safe).
+        # in exit_return_stmt; se_flush drains, so double-flush is safe).
         tail = nd.body[-1];
         if not isinstance(tail, uni.ReturnStmt) {
             self._append_stmt(nd, self._flush_stmt(nd));
+        }
+        # Boundary guard for the exceptional exit. Only for a function that
+        # carries @torch.compile itself: prepended, the decorator sits ABOVE
+        # torch.compile, so its try/finally is eager code Dynamo never traces.
+        # On an nn.Module `forward` there is no such boundary here -- the
+        # torch.compile happens at the call site, so a decorator on `forward`
+        # would be INSIDE the compiled region and its finally would make Dynamo
+        # abandon the frame. Those flush via the always_call forward hook
+        # instead (see _hook_register_stmt).
+        if self._has_torch_compile_decorator(nd) {
+            guard = self._gen_name(nd, '__jac_se_guard__', False);
+            nd.decorators = [guard] + list(nd.decorators or []);
+            nd.set_kids([guard] + list(nd.kid));
+            guard.parent = nd;
+            if mod is not None {
+                mod._gm_needs_se_guard = True;
+            }
         }
     }
 
@@ -478,38 +494,46 @@ obj DeferSideEffectPass(UniPass) {
         );
     }
 
-    """Build `_gm_se_buffer.append(ent)`."""
+    """Build `__jac_se_emit__(callee, args, kwargs)` from the snapshotted triple.
+
+    The buffer is process-global (see `_gm_se_buffer` in runtime.jac), not a
+    function-local list, so it survives a frame that exits by raising and the
+    `se_guard` boundary can still drain it. A global list append traces exactly
+    like a local one, so this costs no additional graph break.
+    """
     def _buffer_append(at: uni.UniNode, ent: uni.Expr) -> uni.FuncCall {
-        buf = self._gen_name(at, '_gm_se_buffer', False);
-        attr = self._gen_name(at, 'append', False);
-        target = uni.AtomTrailer(
-            target=buf, right=attr, is_attr=True, is_null_ok=False, kid=[buf, attr]
-        );
+        emit = self._gen_name(at, '__jac_se_emit__', False);
+        # `ent` is the (callee, args, kwargs) TupleVal built by _buffer_entry;
+        # pass its members positionally -- the runtime interface dispatches
+        # through the plugin proxy, which does not forward variadic parameters.
+        params = list(ent.values);
         return uni.FuncCall(
-            target=target, params=[ent], genai_call=None, kid=[target, ent]
+            target=emit, params=params, genai_call=None, kid=[emit] + params
         );
     }
 
-    """Build `_gm_se_buffer = []`."""
-    def _buffer_init(at: uni.UniNode) -> uni.Assignment {
-        buf = self._gen_name(at, '_gm_se_buffer', True);
-        empty = uni.ListVal(
-            values=[],
-            kid=[at.gen_token(Tok.LSQUARE, '['), at.gen_token(Tok.RSQUARE, ']')]
-        );
-        return uni.Assignment(
-            target=[buf], value=empty, type_tag=None, mutable=True, kid=[buf, empty]
-        );
-    }
-
-    """Build `__jac_flush_se_buffer__(_gm_se_buffer)` as a statement."""
+    """Build `__jac_se_flush__()` as a statement."""
     def _flush_stmt(at: uni.UniNode) -> uni.ExprStmt {
-        helper = self._gen_name(at, '__jac_flush_se_buffer__', False);
-        buf = self._gen_name(at, '_gm_se_buffer', False);
-        call = uni.FuncCall(
-            target=helper, params=[buf], genai_call=None, kid=[helper, buf]
-        );
+        helper = self._gen_name(at, '__jac_se_flush__', False);
+        call = uni.FuncCall(target=helper, params=[], genai_call=None, kid=[helper]);
         return uni.ExprStmt(expr=call, in_fstring=False, kid=[call]);
+    }
+
+    """True if `nd` carries a `@torch.compile` / `@torch.compile(...)` decorator."""
+    def _has_torch_compile_decorator(nd: uni.UniNode) -> bool {
+        for dec in (nd?.decorators or []) {
+            target = dec.target if isinstance(dec, uni.FuncCall) else dec;
+            if (
+                isinstance(target, uni.AtomTrailer)
+                and isinstance(target.right, uni.Name)
+                and (target.right.value == 'compile')
+                and isinstance(target.target, uni.Name)
+                and (target.target.value == 'torch')
+            ) {
+                return True;
+            }
+        }
+        return False;
     }
 
     # ---- body splicing helpers ----

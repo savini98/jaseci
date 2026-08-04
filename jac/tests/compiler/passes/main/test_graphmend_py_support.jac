@@ -45,11 +45,12 @@ test "py: print side effect is buffered and flushed" {
     # Positional arg snapshotted (hoisted + cloned-if-tensor) at the call site.
     assert "__gm_se_arg_0 = x" in src;
     assert (
-        "_gm_se_buffer.append((print, "
+        "__jac_se_emit__(print, "
         "(__gm_se_arg_0.clone() if hasattr(__gm_se_arg_0, 'clone') "
-        "else __gm_se_arg_0,), {}))"
-    ) in src;
-    assert "__jac_flush_se_buffer__(_gm_se_buffer)" in src;
+        "else __gm_se_arg_0,), {})"
+    )
+        in src;
+    assert "__jac_se_flush__()" in src;
 }
 
 test "py: validation guard lowers to torch._assert_async" {
@@ -57,7 +58,8 @@ test "py: validation guard lowers to torch._assert_async" {
     # exception type/message folded into a trap marker + boundary guard decorator
     assert (
         "torch._assert_async(mask.all(), "
-        "'[[GM-TRAP ValueError]]mask must be all true[[/GM-TRAP]]')" in src
+        "'[[GM-TRAP ValueError]]mask must be all true[[/GM-TRAP]]')"
+        in src
     );
     assert "@__jac_trap_guard__" in src;
     assert "raise ValueError" not in src;

@@ -408,3 +408,67 @@ def test_flush_hook_registered_with_always_call() -> None:
     """
     src = _compile_src("logger_forward_hook.py", True)
     assert "register_forward_hook(__jac_log_flush_hook__, always_call=True)" in src
+
+
+def _run_raising_compiled_fn(graphmend: bool) -> tuple[list, object]:
+    """Run the raising @torch.compile fixture; return (printed lines, exception)."""
+    import builtins
+
+    src = _compile_src("side_effect_raises.jac", graphmend)
+    ns: dict = {}
+    printed: list = []
+    real_print = builtins.print
+    builtins.print = lambda *a, **k: printed.append(" ".join(str(v) for v in a))
+    try:
+        exec(compile(src, "side_effect_raises.jac", "exec"), ns)
+        caught: object = None
+        torch._dynamo.reset()
+        try:
+            ns["f"](torch.tensor([1.0, 2.0]))
+        except Exception as exc:  # noqa: BLE001 - the fixture raises on purpose
+            caught = exc
+    finally:
+        builtins.print = real_print
+    return printed, caught
+
+
+def test_deferred_print_flushes_on_exceptional_exit() -> None:
+    """The eager boundary guard drains the buffer when the compiled fn raises.
+
+    Deferral moves *when* the print is emitted; an exit that never reaches the
+    in-function flush would therefore lose it. The guard sits above
+    @torch.compile, so its finally runs on the exceptional path too.
+    """
+    orig_out, orig_exc = _run_raising_compiled_fn(False)
+    fixed_out, fixed_exc = _run_raising_compiled_fn(True)
+
+    # Baseline: the untransformed program prints, then raises.
+    assert any("GM-SE-BEFORE-RAISE" in line for line in orig_out)
+    assert isinstance(orig_exc, ValueError) and "GM-SE-BOOM" in str(orig_exc)
+
+    # The exception survives unchanged...
+    assert isinstance(fixed_exc, ValueError), f"expected ValueError, got {fixed_exc!r}"
+    assert "GM-SE-BOOM" in str(fixed_exc)
+    # ...and the deferred print is still emitted rather than dropped.
+    assert any("GM-SE-BEFORE-RAISE" in line for line in fixed_out), (
+        "deferred print was lost on the exceptional exit -- the __jac_se_guard__ "
+        "boundary must flush the global buffer in its finally"
+    )
+
+
+def test_se_guard_is_outside_the_compiled_region() -> None:
+    """The guard must be prepended, i.e. applied ABOVE @torch.compile.
+
+    Order matters for more than tidiness: inside the compiled region an
+    untraceable call in a `finally` makes Dynamo abandon the whole frame (1 FX
+    graph becomes 0), so a guard applied below torch.compile would trade the
+    graph break being removed for full eager fallback.
+    """
+    src = _compile_src("side_effect.jac", True)
+    assert "@__jac_se_guard__" in src
+    assert src.index("@__jac_se_guard__") < src.index("@torch.compile")
+
+
+def test_se_guard_does_not_split_the_graph() -> None:
+    """Adding the boundary guard must not cost a graph break."""
+    _assert_defragmented("side_effect.jac", "f", torch.tensor([1.0, 2.0, 3.0]))
