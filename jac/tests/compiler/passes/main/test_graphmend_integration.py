@@ -472,3 +472,46 @@ def test_se_guard_is_outside_the_compiled_region() -> None:
 def test_se_guard_does_not_split_the_graph() -> None:
     """Adding the boundary guard must not cost a graph break."""
     _assert_defragmented("side_effect.jac", "f", torch.tensor([1.0, 2.0, 3.0]))
+
+
+def test_trap_lowers_a_real_transformers_validation_guard() -> None:
+    """[Trap] fires on genuine upstream model source, not just fixtures.
+
+    transformers' VITS contains a textbook validation guard on the inference
+    path -- ``if not (discriminant >= 0).all(): raise RuntimeError(...)`` in
+    ``_rational_quadratic_spline`` -- reached with ``reverse=True`` during a
+    normal forward. It must lower to a graph-native ``torch._assert_async``.
+
+    Asserted at the transformation level rather than as a break-count row in
+    paper_eval: VITS carries ~22 breaks from unrelated causes (dynamic shapes in
+    the vocoder), and this guard sits inside a region that is already eager, so
+    lowering it does not change the graph count. A registry entry would read
+    "22 -> 22, 0% fixed" and misrepresent a transform that applied correctly.
+
+    The paper's own VG model, MoLFormer-XL, cannot serve here: it ships its
+    guards as Hub remote code, and all of transformers contains exactly one
+    ``torch.equal`` (in a loss function, not a guard).
+    """
+    transformers = pytest.importorskip("transformers")
+    src_path = (
+        Path(transformers.__file__).parent / "models" / "vits" / "modeling_vits.py"
+    )
+    if not src_path.is_file():
+        pytest.skip("transformers VITS source not present")
+
+    prog = JacProgram()
+    prog._graphmend_enabled = True
+    prog._graphmend_scoped_compile = True
+    mod = prog.compile(
+        file_path=str(src_path),
+        options=CompileOptions(graphmend=True, type_check=False),
+    )
+    pa = mod.gen.py_ast
+    src = ast.unparse(pa[0] if isinstance(pa, list) else pa)
+
+    assert "torch._assert_async((discriminant >= 0).all()" in src, (
+        "the VITS discriminant guard was not lowered to a graph-native assert"
+    )
+    # The Python-level `raise` on that path is gone: the check now lives in the
+    # graph rather than forcing a data-dependent bool back into the interpreter.
+    assert "if not (discriminant >= 0).all():" not in src
