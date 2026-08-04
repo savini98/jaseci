@@ -86,8 +86,8 @@ obj TrapLoweringPass(UniPass) {
         # When the message is not a string literal, degrade to message-only.
         marked = (
             self._marked_message(nd, msg, type_name)
-            if (type_name is not None)
-            else None
+                if (type_name is not None)
+                else None
         );
         use_msg = marked if (marked is not None) else msg;
         eq = self._torch_equal_args(x);

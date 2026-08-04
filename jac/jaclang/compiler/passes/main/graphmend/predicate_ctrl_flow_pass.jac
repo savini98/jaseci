@@ -88,15 +88,15 @@ obj PredicateCtrlFlowPass(UniPass) {
             if isinstance(a0, uni.Assignment) and isinstance(b0, uni.Assignment) {
                 lhs = self._same_lhs(a0, b0);
                 if (lhs is not None)
-                and (a0.value is not None)
-                and (b0.value is not None)
-                and (not self._has_none(a0.value, b0.value)) {
+                    and (a0.value is not None)
+                    and (b0.value is not None)
+                    and (not self._has_none(a0.value, b0.value)) {
                     self._rewrite_assignment(nd, lhs, a0.value, b0.value);
                 }
             } elif isinstance(a0, uni.ReturnStmt) and isinstance(b0, uni.ReturnStmt) {
                 if (a0.expr is not None)
-                and (b0.expr is not None)
-                and (not self._has_none(a0.expr, b0.expr)) {
+                    and (b0.expr is not None)
+                    and (not self._has_none(a0.expr, b0.expr)) {
                     self._rewrite_return(nd, a0.expr, b0.expr);
                 }
             } elif isinstance(a0, uni.ExprStmt) and isinstance(b0, uni.ExprStmt) {
@@ -235,8 +235,8 @@ obj PredicateCtrlFlowPass(UniPass) {
     """Return `(receiver_text, key)` for `not hasattr(<recv>, "<literal>")`."""
     def _hasattr_key(c: uni.Expr) -> (tuple | None) {
         if (not isinstance(c, uni.UnaryExpr))
-        or (c.op is None)
-        or (c.op.value != 'not') {
+            or (c.op is None)
+            or (c.op.value != 'not') {
             return None;
         }
         inner = c.operand;
@@ -255,7 +255,7 @@ obj PredicateCtrlFlowPass(UniPass) {
         # a string literal surfaces as `String` or `MultiString`; both expose
         # the unquoted text via `lit_value`.
         if isinstance(recv, uni.KWPair)
-        or (not isinstance(key, (uni.String, uni.MultiString))) {
+            or (not isinstance(key, (uni.String, uni.MultiString))) {
             return None;
         }
         return (recv.unparse().replace(' ', ''), key.lit_value);

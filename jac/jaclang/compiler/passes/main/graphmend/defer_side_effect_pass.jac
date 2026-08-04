@@ -117,7 +117,7 @@ obj DeferSideEffectPass(UniPass) {
             return False;
         }
         if (not isinstance(t.right, uni.Name))
-        or (t.right.value not in self._LOG_METHODS) {
+            or (t.right.value not in self._LOG_METHODS) {
             return False;
         }
         base = t.target;
