@@ -93,6 +93,52 @@ test "a relative import named like a stdlib module keeps its call edge" {
     assert "__jac_se_emit__" in _fn_src(src, "near_helper");
 }
 
+test "a decorator factory's sibling closure joins the region through the wrapper" {
+    # The seeded forward's decorator is a factory imported from another module;
+    # only its wrapper closure calls the decorated function, and the breaks
+    # live one bare-name call away in a sibling closure bound in the factory's
+    # local scope. The walk must chain the import hop, the decorator hop, and
+    # the enclosing-scope hop before detection can tag anything here.
+    prog = JacProgram();
+    _pysrc_in(prog, "region_deco_entry.jac");
+    src = _pysrc_in(prog, "region_deco_factory.jac");
+    assert "torch.where(" in _fn_src(src, "phase_update");
+    assert "__jac_se_emit__" in _fn_src(src, "phase_update");
+    assert "if x.sum() > 0" not in _fn_src(src, "phase_update");
+}
+
+test "detection tags the sibling closure's branch behind the decorator" {
+    # Pin the facts, not just the emitted source: a reintroduced reachability
+    # gap would leave breaks empty and noop set while the output still looks
+    # plausible, so a source-only assert cannot catch it.
+    prog = JacProgram();
+    _pysrc_in(prog, "region_deco_entry.jac");
+    mod = prog.compile(
+        file_path=os.path.join(FIXTURES, "region_deco_factory.jac"),
+        options=CompileOptions(graphmend=True, type_check=False)
+    );
+    facts = mod.gen.graphmend_facts;
+    assert facts is not None;
+    assert not facts.noop;
+    assert sorted([k.value for k in facts.breaks.values()])
+        == ["dyn_ctrl_fl", "side_effect"];
+    assert sorted([ab.sym_name for ab in facts.boundary.keys()])
+        == ["phase_update", "wrapper"];
+}
+
+test "a sibling closure the wrapper never calls stays byte identical" {
+    # phase_orphan holds the same transformable patterns as phase_update but no
+    # call edge reaches it, so widening the enclosing-scope resolution must not
+    # drag it into the region.
+    prog = JacProgram();
+    _pysrc_in(prog, "region_deco_entry.jac");
+    src_on = _pysrc_in(prog, "region_deco_factory.jac");
+    src_off = _pysrc("region_deco_factory.jac", False);
+    assert _fn_src(src_on, "phase_orphan") == _fn_src(src_off, "phase_orphan");
+    assert "print('PHASE-ORPHAN', y)" in src_on;
+    assert _fn_src(src_on, "wrapper") == _fn_src(src_off, "wrapper");
+}
+
 test "a wrapped entry function is transformed through the wrap" {
     src = _pysrc("region_wrap_fn.jac", True);
     assert "__jac_se_emit__" in _fn_src(src, "wrapped");
