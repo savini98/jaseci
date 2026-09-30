@@ -9,6 +9,73 @@ glob SYSTEM_PERSONA = """\
     output. Only use tools.
     """;
 
+def _tool_call_args(raw_args: object) -> dict[str, any] {
+    if isinstance(raw_args, dict) {
+        return raw_args as dict[str, any];
+    }
+    if isinstance(raw_args, str) and raw_args {
+        try {
+            parsed: any = json.loads(raw_args);
+            if isinstance(parsed, dict) {
+                return parsed as dict[str, any];
+            }
+        } except Exception {}
+        return {"_raw": raw_args};
+    }
+    return {};
+}
+
+def _extract_tool_calls(msg: object) -> list[dict[str, any]] {
+    raw: any = msg?.tool_calls;
+    if raw is None and isinstance(msg, dict) {
+        raw = msg.get("tool_calls");
+    }
+    if not raw {
+        return [];
+    }
+    out: list[dict[str, any]] = [];
+    for tc in raw {
+        tc_id = str(getattr(tc, "id", "") or "");
+        tc_name = "";
+        tc_args: dict[str, any] = {};
+        fn: any = tc?.function;
+        if fn is not None {
+            tc_name = str(getattr(fn, "name", "") or "");
+            tc_args = _tool_call_args(fn?.arguments);
+        }
+        if not tc_id and isinstance(tc, dict) {
+            tc_id = str(tc.get("id", "") or "");
+            fn_dict: any = tc.get("function") or {};
+            if isinstance(fn_dict, dict) {
+                tc_name = str(fn_dict.get("name", "") or "");
+                tc_args = _tool_call_args(fn_dict.get("arguments"));
+            }
+        }
+        if tc_id {
+            out.append({"id": tc_id, "name": tc_name, "args": tc_args});
+        }
+    }
+    return out;
+}
+
+def _record_context_message(
+    cg: ContextGraph, mt_run: MTRuntime, message: object
+) -> None {
+    if isinstance(message, ToolCallResultMsg) {
+        return;
+    }
+    role = message_role(message);
+    if not role or role == "tool" {
+        return;
+    }
+    msg_node = cg.record_message(
+        role=role,
+        content=message_text(message),
+        tool_calls=_extract_tool_calls(message)
+    );
+    mt_run._ctx_msg_ids[id(message)] = msg_node.msg_id;
+}
+
 impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
     caller = mtir.caller;
     args = mtir.args;
@@ -220,23 +287,60 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
         mt_run._conversation_list = conv_list_ref;
     }
 
+    context_obj = call_params.get("context");
+    if isinstance(context_obj, Context) {
+        cg = context_obj.get_or_create_graph();
+        mt_run.context = cg;
+        mt_run.context_policy = context_obj.policy;
+        existing = cg.messages();
+        matched = 0;
+        for m in mt_run.messages {
+            if matched < len(existing)
+                and message_role(m) == existing[matched].role
+                and message_text(m) == existing[matched].content {
+                mt_run._ctx_msg_ids[id(m)] = existing[matched].msg_id;
+                matched += 1;
+                continue;
+            }
+            _record_context_message(cg, mt_run, m);
+        }
+    }
+
     return mt_run;
 }
 
 impl MTRuntime.add_message(message: MessageType) -> None {
     self.messages.append(message);
+    cg = self.context;
+    if cg is not None {
+        _record_context_message(cg, self, message);
+    }
 }
 
 
 impl MTRuntime.add_scaffolding_message(message: MessageType) -> None {
     self.messages.append(message);
     self._scaffolding_ids.append(id(message));
+    self._ctx_msg_ids.pop(id(message), None);
 }
 
 impl MTRuntime.get_msg_list -> list[dict[str, object] | LiteLLMMessage] {
-    return [
-        msg.to_dict() if isinstance(msg, Message) else msg for msg in self.messages
-    ];
+    source: list[any] = self.messages;
+    policy = self.context_policy;
+    cg = self.context;
+    if policy is not None and cg is not None {
+        try {
+            overlay = policy.materialize(cg, self);
+            if overlay is not None {
+                source = overlay;
+            }
+        } except Exception as e {
+            logger.warning(
+                f"byLLM context: materialize failed, sending the canonical history: {e}"
+            );
+        }
+    }
+    return [msg.to_dict() if isinstance(msg, Message) else msg for msg in source];
 }
 
 

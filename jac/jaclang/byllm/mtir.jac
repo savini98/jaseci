@@ -18,6 +18,14 @@ import from jaclang.byllm.types {
     ToolCallResultMsg
 }
 import from jaclang.byllm.mcp { McpTool }
+import from jaclang.byllm._optdeps.loguru { logger }
+import from jaclang.byllm.context {
+    Context,
+    ContextGraph,
+    ContextPolicy,
+    message_role,
+    message_text
+}
 
 obj MTIR {
     has caller: Callable,
@@ -44,7 +52,10 @@ obj MTRuntime {
         _usage_history: list[dict[str, any]] = [],
         _call_kind: str = "react_iteration",
         _invocation_id: str = "",
-        _parent_invocation_id: str | None = None;
+        _parent_invocation_id: str | None = None,
+        context: ContextGraph | None = None,
+        context_policy: ContextPolicy | None = None,
+        _ctx_msg_ids: dict[int, str] = {};
 
     static def factory(mtir: MTIR) -> MTRuntime;
     def add_message(message: MessageType) -> None;
