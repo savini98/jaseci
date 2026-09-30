@@ -35,6 +35,19 @@ import from jaclang.byllm.exceptions {
 import from jaclang.byllm.mcp { McpClient, McpTool }
 import from jaclang.byllm.telemetry { register_agent_callback }
 import from jaclang.byllm.parallel { dispatch_batch, mark_serialize }
+import from jaclang.byllm.context {
+    Context,
+    ContextPolicy,
+    ContextGraph,
+    ContextToolResult,
+    ContextMessage,
+    ContextCompactionSummary,
+    ReferencedBy,
+    EvictionDecision,
+    apply_eviction_decision
+}
+import from jaclang.byllm.context_render { ContextRender }
+import from jaclang.byllm.typed_compaction { CompactionSlots }
 
 glob `by = JacRuntime.`by,
      __all__ = [
@@ -71,5 +84,16 @@ glob `by = JacRuntime.`by,
          'Video',
          'register_agent_callback',
          'dispatch_batch',
-         'mark_serialize'
+         'mark_serialize',
+         'Context',
+         'ContextPolicy',
+         'ContextGraph',
+         'ContextToolResult',
+         'ContextMessage',
+         'ContextCompactionSummary',
+         'ReferencedBy',
+         'EvictionDecision',
+         'apply_eviction_decision',
+         'ContextRender',
+         'CompactionSlots'
      ];

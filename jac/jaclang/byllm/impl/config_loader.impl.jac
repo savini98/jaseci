@@ -39,6 +39,7 @@ impl JacByllmConfig.get_default_config(self: JacByllmConfig) -> dict[str, any] {
             'ctx_window': 0,
             'compaction_model': ''
         },
+        'context': {'budget_tokens': 0, 'budget_ratio': 0.5, 'embed_model': ''},
         'local': {
             'default_alias': 'gemma-4-e4b',
             'n_ctx': 0,
@@ -176,6 +177,16 @@ impl JacByllmConfig.get_compaction_config(self: JacByllmConfig) -> dict[str, any
         'keep_recent_iterations': int(c.get('keep_recent_iterations', 3)),
         'ctx_window': int(c.get('ctx_window', 0)),
         'compaction_model': str(c.get('compaction_model', ''))
+    };
+}
+
+impl JacByllmConfig.get_context_config(self: JacByllmConfig) -> dict[str, any] {
+    config = self.load();
+    c = config.get('context', {});
+    return {
+        'budget_tokens': int(c.get('budget_tokens', 0)),
+        'budget_ratio': float(c.get('budget_ratio', 0.5)),
+        'embed_model': str(c.get('embed_model', ''))
     };
 }
 

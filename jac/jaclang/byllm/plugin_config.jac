@@ -167,6 +167,28 @@ class JacByllmPluginConfig {
                             "description": "Model to use for the summarisation call (empty = use the same model as the active ReAct loop)"
                         }
                     }
+                },
+                "context": {
+                    "type": "dict",
+                    "default": {},
+                    "description": "Defaults for ContextRender context management, active when a call passes context=Context(...)",
+                    "nested": {
+                        "budget_tokens": {
+                            "type": "int",
+                            "default": 0,
+                            "description": "Token budget for visible tool results (0 = budget_ratio times the model's context window)"
+                        },
+                        "budget_ratio": {
+                            "type": "float",
+                            "default": 0.5,
+                            "description": "Fraction of the context window used as the tool-result budget when budget_tokens is 0"
+                        },
+                        "embed_model": {
+                            "type": "string",
+                            "default": "",
+                            "description": "LiteLLM embedding model for relevance scoring (empty = lexical scoring, no network call)"
+                        }
+                    }
                 }
             }
         };

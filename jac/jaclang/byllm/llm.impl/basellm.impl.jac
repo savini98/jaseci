@@ -413,6 +413,47 @@ def _copy_for_compaction(model: BaseLLM) -> BaseLLM {
 }
 
 
+def _compaction_model(model: BaseLLM, comp_model: str | None) -> BaseLLM {
+    if comp_model {
+        return Model(
+            model_name=comp_model,
+            api_key=model.api_key,
+            config=model.config,
+            call_params={"compaction_enabled": False}
+        );
+    }
+    return _copy_for_compaction(model);
+}
+
+
+def _context_prune(mt_run: MTRuntime, model: BaseLLM) -> None {
+    policy = mt_run.context_policy;
+    cg = mt_run.context;
+    if policy is None or cg is None {
+        return;
+    }
+    if policy.should_prune(cg, mt_run, model) {
+        policy.prune(cg, mt_run, model);
+    }
+}
+
+
+def _context_record_tool_result(
+    mt_run: MTRuntime, tc: ToolCall, result_msg: Message
+) -> None {
+    cg = mt_run.context;
+    if cg is None {
+        return;
+    }
+    cg.record_tool_result(
+        tool_name=tc.tool.get_name(),
+        args=tc.args,
+        full_content=str(result_msg.content),
+        call_id=tc.call_id
+    );
+}
+
+
 def _default_compact(
     messages: list[any],
     keep_recent: int,
@@ -630,6 +671,23 @@ impl BaseLLM._compact_messages(
     on_compaction = (
         mt_run.call_params.get("on_compaction") or self.call_params.get("on_compaction")
     );
+    policy = mt_run.context_policy;
+    cg = mt_run.context;
+    if not on_compaction and policy is not None and cg is not None {
+        if policy.compact(
+            cg, mt_run, _compaction_model(self, comp_model), keep_recent
+        ) {
+            logger.info(
+                "byLLM compaction: the context policy folded older turns into a summary"
+            );
+            return;
+        }
+        raise CompactionNotEffectiveError(
+            "ContextRender compaction found nothing to fold - increase ctx_window, "
+            "lower keep_recent_iterations, or switch to a model with a larger "
+            "context window."
+        );
+    }
     original_len = len(mt_run.messages);
     msg_dicts = mt_run.get_msg_list();
     if on_compaction {
@@ -643,18 +701,8 @@ impl BaseLLM._compact_messages(
             );
         }
     } else {
-        if comp_model {
-            model_for_compaction: BaseLLM = Model(
-                model_name=comp_model,
-                api_key=self.api_key,
-                config=self.config,
-                call_params={"compaction_enabled": False}
-            );
-        } else {
-            model_for_compaction = _copy_for_compaction(self);
-        }
         compacted = _default_compact(
-            msg_dicts, keep_recent, model_for_compaction, mt_run
+            msg_dicts, keep_recent, _compaction_model(self, comp_model), mt_run
         );
     }
     removed = original_len - len(compacted);
@@ -1049,6 +1097,9 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
     just_compacted = False;
     while True {
         iter_count += 1;
+        if iter_count > 1 {
+            _context_prune(mt_run, self);
+        }
         if on_iteration and iter_count > 1 {
             ctx = IterationContext(
                 iteration=iter_count,
@@ -1134,6 +1185,7 @@ impl BaseLLM._invoke_react_loop(mt_run: MTRuntime) -> object {
                         last_tool = btc.tool.get_name();
                         last_result = str(result_msg.content)[:500];
                         mt_run.add_message(result_msg);
+                        _context_record_tool_result(mt_run, btc, result_msg);
                     }
                 }
             }
@@ -2154,6 +2206,9 @@ impl BaseLLM._invoke_streaming(
         while True {
             iter_count += 1;
             _usage_base = len(mt_run._usage_history);
+            if iter_count > 1 {
+                _context_prune(mt_run, self);
+            }
 
             if on_iteration and iter_count > 1 {
                 ctx = IterationContext(
@@ -2398,6 +2453,9 @@ impl BaseLLM._invoke_streaming(
                         }
                         for i in range(len(batch)) {
                             mt_run.add_message(ordered[i][1]);
+                            _context_record_tool_result(
+                                mt_run, ordered[i][0], ordered[i][1]
+                            );
                         }
                     }
                 }
