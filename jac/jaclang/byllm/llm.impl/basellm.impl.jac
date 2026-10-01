@@ -448,8 +448,9 @@ def _context_record_tool_result(
     cg.record_tool_result(
         tool_name=tc.tool.get_name(),
         args=tc.args,
-        full_content=str(result_msg.content),
-        call_id=tc.call_id
+        full_content=message_text(result_msg),
+        call_id=tc.call_id,
+        media=not isinstance(result_msg.content, str)
     );
 }
 
@@ -684,7 +685,16 @@ impl BaseLLM._compact_messages(
         }
     }
     original_len = len(mt_run.messages);
-    msg_dicts = mt_run.get_msg_list();
+    msg_dicts: list[any] = [];
+    carried: dict[int, str] = {};
+    for msg in mt_run.messages {
+        plain: any = msg.to_dict() if isinstance(msg, Message) else msg;
+        node_id = mt_run._ctx_msg_ids.get(id(msg));
+        if node_id is not None {
+            carried[id(plain)] = node_id;
+        }
+        msg_dicts.append(plain);
+    }
     if on_compaction {
         compacted = on_compaction(msg_dicts, keep_recent);
         if not isinstance(compacted, list) or len(compacted) < 2 {
@@ -708,6 +718,11 @@ impl BaseLLM._compact_messages(
         );
     }
     mt_run.messages = compacted;
+    mt_run._ctx_msg_ids = {
+        id(m): carried[id(m)]
+        for m in compacted
+        if id(m) in carried
+    };
     logger.info(
         f"byLLM compaction: reduced message list from {original_len} to {len(
             compacted

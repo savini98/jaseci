@@ -13,7 +13,8 @@ impl ContextGraph.record_tool_result(
     args: dict[str, any],
     full_content: str,
     turn: int = -1,
-    call_id: str = ""
+    call_id: str = "",
+    media: bool = False
 ) -> ContextToolResult {
     if turn < 0 {
         self.turn_count += 1;
@@ -27,7 +28,8 @@ impl ContextGraph.record_tool_result(
         visible_content=full_content,
         produced_at=time.time(),
         produced_at_turn=turn,
-        call_id=call_id
+        call_id=call_id,
+        media=media
     );
     self ++> tr;
     return tr;
@@ -103,9 +105,6 @@ impl Context.get_or_create_graph -> ContextGraph {
         return self.graph;
     }
     cg = ContextGraph(session_id=self.session_id, created_at=time.time());
-    if self.persist {
-        root ++> cg;
-    }
     self.graph = cg;
     return cg;
 }
@@ -236,27 +235,46 @@ impl unit(v: list[float]) -> list[float] {
     return [x / norm for x in v];
 }
 
+impl cache_get(cache: object, key: str) -> any {
+    store: any = cache;
+    if key not in store {
+        return None;
+    }
+    value: any = store.pop(key);
+    store[key] = value;
+    return value;
+}
+
+impl cache_put(cache: object, key: str, value: object, limit: int) {
+    store: any = cache;
+    store.pop(key, None);
+    while limit > 0 and len(store) >= limit {
+        store.pop(next(iter(store)));
+    }
+    store[key] = value;
+}
+
 impl cached_idents(text: str, cap: int = 20000) -> set[str] {
     clipped = text[:cap];
     key = f"{cap}:" + hashlib.sha1(clipped.encode("utf-8")).hexdigest();
-    hit = IDENT_CACHE.get(key);
+    hit = cache_get(IDENT_CACHE, key);
     if hit is not None {
         return hit;
     }
     v = distinctive_idents(clipped);
-    IDENT_CACHE[key] = v;
+    cache_put(IDENT_CACHE, key, v, TEXT_CACHE_MAX);
     return v;
 }
 
 impl cached_lextoks(text: str, cap: int = 20000) -> set[str] {
     clipped = text[:cap];
     key = f"{cap}:" + hashlib.sha1(clipped.encode("utf-8")).hexdigest();
-    hit = LEXTOK_CACHE.get(key);
+    hit = cache_get(LEXTOK_CACHE, key);
     if hit is not None {
         return hit;
     }
     v = lexical_tokens(clipped);
-    LEXTOK_CACHE[key] = v;
+    cache_put(LEXTOK_CACHE, key, v, TEXT_CACHE_MAX);
     return v;
 }
 
@@ -329,7 +347,7 @@ impl managed_tool_results(cg: ContextGraph) -> list[ContextToolResult] {
     return [
         tr
         for tr in cg.tool_results()
-        if tr.call_id and seen.get(tr.call_id, 0) == 1
+        if tr.call_id and not tr.media and seen.get(tr.call_id, 0) == 1
     ];
 }
 
@@ -347,13 +365,15 @@ impl message_role(message: object) -> str {
     return str(getattr(role, "value", role) or "");
 }
 
-impl message_text(message: object) -> str {
-    content: any = None;
+impl message_content(message: object) -> any {
     if isinstance(message, dict) {
-        content = message.get("content");
-    } else {
-        content = message?.content;
+        return message.get("content");
     }
+    return message?.content;
+}
+
+impl message_text(message: object) -> str {
+    content: any = message_content(message);
     if content is None {
         return "";
     }

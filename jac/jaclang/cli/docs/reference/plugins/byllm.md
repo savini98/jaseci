@@ -1456,12 +1456,12 @@ with entry {
 | Field | Default | Meaning |
 |---|---|---|
 | `budget_tokens` | `0` | Token budget for visible tool results. `0` means "use `budget_ratio` of the model's context window". |
-| `budget_ratio` | `0.5` | Fraction of the context window used when `budget_tokens` is `0`. |
+| `budget_ratio` | `0.0` | Fraction of the context window used when no token budget is set. `0` means "use `[plugins.byllm.context] budget_ratio`", which defaults to `0.5`. |
 | `policy` | `None` | The policy object. `None` means `ContextRender()` with default settings. |
 | `persist` | `True` | Keep the same graph across calls on this `Context`. `False` starts a new graph on every call. |
 | `session_id` | `""` | Label stored on the graph, useful when inspecting it later. |
 
-The budget resolves in this order: `Context.budget_tokens`, then `[plugins.byllm.context] budget_tokens` in `jac.toml`, then `budget_ratio` times the model's context window (see [Context window resolution](#context-window-resolution)). A budget of `0` after all three means record only: the graph is filled but nothing is ever trimmed.
+The budget resolves in this order: `Context.budget_tokens`, then `[plugins.byllm.context] budget_tokens` in `jac.toml`, then a ratio times the model's context window (see [Context window resolution](#context-window-resolution)). The ratio is `Context.budget_ratio` when it is set, else `[plugins.byllm.context] budget_ratio`. A budget of `0` after all three means record only: the graph is filled but nothing is ever trimmed.
 
 Tokens are estimated as characters divided by four, so the budget is approximate.
 
@@ -1473,7 +1473,7 @@ The canonical message list (`mt_run.messages`, and any `conversation=` list) is 
 - Turns that a compaction folded away are replaced by one summary message tagged `[Compacted context summary]`.
 - The system message and the first user message are always sent as they are.
 
-Tool call ids stay paired with their results, so the provider sees a valid conversation: when a compaction hides an assistant message, the results of its tool calls go with it. Tool results that arrive as `conversation=` history are recorded and managed like the ones produced in the call. A result whose tool call id is empty or not unique cannot be paired, so it is recorded but never trimmed or counted. With `persist=True`, results from an earlier call that are not in the current message list are likewise left out of the budget.
+Tool call ids stay paired with their results, so the provider sees a valid conversation: when a compaction hides an assistant message, the results of its tool calls go with it. Tool results that arrive as `conversation=` history are recorded and managed like the ones produced in the call. A result whose tool call id is empty or not unique cannot be paired, so it is recorded but never trimmed or counted. The same holds for a result that is not plain text, such as an image: the graph keeps its caption and a `[media]` marker, and the message is always sent as it is. With `persist=True`, results from an earlier call that are not in the current message list are likewise left out of the budget.
 
 ### How results are scored
 
@@ -1486,22 +1486,24 @@ score = w_recency   * exp(-recency_decay * age)
 ```
 
 - **age** is the number of transcript items recorded since the result was produced. Every message and every tool result is one turn, so `grace_turns=3` covers roughly the last one or two tool calls.
-- **reuse** is how much later assistant turns cited identifiers that this result introduced. The policy scans each new assistant message and its tool-call arguments for distinctive identifiers (mixed case, underscores, digits, dots or dashes, at least six characters) and credits the earliest result that contained them, weighted by how many results share the identifier. Each credit also writes a `ReferencedBy` edge from the citing message to the result, so the graph records which turn used which result.
-- **relevance** is the cosine similarity between the result and the agent's current focus: the first user message blended with the latest user and assistant messages. By default this is a lexical (bag of words) cosine, so no network call is made. Set `embed_model` to a LiteLLM embedding model to use embeddings instead; if an embedding call fails the policy falls back to lexical scoring for the rest of the process.
+- **reuse** is how much later assistant turns cited identifiers that this result introduced. The policy scans each new assistant message and its tool-call arguments for distinctive identifiers (mixed case, underscores, digits, dots or dashes, at least six characters) and credits the earliest result in the current message list that contained them, weighted by how many results share the identifier. Each credit also writes a `ReferencedBy` edge from the citing message to the result, so the graph records which turn used which result.
+- **relevance** is the cosine similarity between the result and the agent's current focus: the first user message blended with the latest user and assistant messages. By default this is a lexical (bag of words) cosine, so no network call is made. Set `embed_model` to a LiteLLM embedding model to use embeddings instead; if an embedding call fails twice in a row the policy scores lexically for five minutes and then tries the embedding model again. Embedding calls do not reuse the chat model's key or base URL: set `embed_api_key` and `embed_api_base`, or the provider's environment variables.
 
-Selection then runs in this order: results from the last `grace_turns` messages are kept (the newest always, the rest up to `pin_budget_frac` of the budget); up to `pin_recent` further recent results are kept if they fit; results whose identifiers appear in the last `working_set_turns` assistant messages are kept if they fit; the remaining budget is filled greedily by score with an MMR diversity penalty (`mmr_lambda` times the highest similarity to an already kept result); finally the lowest-scoring kept results are dropped until the set really fits, leaving room for the stubs.
+Selection then runs in this order: results the model has not read yet are kept in full (everything after the last assistant message, so every result of a multi-call turn, while `protect_current_turn` is on); results from the last `grace_turns` messages are kept (the newest always, the rest up to `pin_budget_frac` of the budget); up to `pin_recent` further recent results are kept if they fit; results whose identifiers appear in the last `working_set_turns` assistant messages are kept if they fit; the remaining budget is filled greedily by score with an MMR diversity penalty (`mmr_lambda` times the highest similarity to an already kept result); finally the lowest-scoring kept results are dropped until the set really fits, leaving room for the stubs.
 
 ### How a result is rendered when it is not selected
 
 - **Smart trim**: a result longer than `trim_chars` keeps its first third and last third and fills the middle with the lines most similar to the current focus. Elided spans are marked `...[relevance-trimmed]...`.
-- **Micro stub**: a shorter result keeps the lines that carry the most distinctive identifiers, within `micro_stub_chars`, so the agent can still see what the result was about. Results below `micro_stub_min` characters are left alone.
-- **Named placeholder**: only as a last resort (when `stub_overflow` is `"clear"` and the stubs alone would not fit), a result is replaced by a one-line placeholder that names the tool and its arguments so the agent can re-run it.
+- **Micro stub**: a shorter result keeps the lines that carry the most distinctive identifiers, within `micro_stub_chars`, so the agent can still see what the result was about. Results below `micro_stub_min` characters are left alone. A result with no usable line breaks (one long line of JSON, for example) is cut to its head and tail instead, for both the trim and the stub.
+- **Named placeholder**: only as a last resort, and only when `stub_overflow` is `"clear"` or `allow_hard_clear` is on, a result is replaced by a one-line placeholder that names the tool and its arguments so the agent can re-run it. A placeholder is permanent: that result no longer comes back.
+
+With the default settings no result is ever replaced by a placeholder. When the trimmed results alone exceed the budget, the oldest are shrunk further to micro stubs, which stay restorable. If even the stubs do not fit, the view goes over the budget rather than deleting anything, so the budget is a target and not a hard cap.
 
 Renderings are stable on purpose. Once a result has been trimmed, later passes reuse the same bytes (`sticky_trim`), and the first rendering is memoised per graph (`memo_trim`) so a restore followed by a new trim reproduces it exactly. This keeps provider prompt caches valid.
 
 ### Typed-slot compaction
 
-When the history still grows past the auto-compaction threshold (see [Auto-Compaction](#auto-compaction)), a wired `Context` replaces the plain summary with a typed extraction. The model fills a `CompactionSlots` object with `files_read`, `key_observations`, `commands_run`, `decisions` and `unresolved_questions`, and is instructed to copy numeric values, configuration keys, paths and identifiers verbatim. The rendered slots become the summary, the covered turns are hidden from the view, and the previous summary is merged into the new one. An `on_compaction` hook, when set, still takes precedence.
+When the history still grows past the auto-compaction threshold (see [Auto-Compaction](#auto-compaction)), a wired `Context` replaces the plain summary with a typed extraction. The model fills a `CompactionSlots` object with `files_read`, `key_observations`, `commands_run`, `decisions` and `unresolved_questions`, and is instructed to copy numeric values, configuration keys, paths and identifiers verbatim. The rendered slots become the summary, the covered turns are hidden from the view, and the previous summary is merged into the new one. An `on_compaction` hook, when set, still takes precedence, and is handed the canonical history with full tool results, not the trimmed view.
 
 The extraction reads the full text of the folded tool results while that fits `compact_full_ratio` of the extracting model's context window. Past that it reads their trimmed view, which is what the agent was seeing. Nothing is hidden until the extraction succeeds: if that call fails, the error is raised and the view, including any earlier summary, stays as it was. When there is nothing left to fold, `ContextRender` raises `CompactionNotEffectiveError`.
 
@@ -1514,6 +1516,7 @@ All settings are `has` fields of `ContextRender`, so `Context(policy=ContextRend
 | Field | Default | What it does |
 |---|---|---|
 | `embed_model` | `""` | LiteLLM embedding model for relevance. Empty means lexical scoring. Also read from `[plugins.byllm.context] embed_model`. |
+| `embed_api_key`, `embed_api_base` | `""` | Key and base URL for the embedding calls. Empty means LiteLLM's own resolution from the environment. |
 | `anchor_w` | `0.4` | Weight of the first user message in the focus query; the rest is the latest user and assistant messages. |
 | `grace_turns` | `3` | Results from the last N messages are never trimmed. |
 | `pin_recent` | `2` | Extra most-recent results kept when they fit. |
@@ -1530,8 +1533,8 @@ All settings are `has` fields of `ContextRender`, so `Context(policy=ContextRend
 | `sticky_trim` | `True` | Reuse an existing rendering that already fits. |
 | `memo_trim` | `True` | Memoise the first rendering of each result. |
 | `stub_overflow` | `"keep"` | `"keep"` shrinks the kept set so stubs fit; `"clear"` replaces the lowest-scoring stubs with placeholders instead. |
-| `allow_hard_clear` | `False` | Let heavy pressure escalate to placeholders. |
-| `protect_current_turn` | `True` | Never hard-clear a result from the current turn. |
+| `allow_hard_clear` | `False` | Let pressure replace results with placeholders: heavy fill escalates evictions, and the oldest stubs are cleared when they do not fit the budget. |
+| `protect_current_turn` | `True` | Never trim a result the model has not read yet. |
 | `high_water` | `1.0` | Run the policy when visible tool tokens exceed this multiple of the budget. |
 | `select_hysteresis` | `0.0` | Score margin a stubbed result must beat to displace a visible one. |
 | `evict_min_tokens`, `evict_min_gain_ratio` | `0`, `0.0` | Skip a pass that would remove too little when nothing needs restoring. |
@@ -1543,7 +1546,7 @@ All settings are `has` fields of `ContextRender`, so `Context(policy=ContextRend
 
 ### Inspecting the graph
 
-`ctx.graph` is the `ContextGraph` node. Its `tool_results()`, `messages()` and `summaries()` return the recorded nodes; each `ContextToolResult` carries `full_content`, `visible_content`, `truncation_state` (`full`, `head_tail` or `hard_cleared`) and `call_id`. `ctx.stats()` returns a dictionary with the budget, the counts of full, trimmed and hard-cleared results, visible and full token estimates, and counters for prunes, restores, trims, stubs, clears and compactions.
+`ctx.graph` is the `ContextGraph` node. It is not attached to `root`; connect it yourself (`root ++> ctx.graph;`) if you want it stored with your application's graph. Its `tool_results()`, `messages()` and `summaries()` return the recorded nodes; each `ContextToolResult` carries `full_content`, `visible_content`, `truncation_state` (`full`, `head_tail` or `hard_cleared`) and `call_id`. `ctx.stats()` returns a dictionary with the budget, the counts of full, trimmed and hard-cleared results, visible and full token estimates, and counters for prunes, restores, trims, stubs, clears and compactions.
 
 ### Limits
 

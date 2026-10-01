@@ -67,7 +67,8 @@ def _wire_context(mt_run: MTRuntime, context_obj: Context) {
                     tool_name=str(info.get("name", "") or getattr(m, "name", "") or ""),
                     args=info.get("args", {}),
                     full_content=message_text(m),
-                    call_id=call_id
+                    call_id=call_id,
+                    media=not isinstance(message_content(m), str)
                 );
                 known_calls.add(call_id);
             }

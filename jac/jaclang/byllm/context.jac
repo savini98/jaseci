@@ -10,6 +10,7 @@ glob COMPACTION_TAG: str = "[Compacted context summary]",
      HARD_CLEAR_DEFAULT: str = "[Old tool result content cleared]",
      FOLDED_RESULT_NOTE: str = "[Tool result folded into the compacted context summary]",
      MEDIA_TAG: str = "[media]",
+     TEXT_CACHE_MAX: int = 4096,
      IDENT_CACHE: dict[str, set[str]] = {},
      LEXTOK_CACHE: dict[str, set[str]] = {},
      STAT_COUNTERS: list[str] = [
@@ -42,7 +43,8 @@ node ContextGraph {
         args: dict[str, any],
         full_content: str,
         turn: int = -1,
-        call_id: str = ""
+        call_id: str = "",
+        media: bool = False
     ) -> ContextToolResult;
 
     def record_message(
@@ -66,7 +68,8 @@ node ContextToolResult {
         visible: bool = True,
         reference_count: int = 0,
         last_referenced_at: float = 0.0,
-        call_id: str = "";
+        call_id: str = "",
+        media: bool = False;
 }
 
 node ContextMessage {
@@ -116,7 +119,7 @@ obj Context {
     has persist: bool = True,
         session_id: str = "",
         budget_tokens: int = 0,
-        budget_ratio: float = 0.5,
+        budget_ratio: float = 0.0,
         policy: ContextPolicy | None = None,
         `graph: ContextGraph | None = None,
         _resolved_budget: int = 0;
@@ -134,11 +137,14 @@ def lexical_tokens(text: str) -> set[str];
 def lexical_set_cosine(a: set[str], b: set[str]) -> float;
 def cosine(a: list[float], b: list[float]) -> float;
 def unit(v: list[float]) -> list[float];
+def cache_get(cache: object, key: str) -> any;
+def cache_put(cache: object, key: str, value: object, limit: int);
 def cached_idents(text: str, cap: int = 20000) -> set[str];
 def cached_lextoks(text: str, cap: int = 20000) -> set[str];
 def graph_stats(cg: ContextGraph) -> dict[str, any];
 def managed_tool_results(cg: ContextGraph) -> list[ContextToolResult];
 def message_role(message: object) -> str;
+def message_content(message: object) -> any;
 def message_text(message: object) -> str;
 def message_tool_calls(message: object) -> list[dict[str, any]];
 def tool_call_id_of(message: object) -> str;

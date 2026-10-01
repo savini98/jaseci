@@ -11,6 +11,7 @@ import from typing { AsyncGenerator, Generator, cast }
 import type from litellm { Router }
 import type from llama_cpp { Llama }
 import from jaclang.byllm.mtir { MTRuntime }
+import from jaclang.byllm.context { message_text }
 import from jaclang.byllm._optdeps.litellm { litellm, _disable_debugging }
 import from jaclang.byllm._optdeps.openai { openai, OpenAI, AsyncOpenAI }
 import from jaclang.project.capabilities { require_optional }

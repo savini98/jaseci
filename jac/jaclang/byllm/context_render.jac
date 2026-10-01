@@ -16,6 +16,8 @@ import from jaclang.byllm.context {
     EvictionDecision,
     ReferencedBy,
     apply_eviction_decision,
+    cache_get,
+    cache_put,
     cached_idents,
     cached_lextoks,
     cosine,
@@ -39,8 +41,10 @@ glob TRIM_MARKER: str = "...[relevance-trimmed]...",
      HARD_CLEAR_PLACEHOLDER: str = "[tool result evicted by context policy - re-run the tool if needed]",
      NOTHING_TO_FOLD: str = "ContextRender compaction found nothing to fold - increase ctx_window, lower keep_recent_iterations, or switch to a model with a larger context window.",
      EMBED_TIMEOUT: float = 60.0,
+     EMBED_COOLDOWN: float = 300.0,
+     EMBED_CACHE_MAX: int = 1024,
      EMBED_CACHE: dict[str, list[float]] = {},
-     EMBED_STATE: dict[str, bool] = {};
+     EMBED_STATE: dict[str, float] = {};
 
 obj Presence {
     has unrestricted: bool,
@@ -65,6 +69,8 @@ obj ScorePass {
 
 obj ContextRender(ContextPolicy) {
     has embed_model: str = "",
+        embed_api_key: str = "",
+        embed_api_base: str = "",
         anchor_w: float = 0.4,
         grace_turns: int = 3,
         pin_recent: int = 2,
@@ -123,6 +129,7 @@ obj ContextRender(ContextPolicy) {
         tr: ContextToolResult, kind: str, query_tokens: set[str], cg: ContextGraph
     ) -> str;
 
+    def stub_to_budget(cg: ContextGraph, budget_tokens: int, present: Presence) -> int;
     def clear_to_budget(
         cg: ContextGraph, budget_tokens: int, present: Presence
     ) -> int;
@@ -134,7 +141,10 @@ def candidates_of(cg: ContextGraph, present: Presence) -> list[ContextToolResult
 def visible_tool_tokens(cg: ContextGraph, present: Presence) -> int;
 def fill_tokens(cg: ContextGraph, present: Presence) -> int;
 def current_turn_floor(cg: ContextGraph, present: Presence) -> int;
-def scan_citations(cg: ContextGraph, cap: int = 20000);
+def scan_citations(
+    cg: ContextGraph, cap: int = 20000, present: Presence | None = None
+);
+
 def active_call_ids(cg: ContextGraph, turns: int, cap: int = 20000) -> dict[str, bool];
 def focus_texts(cg: ContextGraph, present: Presence) -> dict[str, str];
 def evicted_handle(tr: ContextToolResult) -> str;
@@ -144,6 +154,9 @@ def enforce_budget(
 ) -> dict[str, bool];
 
 def stub_reserve(n_candidates: int, budget: int, stub_chars: int) -> int;
-def embed_text(model_name: str, text: str, clip: int) -> list[float];
+def embed_text(
+    model_name: str, text: str, clip: int, api_key: str = "", api_base: str = ""
+) -> list[float];
+
 def message_item_text(m: ContextMessage) -> str;
 def bump_stat(cg: ContextGraph, key: str, n: int = 1);
