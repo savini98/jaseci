@@ -1,12 +1,15 @@
 import hashlib;
+import json;
 import math;
 import re;
 import time;
-import from jaclang.byllm.types { Message, ToolCallResultMsg }
+import from jaclang.byllm.types { Message, Text, ToolCallResultMsg }
 
 glob COMPACTION_TAG: str = "[Compacted context summary]",
      SOFT_TRIM_MARKER: str = "\n...[soft-trimmed]...\n",
      HARD_CLEAR_DEFAULT: str = "[Old tool result content cleared]",
+     FOLDED_RESULT_NOTE: str = "[Tool result folded into the compacted context summary]",
+     MEDIA_TAG: str = "[media]",
      IDENT_CACHE: dict[str, set[str]] = {},
      LEXTOK_CACHE: dict[str, set[str]] = {},
      STAT_COUNTERS: list[str] = [
@@ -137,6 +140,7 @@ def graph_stats(cg: ContextGraph) -> dict[str, any];
 def managed_tool_results(cg: ContextGraph) -> list[ContextToolResult];
 def message_role(message: object) -> str;
 def message_text(message: object) -> str;
+def message_tool_calls(message: object) -> list[dict[str, any]];
 def tool_call_id_of(message: object) -> str;
 def with_content(message: object, content: str) -> object;
 def materialize_overlay(

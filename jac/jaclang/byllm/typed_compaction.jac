@@ -1,5 +1,4 @@
 import json;
-import from jaclang.byllm._optdeps.loguru { logger }
 import from jaclang.byllm.mtir { MTRuntime }
 import from jaclang.byllm.types { Message, MessageRole }
 
@@ -24,8 +23,7 @@ Slots:
 - unresolved_questions: open questions or follow-ups.
 
 If previous_summary is non-empty, merge so the output supersedes it (do not \
-lose entries that were in previous_summary).""",
-     COMPACTION_FAILED_PREFIX: str = "[Typed compaction summary - extractor failed: ";
+lose entries that were in previous_summary).""";
 
 obj CompactionSlots {
     has files_read: list[str] = [],
@@ -52,10 +50,3 @@ def extract_compaction_slots(
     items: list[dict[str, any]],
     parent_mt_run: object = None
 ) -> CompactionSlots;
-
-def compaction_summary_text(
-    model: object,
-    previous_summary: str,
-    items: list[dict[str, any]],
-    parent_mt_run: object = None
-) -> str;

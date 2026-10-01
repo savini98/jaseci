@@ -22,9 +22,12 @@ import from jaclang.byllm._optdeps.loguru { logger }
 import from jaclang.byllm.context {
     Context,
     ContextGraph,
+    ContextMessage,
     ContextPolicy,
     message_role,
-    message_text
+    message_text,
+    message_tool_calls,
+    tool_call_id_of
 }
 
 obj MTIR {

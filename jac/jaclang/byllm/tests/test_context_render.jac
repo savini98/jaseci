@@ -20,7 +20,9 @@ import from jaclang.byllm.context {
     ContextGraph,
     ContextMessage,
     ContextToolResult,
+    EvictionDecision,
     ReferencedBy,
+    apply_eviction_decision,
     cached_lextoks,
     estimate_tokens,
     lexical_set_cosine,
@@ -40,6 +42,7 @@ import from jaclang.byllm.context_render {
     scan_citations,
     visible_tool_tokens
 }
+import from jaclang.byllm.exceptions { CompactionNotEffectiveError }
 import from jaclang.byllm.types { ToolCallResultMsg }
 import from jaclang.byllm.typed_compaction { CompactionSlots }
 import from support { call, fail, finish, mk_run, roles, sent_messages }
@@ -77,7 +80,9 @@ def tool_text(messages: list[dict[str, any]], call_id: str) -> str {
         for m in messages
         if m.get("role") == "tool" and m.get("tool_call_id") == call_id
     ];
-    assert len(found) == 1 , f"expected one tool message for {call_id}, got {len(found)}";
+    assert len(found) == 1 , f"expected one tool message for {call_id}, got {len(
+        found
+    )}";
     return str(found[0]["content"]);
 }
 
@@ -108,7 +113,9 @@ def wired(ctx: Context, task: str = "") -> tuple[ContextGraph, MTRuntime] {
 
 
 """Record a user or assistant message the way the loop does: into the run and the graph."""
-def add_message(cg: ContextGraph, run: MTRuntime, role: str, text: str) -> ContextMessage {
+def add_message(
+    cg: ContextGraph, run: MTRuntime, role: str, text: str
+) -> ContextMessage {
     m: dict[str, any] = {"role": role, "content": text};
     run.messages.append(m);
     msg_node = cg.record_message(role=role, content=text);
@@ -147,7 +154,9 @@ def add_result(
         tool_calls=[{"id": call_id, "name": tool_name, "args": a}]
     );
     run._ctx_msg_ids[id(call_msg)] = msg_node.msg_id;
-    run.messages.append(ToolCallResultMsg(content=content, tool_call_id=call_id, name=tool_name));
+    run.messages.append(
+        ToolCallResultMsg(content=content, tool_call_id=call_id, name=tool_name)
+    );
     return cg.record_tool_result(
         tool_name=tool_name, args=a, full_content=content, call_id=call_id
     );
@@ -166,13 +175,23 @@ def states(cg: ContextGraph) -> dict[str, str] {
 
 """Visible tokens of every result on the graph, managed or not."""
 def visible_tokens(cg: ContextGraph) -> int {
-    return sum([estimate_tokens(tr.visible_content) for tr in cg.tool_results() if tr.visible]);
+    return sum(
+        [
+            estimate_tokens(tr.visible_content)
+            for tr in cg.tool_results()
+            if tr.visible
+        ]
+    );
 }
 
 
 """The stub's own lines, without the elision markers."""
 def stub_lines(text: str) -> list[str] {
-    return [line for line in text.split("\n") if line != TRIM_MARKER];
+    return [
+        line
+        for line in text.split("\n")
+        if line != TRIM_MARKER
+    ];
 }
 
 
@@ -207,20 +226,31 @@ test "under budget pressure the oldest results are trimmed, the newest stays ful
     c = tool_text(last, "call_c");
     assert TRIM_MARKER in a and TRIM_MARKER in b , "the two oldest are trimmed on the last call";
     assert c == blob("gamma", 8000) , "the newest result is full (grace window)";
-    assert a.startswith(blob("alpha", 8000)[:900]) and a.endswith(blob("alpha", 8000)[-900:]) , (
+    assert a.startswith(blob("alpha", 8000)[:900])
+        and a.endswith(blob("alpha", 8000)[-900:]) , (
         "a smart trim keeps a head and a tail anchor"
     );
     assert len(a) < 8000 and len(b) < 8000;
-    assert HARD_CLEAR_PLACEHOLDER not in str(last) and "evicted from context" not in str(last);
+    assert HARD_CLEAR_PLACEHOLDER not in str(last)
+        and "evicted from context" not in str(last);
     assert [m["role"] for m in last][:2] == ["system", "user"];
 
     cg = ctx.graph;
     assert cg is not None;
-    assert states(cg) == {"call_a": "head_tail", "call_b": "head_tail", "call_c": "full"} , states(cg);
-    assert visible_tokens(cg) <= 3600 , f"visible tool tokens fit the budget: {visible_tokens(cg)}";
+    assert states(cg)
+        == {"call_a": "head_tail", "call_b": "head_tail", "call_c": "full"} , states(
+        cg
+    );
+    assert visible_tokens(cg) <= 3600 , f"visible tool tokens fit the budget: {visible_tokens(
+        cg
+    )}";
     assert a == by_call(cg)["call_a"].visible_content , "the model saw the graph's visible_content";
     turns = [tr.produced_at_turn for tr in cg.tool_results()];
-    asst_turns = [m.turn for m in cg.messages() if m.role == "assistant"];
+    asst_turns = [
+        m.turn
+        for m in cg.messages()
+        if m.role == "assistant"
+    ];
     assert turns == [asst_turns[0] + 1, asst_turns[1] + 1, asst_turns[2] + 1] , (
         f"every item is a turn: results sit one after their call: {turns} vs {asst_turns}"
     );
@@ -249,23 +279,31 @@ test "base_score is decayed recency plus saturating reuse plus clipped relevance
         assert abs(got - want) < 1e-12 , f"{label}: {got} vs {want}";
     }
     assert policy.base_score(0, 0.0, 0.0) == 1.0;
-    assert abs(policy.base_score(2, 0.5, -0.4) - policy.base_score(2, 0.5, 0.0)) < 1e-12;
+    assert abs(policy.base_score(2, 0.5, -0.4) - policy.base_score(2, 0.5, 0.0))
+        < 1e-12;
 
-    weighted = ContextRender(w_recency=2.0, w_reuse=0.5, w_relevance=3.0, recency_decay=0.1, reuse_saturation=1.0);
+    weighted = ContextRender(
+        w_recency=2.0,
+        w_reuse=0.5,
+        w_relevance=3.0,
+        recency_decay=0.1,
+        reuse_saturation=1.0
+    );
     want = 2.0 * math.exp(-0.1 * 4) + 0.5 * (1.0 - math.exp(-1.0 * 2.0)) + 3.0 * 0.5;
     assert abs(weighted.base_score(4, 2.0, 0.5) - want) < 1e-12;
 
     capped = ContextRender(reuse_cap=1.0);
     assert capped.base_score(0, 5.0, 0.0) == capped.base_score(0, 1.0, 0.0) , "reuse_cap clips the mass";
-    assert ContextRender().base_score(0, 5.0, 0.0) > ContextRender().base_score(0, 1.0, 0.0) , (
-        "off by default (-1)"
-    );
+    assert ContextRender().base_score(0, 5.0, 0.0)
+        > ContextRender().base_score(0, 1.0, 0.0) , ("off by default (-1)");
 
     # On a graph: ages come from turns (every item is one), mass from citation_counts,
     # relevance from the lexical query (anchor and focus tokens).
     ctx = Context(policy=policy, budget_tokens=10000, persist=False);
     (cg, run) = wired(ctx);
-    tr_a = add_result(cg, run, "call_a", "the thing is alpha_row_0001\n" + blob("alpha", 300));
+    tr_a = add_result(
+        cg, run, "call_a", "the thing is alpha_row_0001\n" + blob("alpha", 300)
+    );
     tr_b = add_result(cg, run, "call_b", blob("beta", 300));
     cg.citation_counts["call_a"] = 2.0;
     query = lexical_tokens("Do the thing.") | lexical_tokens("Do the thing.");
@@ -275,10 +313,14 @@ test "base_score is decayed recency plus saturating reuse plus clipped relevance
     scores = policy.candidate_scores(cg, run);
     age_a = cg.turn_count - tr_a.produced_at_turn;
     age_b = cg.turn_count - tr_b.produced_at_turn;
-    assert (age_a, age_b) == (2, 0) , f"alpha is two items old (beta's call and result): {(age_a, age_b)}";
+    assert (age_a, age_b) == (2, 0) , f"alpha is two items old (beta's call and result): {(
+        age_a,
+        age_b
+    )}";
     assert abs(scores[tr_a.tr_id] - policy.base_score(2, 2.0, rel_a)) < 1e-12 , scores;
     assert abs(scores[tr_b.tr_id] - policy.base_score(0, 0.0, 0.0)) < 1e-12 , scores;
-    assert abs(scores[tr_a.tr_id] - (math.exp(-0.6) + (1.0 - math.exp(-0.4)) + rel_a)) < 1e-12;
+    assert abs(scores[tr_a.tr_id] - (math.exp(-0.6) + (1.0 - math.exp(-0.4)) + rel_a))
+        < 1e-12;
 }
 
 
@@ -286,13 +328,25 @@ test "base_score is decayed recency plus saturating reuse plus clipped relevance
 test "a citation credits only the earliest introducer, weighted 1/df, never a later result, never prose" {
     ctx = Context(budget_tokens=10000, persist=False);
     (cg, run) = wired(ctx);
-    tr_a = add_result(cg, run, "call_a", "CFG_TIMEOUT_MS=30000\nRETRY_LIMIT_X=5\nplain words only here");
-    tr_b = add_result(cg, run, "call_b", "CFG_TIMEOUT_MS=30000 seen again\nTimeout Timeout");
+    tr_a = add_result(
+        cg,
+        run,
+        "call_a",
+        "CFG_TIMEOUT_MS=30000\nRETRY_LIMIT_X=5\nplain words only here"
+    );
+    tr_b = add_result(
+        cg, run, "call_b", "CFG_TIMEOUT_MS=30000 seen again\nTimeout Timeout"
+    );
     citing = add_message(
-        cg, run, "assistant", "Set CFG_TIMEOUT_MS to 30000 and keep RETRY_LIMIT_X. Timeout handled."
+        cg,
+        run,
+        "assistant",
+        "Set CFG_TIMEOUT_MS to 30000 and keep RETRY_LIMIT_X. Timeout handled."
     );
     cite_turn = citing.turn;
-    tr_c = add_result(cg, run, "call_c", "CFG_TIMEOUT_MS=30000 RETRY_LIMIT_X=5 copied later");
+    tr_c = add_result(
+        cg, run, "call_c", "CFG_TIMEOUT_MS=30000 RETRY_LIMIT_X=5 copied later"
+    );
 
     scan_citations(cg);
 
@@ -306,14 +360,16 @@ test "a citation credits only the earliest introducer, weighted 1/df, never a la
     assert "call_c" not in cg.citation_counts , "a result produced after the citing turn is never credited";
     assert cg.citation_turns.get("call_a") == [cite_turn] , cg.citation_turns;
     assert "call_b" not in cg.citation_turns;
-    assert set(cg.citation_idents["call_a"]) == {"CFG_TIMEOUT_MS", "RETRY_LIMIT_X"} , cg.citation_idents["call_a"];
+    assert set(cg.citation_idents["call_a"]) == {"CFG_TIMEOUT_MS", "RETRY_LIMIT_X"} , cg.citation_idents[
+        "call_a"
+    ];
     assert cg.n_seen_asst == 4 , f"every assistant message is now behind the cursor: {cg.n_seen_asst}";
 
     # The reserved schema is written too: one ReferencedBy edge per (citing message, source),
     # reference_count per distinct citing turn, and a last_referenced_at stamp.
-    targets = [citing ->:ReferencedBy:->];
+    targets = [citing->:ReferencedBy:->];
     assert [t.call_id for t in targets] == ["call_a"] , f"one edge to the credited source: {targets}";
-    edges = [edge citing ->:ReferencedBy:->];
+    edges = [edge citing->:ReferencedBy:->];
     assert [e.cite_turn for e in edges] == [cite_turn];
     assert tr_a.reference_count == 1 == len(cg.citation_turns["call_a"]);
     assert tr_a.last_referenced_at > 0.0;
@@ -323,19 +379,23 @@ test "a citation credits only the earliest introducer, weighted 1/df, never a la
     scan_citations(cg);
     assert abs(cg.citation_counts["call_a"] - 1.5) < 1e-12 , "rescanning credits nothing twice";
     assert cg.citation_turns["call_a"] == [cite_turn];
-    assert len([edge citing ->:ReferencedBy:->]) == 1 and tr_a.reference_count == 1;
+    assert len([edge citing->:ReferencedBy:->]) == 1 and tr_a.reference_count == 1;
 
     # A tool call's arguments are scanned too, and a second citing turn is appended.
     add_result(cg, run, "call_d", blob("delta", 100), args={"key": "RETRY_LIMIT_X"});
-    d_call = [m for m in cg.messages() if m.role == "assistant"][-1];
+    d_call = [
+        m
+        for m in cg.messages()
+        if m.role == "assistant"
+    ][-1];
     scan_citations(cg);
     assert abs(cg.citation_counts["call_a"] - (1.5 + 0.5)) < 1e-12 , (
         f"RETRY_LIMIT_X now has two earlier sources (A and C), so A gets 1/2: {cg.citation_counts}"
     );
     assert cg.citation_turns["call_a"] == [cite_turn, d_call.turn] , cg.citation_turns;
     assert tr_a.reference_count == 2 == len(cg.citation_turns["call_a"]);
-    assert [t.call_id for t in [d_call ->:ReferencedBy:->]] == ["call_a"];
-    assert len([edge citing ->:ReferencedBy:->]) == 1 , "the earlier message's edge is not duplicated";
+    assert [t.call_id for t in [d_call->:ReferencedBy:->]] == ["call_a"];
+    assert len([edge citing->:ReferencedBy:->]) == 1 , "the earlier message's edge is not duplicated";
 }
 
 
@@ -356,17 +416,20 @@ test "a trimmed result whose identifiers the last tool call uses is pinned back 
 
         assert policy.should_prune(cg, run, MockLLM()) , f"{label}: 1000 tokens exceed 950";
         policy.prune(cg, run, MockLLM());
-        assert states(cg) == {
-            "call_a": "head_tail",
-            "call_x": "head_tail",
-            "call_c": "full",
-            "call_d": "full",
-            "call_e": "full"
-        } , f"{label}: first pass stubs the two old results: {states(cg)}";
+        assert states(cg)
+            == {
+                "call_a": "head_tail",
+                "call_x": "head_tail",
+                "call_c": "full",
+                "call_d": "full",
+                "call_e": "full"
+            } , f"{label}: first pass stubs the two old results: {states(cg)}";
         assert "alpha_row_0007" in by_call(cg)["call_a"].full_content;
 
         add_result(cg, run, "call_f", blob("eff", 400), args={"key": key});
-        assert active_call_ids(cg, 3) == want_active , f"{label}: {active_call_ids(cg, 3)}";
+        assert active_call_ids(cg, 3) == want_active , f"{label}: {active_call_ids(
+            cg, 3
+        )}";
         policy.prune(cg, run, MockLLM());
         assert states(cg)["call_a"] == want_state , f"{label}: {states(cg)}";
         assert states(cg)["call_x"] == "head_tail" , f"{label}: the other old result stays stubbed";
@@ -395,15 +458,27 @@ test "a trimmed result returns to full when a larger budget reselects it" {
     add_result(cg, run, "call_c", blob("cee", 2000));
     present = presence_of(run);
     assert visible_tool_tokens(cg, present) == 1500 , (
-        f"the duplicates' 2000 tokens are not counted: {visible_tool_tokens(cg, present)}"
+        f"the duplicates' 2000 tokens are not counted: {visible_tool_tokens(
+            cg, present
+        )}"
     );
     assert visible_tokens(cg) == 3500 , "though they are on the graph";
 
     assert policy.should_prune(cg, run, MockLLM());
     changed = policy.prune(cg, run, MockLLM());
     assert changed == 2 , f"two results changed rendering: {changed}";
-    assert states(cg) == {"call_dup": "full", "call_a": "head_tail", "call_b": "head_tail", "call_c": "full"} , states(cg);
-    dups = [tr for tr in cg.tool_results() if tr.call_id == "call_dup"];
+    assert states(cg)
+        == {
+            "call_dup": "full",
+            "call_a": "head_tail",
+            "call_b": "head_tail",
+            "call_c": "full"
+        } , states(cg);
+    dups = [
+        tr
+        for tr in cg.tool_results()
+        if tr.call_id == "call_dup"
+    ];
     assert [tr.truncation_state for tr in dups] == ["full", "full"] , "duplicates are never stubbed";
     assert [tr.visible_content == tr.full_content for tr in dups] == [True, True];
     assert visible_tool_tokens(cg, present) <= 900;
@@ -421,15 +496,25 @@ test "a trimmed result returns to full when a larger budget reselects it" {
     assert not policy.should_prune(cg, run2, MockLLM()) , "1500 tokens sit under 100000";
     changed = policy.prune(cg, run2, MockLLM());
     assert changed == 2;
-    assert states(cg) == {"call_dup": "full", "call_a": "full", "call_b": "full", "call_c": "full"} , states(cg);
+    assert states(cg)
+        == {"call_dup": "full", "call_a": "full", "call_b": "full", "call_c": "full"} , states(
+        cg
+    );
     for tr in cg.tool_results() {
         assert tr.visible_content == tr.full_content , f"{tr.call_id} is back at full fidelity";
     }
-    assert bigger.stats()["restores"] == 2 and bigger.stats()["budget_tokens"] == 100000 , bigger.stats();
+    assert bigger.stats()["restores"] == 2
+        and bigger.stats()["budget_tokens"] == 100000 , bigger.stats();
 
     # Shrink again: the same renderings come back (memo), nothing is destroyed.
     policy.prune(cg, run, MockLLM());
-    assert states(cg) == {"call_dup": "full", "call_a": "head_tail", "call_b": "head_tail", "call_c": "full"};
+    assert states(cg)
+        == {
+            "call_dup": "full",
+            "call_a": "head_tail",
+            "call_b": "head_tail",
+            "call_c": "full"
+        };
     assert small.stats()["hard_cleared"] == 0;
 }
 
@@ -474,7 +559,9 @@ test "a trimmed rendering is byte-identical across later passes and after a rest
     assert retrimmed == first , "memo: a restore then re-trim replays the first rendering";
     assert "yak_marker" not in retrimmed;
 
-    (ctrl_first, ctrl_second, ctrl_retrimmed) = scenario(ContextRender(memo_trim=False));
+    (ctrl_first, ctrl_second, ctrl_retrimmed) = scenario(
+        ContextRender(memo_trim=False)
+    );
     assert ctrl_second == ctrl_first , "sticky still holds without the memo";
     assert ctrl_retrimmed != ctrl_first , "without the memo the re-trim re-ranks against the new focus";
     assert "yak_marker" in ctrl_retrimmed and "zebra_marker" not in ctrl_retrimmed;
@@ -487,7 +574,9 @@ test "the MMR fill prefers a distinct old result over a near-duplicate of one al
         ("with the diversity penalty", 0.5, "call_p1"),
         ("without it, recency wins", 0.0, "call_q")
     ] {
-        policy = ContextRender(stub_overflow="clear", grace_turns=1, pin_recent=0, mmr_lambda=lam);
+        policy = ContextRender(
+            stub_overflow="clear", grace_turns=1, pin_recent=0, mmr_lambda=lam
+        );
         ctx = Context(policy=policy, budget_tokens=790, persist=False);
         (cg, run) = wired(ctx);
         p1 = blob("pdup", 800);
@@ -500,13 +589,20 @@ test "the MMR fill prefers a distinct old result over a near-duplicate of one al
 
         sim = lexical_set_cosine(cached_lextoks(p1), cached_lextoks(p2));
         assert sim > 0.9 , f"near-duplicates: {sim}";
-        assert lexical_set_cosine(cached_lextoks(p1), cached_lextoks(blob("quiet", 800))) == 0.0;
+        assert lexical_set_cosine(
+            cached_lextoks(p1), cached_lextoks(blob("quiet", 800))
+        )
+            == 0.0;
 
         policy.prune(cg, run, MockLLM());
         st = states(cg);
         assert st["call_n"] == "full" and st["call_p2"] == "full" , f"{label}: {st}";
         assert st[want_stubbed] == "head_tail" , f"{label}: {st}";
-        others = [k for k in ["call_q", "call_p1"] if k != want_stubbed];
+        others = [
+            k
+            for k in ["call_q", "call_p1"]
+            if k != want_stubbed
+        ];
         assert st[others[0]] == "full" , f"{label}: {st}";
         assert visible_tokens(cg) <= 790;
     }
@@ -570,7 +666,10 @@ test "a small result under pressure becomes an identifier-bearing restorable stu
     assert tr_s.truncation_state == "head_tail" and tr_s.full_content == small , "restorable";
     assert by_call(cg)["call_t"].truncation_state == "full";
     s = ctx.stats();
-    assert s["stubs"] == 1 and s["trims"] == 0 and s["clears"] == 0 and s["hard_cleared"] == 0 , s;
+    assert s["stubs"] == 1
+        and s["trims"] == 0
+        and s["clears"] == 0
+        and s["hard_cleared"] == 0 , s;
     assert visible_tokens(cg) <= 150;
 }
 
@@ -583,10 +682,34 @@ test "stub_overflow=clear escalates to a named hard clear only when the stubs al
     ];
     stubbable = [blob(f"r{i}", 600) for i in range(6)];
     for (label, overflow, budget, contents, want_named, want_stubbed, want_bare) in [
-        ("clear, tiny results, stubs would overflow", "clear", 60, tiny_results, 5, 0, 0),
+        (
+            "clear, tiny results, stubs would overflow",
+            "clear",
+            60,
+            tiny_results,
+            5,
+            0,
+            0
+        ),
         ("clear, tiny results, stubs fit", "clear", 300, tiny_results, 0, 0, 0),
-        ("keep, stub-able results, stubs fit the budget", "keep", 400, stubbable, 0, 5, 0),
-        ("keep, stub-able results, stubs overflow the budget", "keep", 240, stubbable, 0, 0, 5)
+        (
+            "keep, stub-able results, stubs fit the budget",
+            "keep",
+            400,
+            stubbable,
+            0,
+            5,
+            0
+        ),
+        (
+            "keep, stub-able results, stubs overflow the budget",
+            "keep",
+            240,
+            stubbable,
+            0,
+            0,
+            5
+        )
     ] {
         policy = ContextRender(stub_overflow=overflow);
         ctx = Context(policy=policy, budget_tokens=budget, persist=False);
@@ -607,14 +730,20 @@ test "stub_overflow=clear escalates to a named hard clear only when the stubs al
             if text == HARD_CLEAR_PLACEHOLDER {
                 bare.append(k);
             } else {
-                assert text.startswith("[evicted from context: fetch(") and "Re-run this call" in text , (
+                assert text.startswith("[evicted from context: fetch(")
+                    and "Re-run this call" in text , (
                     f"{label}: an escalated result names its call: {text}"
                 );
                 named.append(k);
             }
         }
-        stubbed = [k for k in st if st[k] == "head_tail"];
-        assert (len(named), len(stubbed), len(bare)) == (want_named, want_stubbed, want_bare) , (
+        stubbed = [
+            k
+            for k in st
+            if st[k] == "head_tail"
+        ];
+        assert (len(named), len(stubbed), len(bare))
+            == (want_named, want_stubbed, want_bare) , (
             f"{label}: named {named}, stubbed {stubbed}, bare {bare}"
         );
         assert st["call_5"] == "full" , f"{label}: the newest is never cleared: {st}";
@@ -641,9 +770,8 @@ test "with embed_model relevance comes from litellm embeddings; a failure falls 
         tr_a = add_result(cg, run, "call_a", blob("alpha", 300));
         tr_b = add_result(cg, run, "call_b", blob("beta", 300));
         lexical = ContextRender().candidate_scores(cg, run);
-        assert abs(lexical[tr_a.tr_id] - ContextRender().base_score(2, 0.0, 0.0)) < 1e-12 , (
-            "lexically neither result overlaps the task"
-        );
+        assert abs(lexical[tr_a.tr_id] - ContextRender().base_score(2, 0.0, 0.0))
+            < 1e-12 , ("lexically neither result overlaps the task");
 
         seen_inputs: list[str] = [];
         def fake_embedding(model: str, input: str, timeout: float) -> dict[str, any] {
@@ -666,13 +794,17 @@ test "with embed_model relevance comes from litellm embeddings; a failure falls 
             f"beta is orthogonal: relevance 0: {scores}"
         );
 
-        with mock.patch.object(litellm, "embedding", side_effect=fake_embedding) as again {
+        with mock.patch.object(
+            litellm, "embedding", side_effect=fake_embedding
+        ) as again {
             policy.candidate_scores(cg, run);
         }
         assert again.call_count == 0 , "embeddings are cached by content";
 
         EMBED_CACHE.clear();
-        with mock.patch.object(litellm, "embedding", side_effect=RuntimeError("no key")) as broken {
+        with mock.patch.object(
+            litellm, "embedding", side_effect=RuntimeError("no key")
+        ) as broken {
             fallback = policy.candidate_scores(cg, run);
             assert broken.call_count == 2 , f"one retry, then give up: {broken.call_count}";
             assert EMBED_STATE.get("disabled") , "disabled for the rest of the process";
@@ -778,17 +910,27 @@ test "a second call on a persisted Context budgets, trims and anchors on its own
     assert len(llm_two.seen) == 3;
     for n in range(3) {
         sent = sent_messages(llm_two, n);
-        assert not has_tool_message(sent, "call_a") and not has_tool_message(sent, "call_b") , (
+        assert not has_tool_message(sent, "call_a")
+            and not has_tool_message(sent, "call_b") , (
             f"call {n}: the first call's results never reach the model"
         );
     }
     last = sent_messages(llm_two, 2);
     assert TRIM_MARKER in tool_text(last, "call_c") , "gamma (150 tokens) is stubbed under the 150 budget";
     assert tool_text(last, "call_d") == blob("delta", 300) , "delta, the newest, is full";
-    assert states(cg) == {"call_a": "full", "call_b": "full", "call_c": "head_tail", "call_d": "full"} , states(cg);
+    assert states(cg)
+        == {
+            "call_a": "full",
+            "call_b": "full",
+            "call_c": "head_tail",
+            "call_d": "full"
+        } , states(cg);
     assert by_call(cg)["call_a"].visible_content == blob("alpha", 8000) , "alpha was never rewritten";
     s = ctx.stats();
-    assert s["budget_tokens"] == 150 and s["stubs"] == 1 and s["trims"] == 0 and s["clears"] == 0 , s;
+    assert s["budget_tokens"] == 150
+        and s["stubs"] == 1
+        and s["trims"] == 0
+        and s["clears"] == 0 , s;
     assert s["full"] == 3 and s["trimmed"] == 1 and s["hard_cleared"] == 0 , s;
     assert s["visible_tokens"] > 4000 , "stats() still reports the whole graph";
 
@@ -799,7 +941,9 @@ test "a second call on a persisted Context budgets, trims and anchors on its own
     (_, run) = wired(third, task="third task: find epsilon");
     add_result(cg, run, "call_e", blob("epsilon", 400));
     present = presence_of(run);
-    assert focus_texts(cg, present)["anchor"] == "third task: find epsilon" , focus_texts(cg, present);
+    assert focus_texts(cg, present)["anchor"] == "third task: find epsilon" , focus_texts(
+        cg, present
+    );
     assert visible_tool_tokens(cg, present) == 100 , visible_tool_tokens(cg, present);
     assert not policy.should_prune(cg, run, MockLLM()) , "100 tokens do not exceed 100";
     unrestricted = presence_of(object());
@@ -811,12 +955,24 @@ test "a second call on a persisted Context budgets, trims and anchors on its own
 
 # 18. Typed compaction through the threshold path.
 test "compaction fires through the threshold, folds older turns into typed slots and keeps the prefix" {
-    slots = CompactionSlots(files_read=["config/prod.yaml"], key_observations=[VALUE_LINE]);
+    slots = CompactionSlots(
+        files_read=["config/prod.yaml"], key_observations=[VALUE_LINE]
+    );
     llm = MockLLM(
         ctx_window=1000,
         outputs=[
-            call("fetch", {"key": "alpha", "chars": 200}, call_id="call_a", usage={"prompt_tokens": 100}),
-            call("fetch", {"key": "beta", "chars": 200}, call_id="call_b", usage={"prompt_tokens": 850}),
+            call(
+                "fetch",
+                {"key": "alpha", "chars": 200},
+                call_id="call_a",
+                usage={"prompt_tokens": 100}
+            ),
+            call(
+                "fetch",
+                {"key": "beta", "chars": 200},
+                call_id="call_b",
+                usage={"prompt_tokens": 850}
+            ),
             slots,
             finish("ok")
         ]
@@ -828,7 +984,9 @@ test "compaction fires through the threshold, folds older turns into typed slots
     );
 
     assert agent("find the keepalive") == "ok";
-    assert len(llm.seen) == 4 , f"two tool rounds, the extractor, the finish: {len(llm.seen)}";
+    assert len(llm.seen) == 4 , f"two tool rounds, the extractor, the finish: {len(
+        llm.seen
+    )}";
     assert llm.exhausted();
 
     assert roles(llm, 2) == ["system", "user"] , "the extractor call carries the instructions and the JSON";
@@ -843,12 +1001,15 @@ test "compaction fires through the threshold, folds older turns into typed slots
 
     first = sent_messages(llm, 0);
     after = sent_messages(llm, 3);
-    assert [m["role"] for m in after] == ["system", "user", "user", "assistant", "tool"] , (
+    assert [m["role"] for m in after]
+        == ["system", "user", "user", "assistant", "tool"] , (
         f"system, task, summary, then the kept round: {[m['role'] for m in after]}"
     );
     assert after[0] == first[0] and after[1] == first[1] , "the system and task messages are still first";
     summary = str(after[2]["content"]);
-    assert summary.startswith(COMPACTION_TAG + "\n[Typed compaction summary]") , summary;
+    assert summary.startswith(
+        COMPACTION_TAG + "\n[Typed compaction summary]"
+    ) , summary;
     assert VALUE_LINE in summary and "Files read: config/prod.yaml" in summary , "values are preserved verbatim";
     assert not has_tool_message(after, "call_a") , "the folded tool result is gone";
     assert tool_text(after, "call_b") == blob("beta", 200);
@@ -861,10 +1022,18 @@ test "compaction fires through the threshold, folds older turns into typed slots
     assert s["hidden_messages"] == 1 and s["hidden_tool_results"] == 1 , s;
     summ = cg.summaries()[0];
     assert (summ.covers_turn_start, summ.covers_turn_end) == (3, 4) , (
-        f"the call at turn 3 and its result at turn 4: {(summ.covers_turn_start, summ.covers_turn_end)}"
+        f"the call at turn 3 and its result at turn 4: {(
+            summ.covers_turn_start,
+            summ.covers_turn_end
+        )}"
     );
     assert summ.dropped_message_count == 1 and summ.dropped_tool_result_count == 1;
-    assert [m.role for m in cg.messages() if not m.visible] == ["assistant"];
+    assert [
+        m.role
+        for m in cg.messages()
+        if not m.visible
+    ]
+        == ["assistant"];
     assert cg.messages()[0].visible and cg.messages()[1].visible , "system and first user are never hidden";
 }
 
@@ -885,15 +1054,22 @@ test "a ContextWindowExceededError routes the emergency compaction to the policy
     );
     ctx = Context(budget_tokens=100000, persist=False);
 
-    def agent(task: str) -> str by llm(tools=[fetch], context=ctx, keep_recent_iterations=0);
+    def agent(task: str) -> str by llm(
+        tools=[fetch], context=ctx, keep_recent_iterations=0
+    );
 
     assert agent("find the keepalive") == "ok";
-    assert len(llm.seen) == 4 , f"round one, the failed call, the extractor, the retry: {len(llm.seen)}";
+    assert len(llm.seen) == 4 , f"round one, the failed call, the extractor, the retry: {len(
+        llm.seen
+    )}";
     assert roles(llm, 2) == ["system", "user"];
     assert json.dumps(blob("alpha", 200)) in str(sent_messages(llm, 2)[1]["content"]);
     retry = sent_messages(llm, 3);
-    assert [m["role"] for m in retry] == ["system", "user", "user"] , [m["role"] for m in retry];
-    assert str(retry[2]["content"]).startswith(COMPACTION_TAG) and VALUE_LINE in str(retry[2]["content"]);
+    assert [m["role"] for m in retry] == ["system", "user", "user"] , [
+        m["role"] for m in retry
+    ];
+    assert str(retry[2]["content"]).startswith(COMPACTION_TAG)
+        and VALUE_LINE in str(retry[2]["content"]);
     assert not has_tool_message(retry, "call_a");
     assert ctx.stats()["compactions"] == 1 and ctx.stats()["hidden_tool_results"] == 1;
 }
@@ -904,8 +1080,18 @@ test "an on_compaction hook still wins over the policy when both are set" {
     llm = MockLLM(
         ctx_window=1000,
         outputs=[
-            call("fetch", {"key": "alpha", "chars": 200}, call_id="call_a", usage={"prompt_tokens": 100}),
-            call("fetch", {"key": "beta", "chars": 200}, call_id="call_b", usage={"prompt_tokens": 850}),
+            call(
+                "fetch",
+                {"key": "alpha", "chars": 200},
+                call_id="call_a",
+                usage={"prompt_tokens": 100}
+            ),
+            call(
+                "fetch",
+                {"key": "beta", "chars": 200},
+                call_id="call_b",
+                usage={"prompt_tokens": 850}
+            ),
             finish("ok")
         ]
     );
@@ -925,7 +1111,94 @@ test "an on_compaction hook still wins over the policy when both are set" {
     assert len(llm.seen) == 3 , f"no extractor call was made: {len(llm.seen)}";
     assert llm.exhausted();
     s = ctx.stats();
-    assert s["compactions"] == 0 and s["summaries"] == 0 and s["hidden_messages"] == 0 , s;
+    assert s["compactions"] == 0
+        and s["summaries"] == 0
+        and s["hidden_messages"] == 0 , s;
     assert [m["role"] for m in sent_messages(llm, 2)][:2] == ["system", "user"];
     assert COMPACTION_TAG not in str(sent_messages(llm, 2));
+}
+
+
+# 21. A compaction that cannot finish changes nothing.
+test "a failed extraction or an empty span raises and leaves the graph as it was" {
+    policy = ContextRender();
+    ctx = Context(policy=policy, budget_tokens=100000, persist=False);
+    (cg, run) = wired(ctx, task="find the keepalive");
+    add_result(cg, run, "call_a", blob("alpha", 200));
+    add_result(cg, run, "call_b", blob("beta", 200));
+    add_result(cg, run, "call_c", blob("gamma", 200));
+
+    good = MockLLM(outputs=[CompactionSlots(key_observations=[VALUE_LINE])]);
+    assert policy.compact(cg, run, good, 2) , "the first round folds";
+    before = ctx.stats();
+    assert before["compactions"] == 1 and before["hidden_tool_results"] == 1 , before;
+    kept = [
+        s.summary_text
+        for s in cg.summaries()
+        if s.visible
+    ];
+    assert len(kept) == 1 and VALUE_LINE in kept[0];
+
+    broken = MockLLM(outputs=[fail(RuntimeError("extractor down"))]);
+    raised = "";
+    try {
+        policy.compact(cg, run, broken, 1);
+    } except RuntimeError as e {
+        raised = str(e);
+    }
+    assert raised == "extractor down" , f"the error reaches the caller: {raised!r}";
+    assert broken.exhausted();
+    assert ctx.stats() == before , f"nothing was hidden or counted: {ctx.stats()}";
+    assert [
+        s.summary_text
+        for s in cg.summaries()
+        if s.visible
+    ]
+        == kept , ("the earlier summary is still the visible one");
+    assert VALUE_LINE in str(policy.materialize(cg, run));
+
+    # Fewer assistant rounds than keep_recent: nothing to fold, and no model call.
+    idle = MockLLM(outputs=[]);
+    declined = False;
+    try {
+        policy.compact(cg, run, idle, 5);
+    } except CompactionNotEffectiveError as e {
+        declined = "nothing to fold" in str(e);
+    }
+    assert declined and len(idle.seen) == 0;
+    assert ctx.stats() == before;
+}
+
+
+# 22. What the extractor reads.
+test "the extractor reads full results while they fit its window, and the trimmed view past that" {
+    def folded_body(window: int) -> tuple[str, ContextToolResult] {
+        policy = ContextRender();
+        ctx = Context(policy=policy, budget_tokens=100000, persist=False);
+        (cg, run) = wired(ctx, task="find the keepalive");
+        tr = add_result(cg, run, "call_a", blob("alpha", 8000));
+        add_result(cg, run, "call_b", blob("beta", 200));
+        apply_eviction_decision(
+            EvictionDecision(
+                tool_result=tr, kind="soft_trim", head_chars=100, tail_chars=100
+            )
+        );
+        llm = MockLLM(ctx_window=window, outputs=[CompactionSlots()]);
+        assert policy.compact(cg, run, llm, 1);
+        return (str(sent_messages(llm, 0)[1]["content"]), tr);
+    }
+
+    # 8000 chars are 2000 estimated tokens: half of a 100000 window holds them.
+    (roomy, tr_full) = folded_body(100000);
+    assert json.dumps(blob("alpha", 8000)) in roomy , "the full text is read when it fits";
+
+    # Half of a 1000 window does not, so the extractor gets what the model was seeing.
+    (tight, tr_view) = folded_body(1000);
+    assert tr_view.visible_content != tr_view.full_content
+        and len(tr_view.visible_content) < 300;
+    assert json.dumps(tr_view.visible_content) in tight , tight[:300];
+    assert json.dumps(blob("alpha", 8000)) not in tight and len(tight) < 2000 , len(
+        tight
+    );
+    assert tr_full.full_content == blob("alpha", 8000) , "the stored result is never shortened";
 }

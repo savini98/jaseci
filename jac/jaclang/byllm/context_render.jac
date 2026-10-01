@@ -29,10 +29,15 @@ import from jaclang.byllm.context {
     tool_call_id_of,
     unit
 }
-import from jaclang.byllm.typed_compaction { compaction_summary_text }
+import from jaclang.byllm.exceptions { CompactionNotEffectiveError }
+import from jaclang.byllm.typed_compaction {
+    extract_compaction_slots,
+    render_compaction_slots
+}
 
 glob TRIM_MARKER: str = "...[relevance-trimmed]...",
      HARD_CLEAR_PLACEHOLDER: str = "[tool result evicted by context policy - re-run the tool if needed]",
+     NOTHING_TO_FOLD: str = "ContextRender compaction found nothing to fold - increase ctx_window, lower keep_recent_iterations, or switch to a model with a larger context window.",
      EMBED_TIMEOUT: float = 60.0,
      EMBED_CACHE: dict[str, list[float]] = {},
      EMBED_STATE: dict[str, bool] = {};
@@ -87,7 +92,8 @@ obj ContextRender(ContextPolicy) {
         append_restore: bool = False,
         score_content_cap: int = 20000,
         embed_chars: int = 8000,
-        compact_keep_first_user: bool = True;
+        compact_keep_first_user: bool = True,
+        compact_full_ratio: float = 0.5;
 
     override def should_prune(cg: ContextGraph, mt_run: object, model: object) -> bool;
     override def prune(cg: ContextGraph, mt_run: object, model: object) -> int;

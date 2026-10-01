@@ -1473,7 +1473,7 @@ The canonical message list (`mt_run.messages`, and any `conversation=` list) is 
 - Turns that a compaction folded away are replaced by one summary message tagged `[Compacted context summary]`.
 - The system message and the first user message are always sent as they are.
 
-Tool call ids stay paired with their results, so the provider sees a valid conversation. A result whose tool call id is empty or not unique cannot be paired, so it is recorded but never trimmed or counted. With `persist=True`, results from an earlier call that are not in the current message list are likewise left out of the budget.
+Tool call ids stay paired with their results, so the provider sees a valid conversation: when a compaction hides an assistant message, the results of its tool calls go with it. Tool results that arrive as `conversation=` history are recorded and managed like the ones produced in the call. A result whose tool call id is empty or not unique cannot be paired, so it is recorded but never trimmed or counted. With `persist=True`, results from an earlier call that are not in the current message list are likewise left out of the budget.
 
 ### How results are scored
 
@@ -1502,6 +1502,10 @@ Renderings are stable on purpose. Once a result has been trimmed, later passes r
 ### Typed-slot compaction
 
 When the history still grows past the auto-compaction threshold (see [Auto-Compaction](#auto-compaction)), a wired `Context` replaces the plain summary with a typed extraction. The model fills a `CompactionSlots` object with `files_read`, `key_observations`, `commands_run`, `decisions` and `unresolved_questions`, and is instructed to copy numeric values, configuration keys, paths and identifiers verbatim. The rendered slots become the summary, the covered turns are hidden from the view, and the previous summary is merged into the new one. An `on_compaction` hook, when set, still takes precedence.
+
+The extraction reads the full text of the folded tool results while that fits `compact_full_ratio` of the extracting model's context window. Past that it reads their trimmed view, which is what the agent was seeing. Nothing is hidden until the extraction succeeds: if that call fails, the error is raised and the view, including any earlier summary, stays as it was. When there is nothing left to fold, `ContextRender` raises `CompactionNotEffectiveError`.
+
+A custom `ContextPolicy` chooses whether it compacts. If its `compact` returns `False` (the default), byLLM runs the built-in summary from [Auto-Compaction](#auto-compaction) instead.
 
 ### `ContextRender` settings
 
@@ -1535,6 +1539,7 @@ All settings are `has` fields of `ContextRender`, so `Context(policy=ContextRend
 | `score_content_cap` | `20000` | Characters of a result used for identifier and lexical scoring. |
 | `embed_chars` | `8000` | Characters of a result sent to the embedding model. |
 | `compact_keep_first_user` | `True` | Typed-slot compaction never hides the first user message. |
+| `compact_full_ratio` | `0.5` | Typed-slot compaction reads full tool results while they fit this fraction of the extracting model's context window, and their trimmed view past it. |
 
 ### Inspecting the graph
 

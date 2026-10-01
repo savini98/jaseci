@@ -1,5 +1,5 @@
 """Typed-slot compaction at the unit level: rendering, the extractor call as the
-model sees it, coercion of each reply shape, fail-soft, and usage bookkeeping.
+model sees it, coercion of each reply shape, error propagation, and usage bookkeeping.
 
 The end-to-end path through the ReAct loop (compaction firing under a wired
 Context) is covered by test_context_render.jac, not here.
@@ -9,27 +9,24 @@ import json;
 import from jaclang.byllm.lib { MockLLM, MockRawResponse }
 import from jaclang.byllm.typed_compaction {
     COMPACTION_EXTRACT_INSTRUCTIONS,
-    COMPACTION_FAILED_PREFIX,
     CompactionSlots,
     coerce_compaction_slots,
-    compaction_summary_text,
     extract_compaction_slots,
     render_compaction_slots
 }
-import from support { capture_loguru, fail, mk_run, roles, sent_messages }
+import from support { fail, mk_run, roles, sent_messages }
 
 
-glob VALUE_LINE = "keepalive_seconds = 47 (config/prod.yaml)";
-
-glob ITEMS: list[dict[str, any]] = [
-    {"turn": 1, "role": "user", "content": "Find the keepalive setting."},
-    {
-        "turn": 2,
-        "role": "tool:read_file",
-        "content": "server:\n  keepalive_seconds: 47\n  port: 8080"
-    },
-    {"turn": 3, "role": "assistant", "content": "The keepalive is 47 seconds."}
-];
+glob VALUE_LINE = "keepalive_seconds = 47 (config/prod.yaml)",
+     ITEMS: list[dict[str, any]] = [
+         {"turn": 1, "role": "user", "content": "Find the keepalive setting."},
+         {
+             "turn": 2,
+             "role": "tool:read_file",
+             "content": "server:\n  keepalive_seconds: 47\n  port: 8080"
+         },
+         {"turn": 3, "role": "assistant", "content": "The keepalive is 47 seconds."}
+     ];
 
 
 test "render_compaction_slots lays out headers, indents entries, omits empty slots" {
@@ -73,9 +70,10 @@ test "render_compaction_slots lays out headers, indents entries, omits empty slo
     rendered = render_compaction_slots(full);
     for absent in ["Unresolved:", "Decisions:", "Commands run:", "Files read:"] {
         assert absent in rendered , f"{absent} must be in the full rendering";
-        assert absent not in render_compaction_slots(
-            CompactionSlots(key_observations=[VALUE_LINE])
-        ) , f"{absent} must be omitted when its slot is empty";
+        assert absent
+            not in render_compaction_slots(
+                CompactionSlots(key_observations=[VALUE_LINE])
+            ) , f"{absent} must be omitted when its slot is empty";
     }
 }
 
@@ -111,13 +109,14 @@ test "extract_compaction_slots sends the instructions and the items JSON, and re
     assert isinstance(rf, dict) , "a typed call must request a schema";
     # An object return type is sent as its own schema, unwrapped (schema.impl.jac _wrap_to_object).
     wrapper = rf["json_schema"]["schema"];
-    assert set(wrapper["properties"].keys()) == {
-        "files_read",
-        "key_observations",
-        "commands_run",
-        "decisions",
-        "unresolved_questions"
-    } , f"got {list(wrapper['properties'].keys())}";
+    assert set(wrapper["properties"].keys())
+        == {
+            "files_read",
+            "key_observations",
+            "commands_run",
+            "decisions",
+            "unresolved_questions"
+        } , f"got {list(wrapper['properties'].keys())}";
     assert llm.sent("tools")[0] in (None, []) , "the extractor offers no tools";
 }
 
@@ -131,7 +130,9 @@ test "every reply shape the extractor can see becomes CompactionSlots with the v
     ] {
         llm = MockLLM(outputs=[reply]);
         slots = extract_compaction_slots(llm, "", ITEMS);
-        assert isinstance(slots, CompactionSlots) , f"{label}: got {type(slots).__name__}";
+        assert isinstance(slots, CompactionSlots) , f"{label}: got {type(
+            slots
+        ).__name__}";
         assert slots.key_observations == [VALUE_LINE] , f"{label}: got {slots.key_observations}";
         assert slots.files_read == [] , f"{label}: defaults must hold";
         assert llm.exhausted() , label;
@@ -177,33 +178,22 @@ test "every reply shape the extractor can see becomes CompactionSlots with the v
 }
 
 
-test "compaction_summary_text fails soft into a placeholder and logs the reason" {
+test "a failed extraction raises to the caller, which decides what to hide" {
     llm = MockLLM(outputs=[fail(RuntimeError("boom"))]);
-    text = "";
-    with capture_loguru() as logs {
-        text = compaction_summary_text(llm, "", ITEMS);
-    }
-    assert text.startswith(COMPACTION_FAILED_PREFIX) , f"got {text!r}";
-    assert "RuntimeError" in text and "boom" in text , f"got {text!r}";
-    assert text.endswith("]") , f"got {text!r}";
-    assert chr(8212) not in text , "no em-dash in the placeholder";
-    assert "RuntimeError" in logs.text() and "boom" in logs.text() , (
-        f"the failure must be logged, got {logs.text()!r}"
-    );
-    assert llm.exhausted();
-
-    # The extractor itself does not swallow the error.
     raised = "";
     try {
-        extract_compaction_slots(MockLLM(outputs=[fail(RuntimeError("boom"))]), "", ITEMS);
+        extract_compaction_slots(llm, "", ITEMS);
     } except RuntimeError as e {
         raised = str(e);
     }
     assert raised == "boom" , f"got {raised!r}";
+    assert llm.exhausted();
 
-    # And a healthy call renders the slots.
-    ok = compaction_summary_text(
-        MockLLM(outputs=[CompactionSlots(key_observations=[VALUE_LINE])]), "", ITEMS
+    # A healthy call renders the slots.
+    ok = render_compaction_slots(
+        extract_compaction_slots(
+            MockLLM(outputs=[CompactionSlots(key_observations=[VALUE_LINE])]), "", ITEMS
+        )
     );
     assert ok == f"[Typed compaction summary]\nKey observations:\n  - {VALUE_LINE}" , (
         f"got {ok!r}"
@@ -227,11 +217,13 @@ test "the nested call's usage lands on the parent run's history" {
 
     # A second extraction appends; the first record stays.
     llm2 = MockLLM(outputs=[(CompactionSlots(), {"prompt_tokens": 5})]);
-    compaction_summary_text(llm2, "", ITEMS, parent_mt_run=parent);
+    extract_compaction_slots(llm2, "", ITEMS, parent_mt_run=parent);
     assert len(parent._usage_history) == 2 , f"got {parent._usage_history}";
     assert parent._usage_history[1]["prompt_tokens"] == 5;
 
     # Without a parent the call still works.
-    no_parent = extract_compaction_slots(MockLLM(outputs=[CompactionSlots()]), "", ITEMS);
+    no_parent = extract_compaction_slots(
+        MockLLM(outputs=[CompactionSlots()]), "", ITEMS
+    );
     assert no_parent.key_observations == [];
 }
