@@ -5,6 +5,7 @@ the attached ContextPolicy, before each model call, for the view the model sees.
 These tests cover the recording and the overlay; the scoring policy has its own file.
 """
 
+import json;
 import from jaclang.byllm.lib { MockLLM }
 import from jaclang.byllm.context {
     COMPACTION_TAG,
@@ -14,8 +15,13 @@ import from jaclang.byllm.context {
     ContextPolicy,
     EvictionDecision,
     FOLDED_RESULT_NOTE,
+    IDENT_CACHE,
     SOFT_TRIM_MARKER,
+    TEXT_CACHE_MAX,
     apply_eviction_decision,
+    cache_get,
+    cache_put,
+    cached_idents,
     estimate_tokens,
     managed_tool_results,
     materialize_overlay,
@@ -23,7 +29,7 @@ import from jaclang.byllm.context {
     message_text,
     tool_call_id_of
 }
-import from jaclang.byllm.types { Message, MessageRole, Text, ToolCallResultMsg }
+import from jaclang.byllm.types { Image, Message, MessageRole, Text, ToolCallResultMsg }
 import from support {
     call,
     finish,
@@ -43,6 +49,12 @@ glob ROWS: str = "\n".join(
 """A tool whose result is long enough that a head/tail trim visibly shortens it."""
 def lookup(key: str) -> str {
     return f"{key}:\n{ROWS}";
+}
+
+
+"""A tool whose result is a long caption and an image."""
+def snapshot(name: str) -> list[any] {
+    return [Text(text=f"{name}:\n{ROWS}"), Image(url="https://example.com/chart.png")];
 }
 
 
@@ -939,4 +951,81 @@ test "a policy that does not compact leaves auto-compaction to the built-in summ
     ]
         == ["call_b"];
     assert ctx.stats()["compactions"] == 0 , "the policy itself folded nothing";
+}
+
+
+test "a tool result that is not plain text is recorded but never rewritten" {
+    llm = MockLLM(
+        outputs=[
+            call("snapshot", {"name": "chart"}, call_id="call_img"),
+            call("lookup", {"key": "alpha"}, call_id="call_a"),
+            finish("done")
+        ]
+    );
+    ctx = Context(policy=TrimPolicy(), persist=False);
+
+    def agent(task: str) -> str by llm(tools=[snapshot, lookup], context=ctx);
+
+    assert agent("look at the chart, then find alpha") == "done";
+    cg = ctx.graph;
+    assert cg is not None;
+    by_id = {tr.call_id: tr for tr in cg.tool_results()};
+    assert by_id["call_img"].media and not by_id["call_a"].media;
+    assert by_id["call_img"].full_content == f"chart:\n{ROWS}\n[media]" , (
+        "the graph keeps the caption and a marker, never the image bytes"
+    );
+    assert [tr.call_id for tr in managed_tool_results(cg)] == ["call_a"] , (
+        "an image result is not trimmed or counted"
+    );
+
+    last = sent_messages(llm, 2);
+    wire = json.dumps(last, `default=str);
+    assert "https://example.com/chart.png" in wire , "the image still reaches the model";
+    assert json.dumps(ROWS)[1:-1] in wire
+        and "[soft-trimmed]"
+            not in json.dumps(tool_message(last, "call_img"), `default=str) , (
+        "its caption is sent whole even though the policy trims every long text result"
+    );
+    assert SOFT_TRIM_MARKER in tool_message(last, "call_a")["content"];
+}
+
+
+test "a Context keeps its graph to itself: nothing is attached to root" {
+    before = len([root-->]);
+    llm = MockLLM(outputs=[say("one"), say("two"), say("three")]);
+
+    def inline(q: str) -> str by llm(context=Context());
+
+    inline("first");
+    inline("second");
+    kept = Context(persist=True);
+
+    def reused(q: str) -> str by llm(context=kept);
+
+    reused("third");
+    assert kept.graph is not None and len(kept.graph.messages()) == 3;
+    assert len([root-->]) == before , "no call left a graph under root";
+    kept.reset();
+    assert kept.graph is None and kept.stats()["messages"] == 0;
+}
+
+
+test "the scoring caches are bounded and drop the least recently used entry" {
+    cache: dict[str, int] = {};
+    for (i, key) in enumerate(["a", "b", "c"]) {
+        cache_put(cache, key, i, 3);
+    }
+    assert cache_get(cache, "a") == 0 , "a hit also marks the entry as used";
+    cache_put(cache, "d", 3, 3);
+    assert list(cache.keys()) == ["c", "a", "d"] , f"b was the least recently used: {cache}";
+    assert cache_get(cache, "b") is None;
+    cache_put(cache, "c", 9, 3);
+    assert cache == {"a": 0, "d": 3, "c": 9} , "an update does not evict";
+
+    IDENT_CACHE.clear();
+    for i in range(50) {
+        cached_idents(f"result_{i} mentions order_id_{i}");
+    }
+    assert len(IDENT_CACHE) == 50 and TEXT_CACHE_MAX >= 50;
+    assert cached_idents("result_7 mentions order_id_7") == {"result_7", "order_id_7"};
 }

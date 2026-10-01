@@ -97,8 +97,14 @@ impl bump_stat(cg: ContextGraph, key: str, n: int = 1) {
     cg.stats[key] = int(cg.stats.get(key, 0) or 0) + n;
 }
 
-impl scan_citations(cg: ContextGraph, cap: int = 20000) {
-    trs = managed_tool_results(cg);
+impl scan_citations(
+    cg: ContextGraph, cap: int = 20000, present: Presence | None = None
+) {
+    trs = [
+        tr
+        for tr in managed_tool_results(cg)
+        if present is None or present.has_result(tr)
+    ];
     asst = [
         m
         for m in cg.messages()
@@ -300,40 +306,58 @@ impl stub_reserve(n_candidates: int, budget: int, stub_chars: int) -> int {
     return max(budget // 4, budget - reserve);
 }
 
-def _call_embedding(model_name: str, text: str) -> list[float] {
-    raw: any = litellm.embedding(model=model_name, input=text, timeout=EMBED_TIMEOUT);
+def _call_embedding(
+    model_name: str, text: str, api_key: str, api_base: str
+) -> list[float] {
+    extra: dict[str, any] = {};
+    if api_key {
+        extra["api_key"] = api_key;
+    }
+    if api_base {
+        extra["api_base"] = api_base;
+    }
+    raw: any = litellm.embedding(
+        model=model_name, input=text, timeout=EMBED_TIMEOUT, **extra
+    );
     data: any = raw["data"];
     first: any = data[0];
     emb: any = first["embedding"];
     return [float(v) for v in emb];
 }
 
-impl embed_text(model_name: str, text: str, clip: int) -> list[float] {
+impl embed_text(
+    model_name: str, text: str, clip: int, api_key: str = "", api_base: str = ""
+) -> list[float] {
     clipped = text[:clip];
+    if not clipped.strip() {
+        return [];
+    }
     key = model_name + ":" + hashlib.sha1(clipped.encode("utf-8")).hexdigest();
-    cached = EMBED_CACHE.get(key);
+    cached = cache_get(EMBED_CACHE, key);
     if cached is not None {
         return cached;
     }
+    if time.time() < EMBED_STATE.get(model_name, 0.0) {
+        return [];
+    }
     vec: list[float] = [];
-    if not EMBED_STATE.get("disabled") {
+    try {
+        vec = _call_embedding(model_name, clipped, api_key, api_base);
+    } except Exception as e {
         try {
-            vec = _call_embedding(model_name, clipped);
-        } except Exception as e {
-            try {
-                vec = _call_embedding(model_name, clipped);
-            } except Exception {
-                logger.warning(
-                    "byLLM ContextRender: embedding call failed twice "
-                    f"({type(e).__name__}: {str(e)[:120]}); relevance is lexical "
-                    "for the rest of this process"
-                );
-                EMBED_STATE["disabled"] = True;
-                vec = [];
-            }
+            vec = _call_embedding(model_name, clipped, api_key, api_base);
+        } except Exception {
+            logger.warning(
+                "byLLM ContextRender: embedding call failed twice "
+                f"({type(e).__name__}: {str(e)[:120]}); relevance is lexical "
+                f"for the next {int(EMBED_COOLDOWN)} seconds"
+            );
+            EMBED_STATE[model_name] = time.time() + EMBED_COOLDOWN;
+            return [];
         }
     }
-    EMBED_CACHE[key] = vec;
+    EMBED_STATE.pop(model_name, None);
+    cache_put(EMBED_CACHE, key, vec, EMBED_CACHE_MAX);
     return vec;
 }
 
@@ -378,7 +402,10 @@ impl ContextRender._resolve_budget(
         if cfg_budget > 0 {
             budget = cfg_budget;
         } else {
-            ratio = float(ctx.budget_ratio) if ctx is not None else cfg_ratio;
+            ratio = cfg_ratio;
+            if ctx is not None and ctx.budget_ratio > 0.0 {
+                ratio = float(ctx.budget_ratio);
+            }
             window = 0;
             window_fn: any = model?._get_ctx_window;
             if callable(window_fn) {
@@ -418,7 +445,9 @@ impl ContextRender.embed(text: str) -> list[float] {
     if not name {
         return [];
     }
-    return embed_text(name, text, self.embed_chars);
+    return embed_text(
+        name, text, self.embed_chars, self.embed_api_key, self.embed_api_base
+    );
 }
 
 impl ContextRender.focus_query_vec(anchor: str, focus: str) -> list[float] {
@@ -463,6 +492,11 @@ impl ContextRender.score_pass(
         tmp_valid: list[ContextToolResult] = [];
         tmp_vecs: list[list[float]] = [];
         for tr in candidates {
+            if not str(tr.full_content).strip() {
+                tmp_valid.append(tr);
+                tmp_vecs.append([]);
+                continue;
+            }
             e = self.embed(str(tr.full_content));
             if not e {
                 embed_failed = True;
@@ -659,7 +693,13 @@ impl ContextRender.smart_trim(
     for idx in range(ti, nlines) {
         out.append(str(lines[idx]));
     }
-    tr.visible_content = "\n".join(out);
+    rendered = "\n".join(out);
+    if len(rendered) > 2 * total {
+        rendered = (
+            content[:head_budget] + "\n" + TRIM_MARKER + "\n" + content[-tail_budget:]
+        );
+    }
+    tr.visible_content = rendered;
     if self.memo_trim {
         cg.trim_memo[memo_key] = str(tr.visible_content);
     }
@@ -741,22 +781,27 @@ impl ContextRender.micro_stub(
         used += c;
         seen = seen | ids;
     }
-    if not keep {
-        return False;
-    }
     out: list[str] = [];
-    prev = -1;
-    for i in range(0, nlines) {
-        if keep.get(i) {
-            if i > prev + 1 {
-                out.append(TRIM_MARKER);
+    if keep {
+        prev = -1;
+        for i in range(0, nlines) {
+            if keep.get(i) {
+                if i > prev + 1 {
+                    out.append(TRIM_MARKER);
+                }
+                out.append(str(lines[i]));
+                prev = i;
             }
-            out.append(str(lines[i]));
-            prev = i;
         }
-    }
-    if prev < nlines - 1 {
-        out.append(TRIM_MARKER);
+        if prev < nlines - 1 {
+            out.append(TRIM_MARKER);
+        }
+    } else {
+        room = total - len(TRIM_MARKER) - 2;
+        if room < 2 or len(content) <= total {
+            return False;
+        }
+        out = [content[:room - room // 2], TRIM_MARKER, content[-(room // 2):]];
     }
     tr.visible_content = "\n".join(out);
     if self.memo_trim {
@@ -797,6 +842,40 @@ impl ContextRender.apply_eviction(
         EvictionDecision(tool_result=tr, kind=k, placeholder=placeholder)
     );
     return "clear";
+}
+
+impl ContextRender.stub_to_budget(
+    cg: ContextGraph, budget_tokens: int, present: Presence
+) -> int {
+    if budget_tokens <= 0 {
+        return 0;
+    }
+    vis = visible_tool_tokens(cg, present);
+    if vis <= budget_tokens {
+        return 0;
+    }
+    trimmed = [
+        tr
+        for tr in managed_tool_results(cg)
+        if tr.visible and present.has_result(tr) and tr.truncation_state == "head_tail"
+    ];
+    trimmed.sort(
+        key=lambda (tr: ContextToolResult) -> float { return tr.produced_at; }
+    );
+    stubbed = 0;
+    for tr in trimmed {
+        if vis <= budget_tokens {
+            break;
+        }
+        shown = str(tr.visible_content);
+        if self.micro_stub(tr, cg) and len(str(tr.visible_content)) < len(shown) {
+            vis -= estimate_tokens(shown) - estimate_tokens(str(tr.visible_content));
+            stubbed += 1;
+        } else {
+            tr.visible_content = shown;
+        }
+    }
+    return stubbed;
 }
 
 impl ContextRender.clear_to_budget(
@@ -857,7 +936,7 @@ impl ContextRender.prune(cg: ContextGraph, mt_run: object, model: object) -> int
     if not candidates {
         return 0;
     }
-    scan_citations(cg, self.score_content_cap);
+    scan_citations(cg, self.score_content_cap, present);
     sp = self.score_pass(cg, candidates, present);
     valid = sp.candidates;
     base = sp.base;
@@ -869,13 +948,22 @@ impl ContextRender.prune(cg: ContextGraph, mt_run: object, model: object) -> int
         key=lambda (i: int) -> tuple[float, int] { return (valid[i].produced_at, i); },
         reverse=True
     );
+    current_floor = current_turn_floor(cg, present);
+    unseen: dict[int, bool] = {};
+    if self.protect_current_turn and current_floor >= 0 {
+        for i in range(n) {
+            if valid[i].produced_at_turn > current_floor {
+                unseen[i] = True;
+            }
+        }
+    }
     grace_floor = cg.turn_count - self.grace_turns;
     grace_cap = int(float(budget) * self.pin_budget_frac);
     newest_kept = False;
     for i in order {
-        if valid[i].produced_at_turn > grace_floor {
+        if valid[i].produced_at_turn > grace_floor or unseen.get(i) {
             cost = self.keep_cost(valid[i]);
-            if (not newest_kept) or (used + cost <= grace_cap) {
+            if (not newest_kept) or unseen.get(i) or (used + cost <= grace_cap) {
                 selected_idx[i] = True;
                 used += cost;
                 newest_kept = True;
@@ -945,22 +1033,41 @@ impl ContextRender.prune(cg: ContextGraph, mt_run: object, model: object) -> int
     sel_ids: list[str] = [];
     sel_cost: dict[str, int] = {};
     sel_prio: dict[str, float] = {};
+    unseen_cost = 0;
     for i in selected_idx.keys() {
         tid = str(valid[i].tr_id);
-        sel_ids.append(tid);
         sel_cost[tid] = self.keep_cost(valid[i]);
         sel_prio[tid] = base[i];
+        if unseen.get(i) {
+            unseen_cost += sel_cost[tid];
+        } else {
+            sel_ids.append(tid);
+        }
     }
     stub_chars = self.micro_stub_chars
         if self.stub_overflow == "clear"
         else self.trim_chars;
     eff_budget = stub_reserve(len(candidates), max(1, budget), stub_chars);
-    survives = enforce_budget(sel_ids, sel_cost, sel_prio, eff_budget);
+    seen_budget = eff_budget - unseen_cost;
+    survives = enforce_budget(sel_ids, sel_cost, sel_prio, seen_budget);
+    if unseen {
+        left = 0;
+        for tid in sel_ids {
+            if survives.get(tid) {
+                left += sel_cost[tid];
+            }
+        }
+        if left > seen_budget {
+            for tid in sel_ids {
+                survives[tid] = False;
+            }
+        }
+    }
     keep_ids: dict[str, bool] = {};
     kept_total = 0;
     for i in selected_idx.keys() {
         tid = str(valid[i].tr_id);
-        if survives.get(tid) {
+        if survives.get(tid) or unseen.get(i) {
             keep_ids[tid] = True;
             kept_total += sel_cost.get(tid) or 0;
         }
@@ -1020,7 +1127,6 @@ impl ContextRender.prune(cg: ContextGraph, mt_run: object, model: object) -> int
     kind = "micro_stub"
         if (self.allow_hard_clear and fill_ratio >= 0.5)
         else "soft_trim";
-    current_floor = current_turn_floor(cg, present);
     before: dict[str, str] = {};
     for tr in candidates {
         before[tr.tr_id] = str(tr.visible_content);
@@ -1055,7 +1161,12 @@ impl ContextRender.prune(cg: ContextGraph, mt_run: object, model: object) -> int
             clears += 1;
         }
     }
-    clears += self.clear_to_budget(cg, budget, present);
+    if self.stub_overflow != "clear" {
+        stubs += self.stub_to_budget(cg, budget, present);
+    }
+    if self.allow_hard_clear or self.stub_overflow == "clear" {
+        clears += self.clear_to_budget(cg, budget, present);
+    }
     changed = 0;
     for tr in candidates {
         if str(tr.visible_content) != before.get(tr.tr_id, "") {

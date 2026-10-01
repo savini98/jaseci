@@ -24,6 +24,7 @@ import from jaclang.byllm.context {
     ContextGraph,
     ContextMessage,
     ContextPolicy,
+    message_content,
     message_role,
     message_text,
     message_tool_calls,

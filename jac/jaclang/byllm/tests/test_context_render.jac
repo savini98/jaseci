@@ -10,7 +10,9 @@ directly; tests whose subject is the wiring go through the loop with a MockLLM.
 
 import json;
 import math;
+import time;
 import litellm;
+import jaclang.byllm.context_render as render_module;
 import from unittest { mock }
 import from jaclang.byllm.lib { MockLLM }
 import from jaclang.byllm.mtir { MTRuntime }
@@ -45,10 +47,20 @@ import from jaclang.byllm.context_render {
 import from jaclang.byllm.exceptions { CompactionNotEffectiveError }
 import from jaclang.byllm.types { ToolCallResultMsg }
 import from jaclang.byllm.typed_compaction { CompactionSlots }
-import from support { call, fail, finish, mk_run, roles, sent_messages }
+import from support { call, calls, fail, finish, mk_run, roles, sent_messages }
 
 
 glob VALUE_LINE: str = "keepalive_seconds = 47 (config/prod.yaml)";
+
+
+"""Stands in for the byLLM config: only `[plugins.byllm.context]` is read."""
+obj FakeConfig {
+    has context: dict[str, any];
+
+    def get_context_config -> dict[str, any] {
+        return self.context;
+    }
+}
 
 
 """`n` lines whose every token carries `tag`, so two different tags share nothing."""
@@ -681,20 +693,31 @@ test "stub_overflow=clear escalates to a named hard clear only when the stubs al
         for i in range(6)
     ];
     stubbable = [blob(f"r{i}", 600) for i in range(6)];
-    for (label, overflow, budget, contents, want_named, want_stubbed, want_bare) in [
+    for (
+        label,
+        overflow,
+        allow,
+        budget,
+        contents,
+        want_named,
+        want_stubbed,
+        want_bare
+    ) in [
         (
             "clear, tiny results, stubs would overflow",
             "clear",
+            False,
             60,
             tiny_results,
             5,
             0,
             0
         ),
-        ("clear, tiny results, stubs fit", "clear", 300, tiny_results, 0, 0, 0),
+        ("clear, tiny results, stubs fit", "clear", False, 300, tiny_results, 0, 0, 0),
         (
             "keep, stub-able results, stubs fit the budget",
             "keep",
+            False,
             400,
             stubbable,
             0,
@@ -702,8 +725,19 @@ test "stub_overflow=clear escalates to a named hard clear only when the stubs al
             0
         ),
         (
-            "keep, stub-able results, stubs overflow the budget",
+            "keep, stubs overflow the budget, hard clear not allowed",
             "keep",
+            False,
+            240,
+            stubbable,
+            0,
+            5,
+            0
+        ),
+        (
+            "keep, stubs overflow the budget, hard clear allowed",
+            "keep",
+            True,
             240,
             stubbable,
             0,
@@ -711,7 +745,7 @@ test "stub_overflow=clear escalates to a named hard clear only when the stubs al
             5
         )
     ] {
-        policy = ContextRender(stub_overflow=overflow);
+        policy = ContextRender(stub_overflow=overflow, allow_hard_clear=allow);
         ctx = Context(policy=policy, budget_tokens=budget, persist=False);
         (cg, run) = wired(ctx);
         for i in range(6) {
@@ -749,18 +783,22 @@ test "stub_overflow=clear escalates to a named hard clear only when the stubs al
         assert st["call_5"] == "full" , f"{label}: the newest is never cleared: {st}";
         assert ctx.stats()["clears"] == want_named + want_bare , f"{label}: {ctx.stats()}";
         assert ctx.stats()["stubs"] == want_stubbed + want_bare , (
-            f"{label}: under keep every evictee was stubbed first; the backstop then cleared the "
-            f"oldest stubs only because the stubs still exceeded the budget: {ctx.stats()}"
+            f"{label}: under keep every evictee is stubbed first; the backstop clears the "
+            f"oldest stubs only when hard clears are allowed: {ctx.stats()}"
         );
         if want_bare {
             assert visible_tokens(cg) <= budget , f"{label}: the backstop stops at the budget";
+        } elif want_stubbed and budget == 240 {
+            assert visible_tokens(cg) > budget , (
+                f"{label}: without hard clears the budget is a target, nothing is deleted"
+            );
         }
     }
 }
 
 
 # 15. Embeddings.
-test "with embed_model relevance comes from litellm embeddings; a failure falls the pass back to lexical for good" {
+test "with embed_model relevance comes from litellm embeddings; a failure falls back to lexical until the cooldown ends" {
     EMBED_CACHE.clear();
     EMBED_STATE.clear();
     try {
@@ -774,7 +812,9 @@ test "with embed_model relevance comes from litellm embeddings; a failure falls 
             < 1e-12 , ("lexically neither result overlaps the task");
 
         seen_inputs: list[str] = [];
-        def fake_embedding(model: str, input: str, timeout: float) -> dict[str, any] {
+        def fake_embedding(
+            model: str, input: str, timeout: float, **extra: any
+        ) -> dict[str, any] {
             seen_inputs.append(input);
             aligned = ("alpha" in input) or ("Do the thing" in input);
             return {"data": [{"embedding": [1.0, 0.0] if aligned else [0.0, 1.0]}]};
@@ -807,13 +847,57 @@ test "with embed_model relevance comes from litellm embeddings; a failure falls 
         ) as broken {
             fallback = policy.candidate_scores(cg, run);
             assert broken.call_count == 2 , f"one retry, then give up: {broken.call_count}";
-            assert EMBED_STATE.get("disabled") , "disabled for the rest of the process";
+            assert EMBED_STATE.get("fake-embed", 0.0) > time.time() , (
+                "the model is rested for a while, not for the rest of the process"
+            );
             fallback_again = policy.candidate_scores(cg, run);
         }
-        assert broken.call_count == 2 , "a later pass does not call the provider again";
+        assert broken.call_count == 2 , "a pass inside the cooldown does not call the provider";
         assert fallback == lexical and fallback_again == lexical , (
             f"the whole pass is lexical, never a mix: {fallback} vs {lexical}"
         );
+        assert len(EMBED_CACHE) == 0 , "a failure is not cached as an answer";
+
+        # Once the cooldown is over the provider is asked again and embeddings resume.
+        EMBED_STATE["fake-embed"] = time.time() - 1.0;
+        with mock.patch.object(
+            litellm, "embedding", side_effect=fake_embedding
+        ) as healed {
+            resumed = policy.candidate_scores(cg, run);
+        }
+        assert healed.call_count == 3 and resumed == scores , f"{resumed} vs {scores}";
+        assert "fake-embed" not in EMBED_STATE;
+
+        # An empty result is not sent to the provider and does not fail the pass.
+        tr_e = add_result(cg, run, "call_e", "");
+        with mock.patch.object(
+            litellm, "embedding", side_effect=fake_embedding
+        ) as with_empty {
+            mixed = policy.candidate_scores(cg, run);
+        }
+        assert with_empty.call_count == 0 , "nothing new to embed: the empty text is skipped";
+        assert "fake-embed" not in EMBED_STATE , "embeddings stay on";
+        assert abs(mixed[tr_a.tr_id] - policy.base_score(4, 0.0, 1.0)) < 1e-9 , (
+            f"alpha is still scored by its embedding: {mixed}"
+        );
+        assert abs(mixed[tr_e.tr_id] - policy.base_score(0, 0.0, 0.0)) < 1e-9;
+
+        # The key and base are passed only when the policy sets them.
+        assert "api_key" not in healed.call_args.kwargs
+            and "api_base" not in healed.call_args.kwargs;
+        EMBED_CACHE.clear();
+        keyed = ContextRender(
+            embed_model="fake-embed",
+            embed_api_key="sk-embed",
+            embed_api_base="http://proxy/v1"
+        );
+        with mock.patch.object(
+            litellm, "embedding", side_effect=fake_embedding
+        ) as routed {
+            keyed.candidate_scores(cg, run);
+        }
+        assert routed.call_args.kwargs["api_key"] == "sk-embed";
+        assert routed.call_args.kwargs["api_base"] == "http://proxy/v1";
     } finally {
         EMBED_CACHE.clear();
         EMBED_STATE.clear();
@@ -1201,4 +1285,206 @@ test "the extractor reads full results while they fit its window, and the trimme
         tight
     );
     assert tr_full.full_content == blob("alpha", 8000) , "the stored result is never shortened";
+}
+
+
+# 23. Results with no usable line breaks.
+test "a result made of one long line, or led by one, is still trimmed and stubbed" {
+    one_line = "{"
+        + ", ".join([f"'key_{i}': 'value_{i * 7}'" for i in range(60)])
+        + "}";
+    assert "\n" not in one_line and 1000 < len(one_line) < 3000;
+    policy = ContextRender();
+    ctx = Context(policy=policy, budget_tokens=200, persist=False);
+    (cg, run) = wired(ctx);
+    tr = add_result(cg, run, "call_a", one_line);
+    add_result(cg, run, "call_n", blob("newest", 400));
+    policy.prune(cg, run, MockLLM());
+    stub = tr.visible_content;
+    assert tr.truncation_state == "head_tail"
+        and len(stub) <= policy.micro_stub_chars , len(stub);
+    assert stub.split("\n")[1] == TRIM_MARKER , stub;
+    assert stub.startswith(one_line[:40]) and stub.endswith(one_line[-40:]) , stub;
+    policy.prune(cg, run, MockLLM());
+    assert tr.visible_content == stub , "the stub is byte-stable across passes";
+
+    wide = ("x" * 50000) + "\n" + rows("tail", 200);
+    roomy = Context(policy=policy, budget_tokens=2000, persist=False);
+    (cg2, run2) = wired(roomy);
+    tr_wide = add_result(cg2, run2, "call_w", wide);
+    add_result(cg2, run2, "call_n", blob("newest", 400));
+    policy.prune(cg2, run2, MockLLM());
+    trimmed = tr_wide.visible_content;
+    assert tr_wide.truncation_state == "head_tail";
+    assert len(trimmed) <= 2 * policy.trim_chars , f"one 50000-char line cannot ride along: {len(
+        trimmed
+    )}";
+    assert trimmed.startswith("xxxx")
+        and trimmed.endswith(wide[-40:])
+        and TRIM_MARKER in trimmed;
+    assert roomy.stats()["hard_cleared"] == 0;
+}
+
+
+# 24. The backstop under the default settings.
+test "by default pressure turns trimmed results into restorable stubs and deletes nothing" {
+    policy = ContextRender();
+    ctx = Context(policy=policy, budget_tokens=1500, persist=False);
+    (cg, run) = wired(ctx);
+    for i in range(9) {
+        add_result(cg, run, f"call_{i}", blob(f"r{i}", 4000));
+    }
+    policy.prune(cg, run, MockLLM());
+    st = states(cg);
+    assert "hard_cleared" not in st.values() and st["call_8"] == "full" , st;
+    assert visible_tool_tokens(cg, presence_of(run)) <= 1500 , (
+        "eight 750-token trims would not fit, so the oldest were shrunk to stubs"
+    );
+    s = ctx.stats();
+    assert s["clears"] == 0 and s["hard_cleared"] == 0 and s["stubs"] > 0 , s;
+    assert len(by_call(cg)["call_0"].visible_content) < 300 , (
+        "a stub is its 150 chars of lines plus the elision markers"
+    );
+
+    ctx.budget_tokens = 100000;
+    policy.prune(cg, run, MockLLM());
+    assert set(states(cg).values()) == {"full"} , "every result comes back when there is room";
+    assert by_call(cg)["call_0"].visible_content == blob("r0", 4000);
+}
+
+
+# 25. Citations on a persisted graph.
+test "a citation credits a result of the current call, not an older call's copy of the identifier" {
+    policy = ContextRender();
+    ctx = Context(policy=policy, budget_tokens=100000, persist=True);
+    (cg, run_one) = wired(ctx, task="first task");
+    add_result(
+        cg, run_one, "call_old", "config: prod.yaml sets keepalive_seconds to 47"
+    );
+    (same, run_two) = wired(ctx, task="second task");
+    assert same is cg;
+    add_result(
+        cg, run_two, "call_live", "config: prod.yaml sets keepalive_seconds to 47 again"
+    );
+    add_result(cg, run_two, "call_cite", "ok", args={"path": "prod.yaml"});
+
+    scan_citations(cg, 20000, presence_of(run_two));
+    assert (cg.citation_counts.get("call_live") or 0.0) > 0.0 , cg.citation_counts;
+    assert not cg.citation_counts.get("call_old") , (
+        f"the older call's result is not in this prompt: {cg.citation_counts}"
+    );
+}
+
+
+# 26. A turn with several tool calls.
+test "every result of a multi-call turn reaches the model in full before any is trimmed" {
+    def run_batch(policy: ContextRender) -> tuple[list[dict[str, any]], Context] {
+        llm = MockLLM(
+            outputs=[
+                calls(
+                    [
+                        ("fetch", {"key": f"k{i}", "chars": 2000}, f"call_{i}")
+                        for i in range(4)
+                    ]
+                ),
+                finish("ok")
+            ]
+        );
+        ctx = Context(policy=policy, budget_tokens=1500, persist=False);
+
+        def agent(task: str) -> str by llm(tools=[fetch], context=ctx);
+
+        assert agent("collect four things") == "ok";
+        return (sent_messages(llm, 1), ctx);
+    }
+
+    (sent, ctx) = run_batch(ContextRender());
+    for i in range(4) {
+        assert tool_text(sent, f"call_{i}") == blob(f"k{i}", 2000) , (
+            f"call_{i} was shortened before the model read it"
+        );
+    }
+    s = ctx.stats();
+    assert s["trims"] == 0 and s["stubs"] == 0 and s["clears"] == 0 , s;
+
+    # With the guard off the old behaviour is back: only the newest is exempt.
+    (unguarded, _) = run_batch(ContextRender(protect_current_turn=False));
+    assert tool_text(unguarded, "call_3") == blob("k3", 2000);
+    assert any(
+        tool_text(unguarded, f"call_{i}") != blob(f"k{i}", 2000) for i in range(3)
+    );
+}
+
+
+# 27. Where the budget ratio comes from.
+test "the budget ratio is the Context's when set, else the configured one" {
+    policy = ContextRender();
+    model = MockLLM(ctx_window=1000);
+    run = mk_run(tools=[fetch]);
+    assert policy._resolve_budget(Context(policy=policy), run, model) == 500 , (
+        "with nothing set, half the window"
+    );
+    assert policy._resolve_budget(Context(policy=policy, budget_ratio=0.2), run, model)
+        == 200;
+
+    configured = FakeConfig(context={"budget_tokens": 0, "budget_ratio": 0.3});
+    with mock.patch.object(
+        render_module, "get_byllm_config", return_value=configured
+    ) {
+        assert policy._resolve_budget(Context(policy=policy), run, model) == 300 , (
+            "[plugins.byllm.context] budget_ratio applies when the Context sets none"
+        );
+        assert policy._resolve_budget(
+            Context(policy=policy, budget_ratio=0.2), run, model
+        )
+            == 200 , "the Context wins";
+        configured.context["budget_tokens"] = 250;
+        assert policy._resolve_budget(
+            Context(policy=policy, budget_ratio=0.2), run, model
+        )
+            == 250 , "a configured token budget beats any ratio";
+        assert policy._resolve_budget(
+            Context(policy=policy, budget_tokens=70), run, model
+        )
+            == 70;
+    }
+}
+
+
+# 28. A hook compacts the real history.
+test "an on_compaction hook reads and returns the canonical history, never the trimmed view" {
+    policy = ContextRender();
+    ctx = Context(policy=policy, budget_tokens=100000, persist=False);
+    (cg, run) = wired(ctx, task="find the keepalive");
+    tr_a = add_result(cg, run, "call_a", blob("alpha", 8000));
+    tr_b = add_result(cg, run, "call_b", blob("beta", 8000));
+    apply_eviction_decision(
+        EvictionDecision(
+            tool_result=tr_b, kind="soft_trim", head_chars=100, tail_chars=100
+        )
+    );
+    assert tool_text(run.get_msg_list(), "call_b") == tr_b.visible_content , "the view is trimmed";
+
+    given: list[any] = [];
+    def hook(msgs: list[any], keep_recent: int) -> list[any] {
+        given.extend(msgs);
+        return msgs[:2] + msgs[-2:];
+    }
+    run.call_params["on_compaction"] = hook;
+    MockLLM()._compact_messages(run, 1, None);
+
+    assert tool_text(given, "call_b") == blob("beta", 8000) , "the hook is handed the full text";
+    assert len(run.messages) == 4
+        and tool_text(run.messages, "call_b") == blob("beta", 8000) , (
+        "what the hook returns is the history, untrimmed"
+    );
+    present = presence_of(run);
+    assert focus_texts(cg, present)["anchor"] == "find the keepalive" , (
+        "the kept messages still map to their graph nodes"
+    );
+    assert present.has_result(tr_b) and not present.has_result(tr_a);
+    assert tool_text(run.get_msg_list(), "call_b") == tr_b.visible_content , "the view is still the view";
+    tr_b.visible_content = tr_b.full_content;
+    tr_b.truncation_state = "full";
+    assert tool_text(run.get_msg_list(), "call_b") == blob("beta", 8000) , "a restore reaches the model";
 }
