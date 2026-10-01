@@ -1137,7 +1137,7 @@ impl ContextRender.compact(
             i -= 1;
         }
         if not found {
-            return False;
+            raise CompactionNotEffectiveError(NOTHING_TO_FOLD);
         }
     }
     covered_msgs: list[ContextMessage] = [];
@@ -1156,8 +1156,31 @@ impl ContextRender.compact(
         if tr.visible and present.has_result(tr) and tr.produced_at_turn < cut
     ];
     if not covered_msgs and not covered_trs {
-        return False;
+        raise CompactionNotEffectiveError(NOTHING_TO_FOLD);
     }
+    prior = [
+        s
+        for s in cg.summaries()
+        if s.visible
+    ];
+    previous_summary = prior[-1].summary_text if prior else "";
+    full_tokens = estimate_tokens(previous_summary);
+    for m in covered_msgs {
+        full_tokens += m.token_estimate;
+    }
+    for tr in covered_trs {
+        full_tokens += estimate_tokens(str(tr.full_content));
+    }
+    window = 0;
+    window_fn: any = model?._get_ctx_window;
+    if callable(window_fn) {
+        try {
+            window = int(window_fn({}) or 0);
+        } except Exception {
+            window = 0;
+        }
+    }
+    read_full = window > 0 and full_tokens <= int(window * self.compact_full_ratio);
     items: list[dict[str, any]] = [];
     for m in covered_msgs {
         items.append({"turn": m.turn, "role": m.role, "content": message_item_text(m)});
@@ -1167,18 +1190,14 @@ impl ContextRender.compact(
             {
                 "turn": tr.produced_at_turn,
                 "role": f"tool:{tr.tool_name}",
-                "content": str(tr.full_content)
+                "content": str(tr.full_content if read_full else tr.visible_content)
             }
         );
     }
     items.sort(key=lambda (x: dict[str, any]) -> int { return int(x["turn"]); });
-    prior = [
-        s
-        for s in cg.summaries()
-        if s.visible
-    ];
-    previous_summary = prior[-1].summary_text if prior else "";
-    summary_text = compaction_summary_text(model, previous_summary, items, mt_run);
+    summary_text = render_compaction_slots(
+        extract_compaction_slots(model, previous_summary, items, mt_run)
+    );
     turns = [m.turn for m in covered_msgs]
         + [tr.produced_at_turn for tr in covered_trs];
     summary = ContextCompactionSummary(

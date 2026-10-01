@@ -360,7 +360,80 @@ impl message_text(message: object) -> str {
     if isinstance(content, str) {
         return content;
     }
-    return str(content);
+    if not isinstance(content, (list, tuple)) {
+        return str(content);
+    }
+    parts: list[str] = [];
+    in_media = False;
+    for part in content {
+        text: str | None = None;
+        if isinstance(part, str) {
+            text = part;
+        } elif isinstance(part, Text) {
+            text = part.text;
+        } elif isinstance(part, dict) and part.get("type") == "text" {
+            text = str(part.get("text", "") or "");
+        }
+        if text is None {
+            if not in_media {
+                parts.append(MEDIA_TAG);
+            }
+            in_media = True;
+            continue;
+        }
+        in_media = False;
+        parts.append(text);
+    }
+    return "\n".join(parts);
+}
+
+def _tool_call_args(raw_args: object) -> dict[str, any] {
+    if isinstance(raw_args, dict) {
+        return raw_args as dict[str, any];
+    }
+    if isinstance(raw_args, str) and raw_args {
+        try {
+            parsed: any = json.loads(raw_args);
+            if isinstance(parsed, dict) {
+                return parsed as dict[str, any];
+            }
+        } except Exception {}
+        return {"_raw": raw_args};
+    }
+    return {};
+}
+
+impl message_tool_calls(message: object) -> list[dict[str, any]] {
+    raw: any = message?.tool_calls;
+    if raw is None and isinstance(message, dict) {
+        raw = message.get("tool_calls");
+    }
+    if not raw {
+        return [];
+    }
+    out: list[dict[str, any]] = [];
+    for tc in raw {
+        tc_id = str(getattr(tc, "id", "") or "");
+        tc_name = "";
+        tc_args: dict[str, any] = {};
+        fn: any = tc?.function;
+        if fn is not None {
+            tc_name = str(getattr(fn, "name", "") or "");
+            tc_args = _tool_call_args(fn?.arguments);
+        }
+        if not tc_id and isinstance(tc, dict) {
+            tc_id = str(tc.get("id", "") or "");
+            fn_dict: any = tc.get("function") or {};
+            if isinstance(fn_dict, dict) {
+                tc_name = str(fn_dict.get("name", "") or "");
+                tc_args = _tool_call_args(fn_dict.get("arguments"));
+            }
+        }
+        if tc_id {
+            out.append({"id": tc_id, "name": tc_name, "args": tc_args});
+        }
+    }
+    return out;
 }
 
 impl tool_call_id_of(message: object) -> str {
@@ -422,16 +495,24 @@ impl materialize_overlay(
     out: list[any] = [];
     summaries_emitted = False;
     first_user_seen = False;
+    dropped_calls: set[str] = set();
+    emitted_calls: set[str] = set();
     for message in source {
         role = message_role(message);
         if role == "tool" {
             call_id = tool_call_id_of(message);
+            if call_id and call_id in dropped_calls {
+                continue;
+            }
             tr = tr_by_call.get(call_id) if call_id else None;
             if tr is None {
                 out.append(message);
                 continue;
             }
             if not tr.visible {
+                if call_id in emitted_calls {
+                    out.append(with_content(message, FOLDED_RESULT_NOTE));
+                }
                 continue;
             }
             if tr.visible_content == tr.full_content {
@@ -447,6 +528,9 @@ impl materialize_overlay(
         }
         node_id = msg_ids.get(id(message));
         if node_id is not None and node_id in hidden_ids and not protected {
+            for tc in message_tool_calls(message) {
+                dropped_calls.add(str(tc["id"]));
+            }
             if not summaries_emitted {
                 summaries_emitted = True;
                 for s in summaries {
@@ -459,6 +543,9 @@ impl materialize_overlay(
                 }
             }
             continue;
+        }
+        for tc in message_tool_calls(message) {
+            emitted_calls.add(str(tc["id"]));
         }
         out.append(message);
     }

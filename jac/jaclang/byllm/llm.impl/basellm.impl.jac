@@ -682,11 +682,6 @@ impl BaseLLM._compact_messages(
             );
             return;
         }
-        raise CompactionNotEffectiveError(
-            "ContextRender compaction found nothing to fold - increase ctx_window, "
-            "lower keep_recent_iterations, or switch to a model with a larger "
-            "context window."
-        );
     }
     original_len = len(mt_run.messages);
     msg_dicts = mt_run.get_msg_list();

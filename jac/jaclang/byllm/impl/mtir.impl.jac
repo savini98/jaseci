@@ -9,55 +9,6 @@ glob SYSTEM_PERSONA = """\
     output. Only use tools.
     """;
 
-def _tool_call_args(raw_args: object) -> dict[str, any] {
-    if isinstance(raw_args, dict) {
-        return raw_args as dict[str, any];
-    }
-    if isinstance(raw_args, str) and raw_args {
-        try {
-            parsed: any = json.loads(raw_args);
-            if isinstance(parsed, dict) {
-                return parsed as dict[str, any];
-            }
-        } except Exception {}
-        return {"_raw": raw_args};
-    }
-    return {};
-}
-
-def _extract_tool_calls(msg: object) -> list[dict[str, any]] {
-    raw: any = msg?.tool_calls;
-    if raw is None and isinstance(msg, dict) {
-        raw = msg.get("tool_calls");
-    }
-    if not raw {
-        return [];
-    }
-    out: list[dict[str, any]] = [];
-    for tc in raw {
-        tc_id = str(getattr(tc, "id", "") or "");
-        tc_name = "";
-        tc_args: dict[str, any] = {};
-        fn: any = tc?.function;
-        if fn is not None {
-            tc_name = str(getattr(fn, "name", "") or "");
-            tc_args = _tool_call_args(fn?.arguments);
-        }
-        if not tc_id and isinstance(tc, dict) {
-            tc_id = str(tc.get("id", "") or "");
-            fn_dict: any = tc.get("function") or {};
-            if isinstance(fn_dict, dict) {
-                tc_name = str(fn_dict.get("name", "") or "");
-                tc_args = _tool_call_args(fn_dict.get("arguments"));
-            }
-        }
-        if tc_id {
-            out.append({"id": tc_id, "name": tc_name, "args": tc_args});
-        }
-    }
-    return out;
-}
-
 def _record_context_message(
     cg: ContextGraph, mt_run: MTRuntime, message: object
 ) -> None {
@@ -69,11 +20,70 @@ def _record_context_message(
         return;
     }
     msg_node = cg.record_message(
-        role=role,
-        content=message_text(message),
-        tool_calls=_extract_tool_calls(message)
+        role=role, content=message_text(message), tool_calls=message_tool_calls(message)
     );
     mt_run._ctx_msg_ids[id(message)] = msg_node.msg_id;
+}
+
+def _find_context_message(
+    existing: list[ContextMessage], start: int, message: object
+) -> int {
+    role = message_role(message);
+    text = message_text(message);
+    call_ids = [str(tc["id"]) for tc in message_tool_calls(message)];
+    j = start;
+    while j < len(existing) {
+        msg_node = existing[j];
+        if msg_node.role == role
+            and msg_node.content == text
+            and [str(tc.get("id", "")) for tc in msg_node.tool_calls] == call_ids {
+            return j;
+        }
+        j += 1;
+    }
+    return -1;
+}
+
+def _wire_context(mt_run: MTRuntime, context_obj: Context) {
+    cg = context_obj.get_or_create_graph();
+    mt_run.context = cg;
+    mt_run.context_policy = context_obj.policy;
+    existing = cg.messages();
+    known_calls: set[str] = set();
+    for tr in cg.tool_results() {
+        if tr.call_id {
+            known_calls.add(tr.call_id);
+        }
+    }
+    call_info: dict[str, dict[str, any]] = {};
+    cursor = 0;
+    last = len(mt_run.messages) - 1;
+    for (i, m) in enumerate(mt_run.messages) {
+        if message_role(m) == "tool" {
+            call_id = tool_call_id_of(m);
+            if call_id and call_id not in known_calls {
+                info = call_info.get(call_id, {});
+                cg.record_tool_result(
+                    tool_name=str(info.get("name", "") or getattr(m, "name", "") or ""),
+                    args=info.get("args", {}),
+                    full_content=message_text(m),
+                    call_id=call_id
+                );
+                known_calls.add(call_id);
+            }
+            continue;
+        }
+        for tc in message_tool_calls(m) {
+            call_info[str(tc["id"])] = tc;
+        }
+        found = _find_context_message(existing, cursor, m) if i < last else -1;
+        if found >= 0 {
+            mt_run._ctx_msg_ids[id(m)] = existing[found].msg_id;
+            cursor = found + 1;
+            continue;
+        }
+        _record_context_message(cg, mt_run, m);
+    }
 }
 
 impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
@@ -289,21 +299,7 @@ impl MTRuntime.factory(mtir: MTIR) -> MTRuntime {
 
     context_obj = call_params.get("context");
     if isinstance(context_obj, Context) {
-        cg = context_obj.get_or_create_graph();
-        mt_run.context = cg;
-        mt_run.context_policy = context_obj.policy;
-        existing = cg.messages();
-        matched = 0;
-        for m in mt_run.messages {
-            if matched < len(existing)
-                and message_role(m) == existing[matched].role
-                and message_text(m) == existing[matched].content {
-                mt_run._ctx_msg_ids[id(m)] = existing[matched].msg_id;
-                matched += 1;
-                continue;
-            }
-            _record_context_message(cg, mt_run, m);
-        }
+        _wire_context(mt_run, context_obj);
     }
 
     return mt_run;

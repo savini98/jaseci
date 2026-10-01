@@ -105,22 +105,3 @@ impl extract_compaction_slots(
     }
     return coerce_compaction_slots(result);
 }
-
-
-impl compaction_summary_text(
-    model: object,
-    previous_summary: str,
-    items: list[dict[str, any]],
-    parent_mt_run: object = None
-) -> str {
-    try {
-        slots = extract_compaction_slots(model, previous_summary, items, parent_mt_run);
-        return render_compaction_slots(slots);
-    } except Exception as e {
-        reason = f"{type(e).__name__}: {str(e)[:120]}";
-        logger.warning(
-            f"byLLM typed compaction: extractor failed, writing a placeholder ({reason})"
-        );
-        return f"{COMPACTION_FAILED_PREFIX}{reason}]";
-    }
-}
