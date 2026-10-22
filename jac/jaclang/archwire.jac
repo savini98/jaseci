@@ -13951,6 +13951,7 @@ graph import compiler.passes.graphmend {
             is_torch_attr_target
         },
         trap_lowering_pass {
+            SCALAR_TORCH_ATTRS,
             defining_assignment,
             has_torch_compile_decorator,
             is_torch_attr_target,
