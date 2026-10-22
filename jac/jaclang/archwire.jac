@@ -13914,7 +13914,9 @@ graph import compiler.passes.graphmend {
             param_annotation,
             param_names,
             region_in_inference_ctx,
+            resolve_wrapped_entry,
             self_attr_name,
+            torch_binds_name,
             wrapping_classes
         },
         trap_lowering_pass {
@@ -13922,7 +13924,8 @@ graph import compiler.passes.graphmend {
             entry_key,
             entry_module,
             import_item_of,
-            param_annotation
+            param_annotation,
+            torch_binds_name
         },
     ]
     torch_attr_table ++> [
